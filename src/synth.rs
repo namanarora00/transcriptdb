@@ -133,13 +133,12 @@ impl Msg {
                     if i > 0 {
                         s.push(',');
                     }
-                    if i + 1 == bs.len() {
-                        if let Some(m) = marker {
+                    if i + 1 == bs.len()
+                        && let Some(m) = marker {
                             s.push_str(&b[..b.len() - 1]);
                             let _ = write!(s, r#","cache_control":{m}}}"#);
                             continue;
                         }
-                    }
                     s.push_str(b);
                 }
                 s.push_str("]}");

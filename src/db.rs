@@ -52,6 +52,8 @@ pub struct Put<'a> {
     pub time: &'a str,
     pub meta: &'a [u8],
     pub body: &'a [u8],
+    /// sha256 of `body`, if the caller already has it (saves hashing twice).
+    pub digest: Option<[u8; 32]>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -274,9 +276,10 @@ impl Db {
         db.finish_load()?;
         db.seq = db.manifest.checkpoint;
 
-        for (k, &n) in wal_nums.iter().enumerate() {
-            let p = wal::wal_path(&db.dir, n);
-            let c = wal::read_wal(&p)?;
+        let logs: Vec<(u64, wal::WalContents)> =
+            wal_nums.iter().map(|&n| Ok((n, wal::read_wal(&wal::wal_path(&db.dir, n))?))).collect::<Result<_>>()?;
+        for (k, (n, c)) in logs.iter().enumerate() {
+            let (n, p) = (*n, wal::wal_path(&db.dir, *n));
             rec.wal_files += 1;
             for r in &c.records {
                 let m = Mutation::decode(r)?;
@@ -288,7 +291,9 @@ impl Db {
                 rec.replayed += 1;
             }
             if c.torn {
-                if k + 1 != wal_nums.len() {
+                // A torn tail is the last thing written before a crash. Newer log files
+                // may exist (a crash during recovery creates one) but must be empty.
+                if logs[k + 1..].iter().any(|(_, later)| !later.records.is_empty()) {
                     return corrupt(format!("log file {n} is damaged before its end"));
                 }
                 let len = fs::metadata(&p)?.len();
@@ -438,7 +443,7 @@ impl Db {
         if self.opts.verify_split && split::join(&sp)? != p.body {
             return Err(Error::BadRequest("split pieces do not join back to the body".into()));
         }
-        let digest = sha256(p.body);
+        let digest = p.digest.unwrap_or_else(|| sha256(p.body));
         let key = (p.session.to_string(), p.agent.to_string());
         let existing = self.session_ix.get(&key).copied();
         let sidx = existing.unwrap_or(self.sessions.len() as u32);
@@ -715,11 +720,10 @@ impl Db {
     fn remove_old_wal(&self, keep_from: u64) -> Result<()> {
         for e in fs::read_dir(&self.dir)? {
             let name = e?.file_name().to_string_lossy().into_owned();
-            if let Some(n) = parse_num(&name, "wal-", ".log") {
-                if n < keep_from {
+            if let Some(n) = parse_num(&name, "wal-", ".log")
+                && n < keep_from {
                     fs::remove_file(self.dir.join(&name))?;
                 }
-            }
         }
         Ok(())
     }
@@ -1139,6 +1143,10 @@ impl Db {
             st.opq_file_bytes += sg.opq_bytes;
         }
         st
+    }
+
+    pub fn segment_count(&self) -> usize {
+        self.segs.len()
     }
 
     pub fn dir(&self) -> &Path {

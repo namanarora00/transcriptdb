@@ -184,8 +184,8 @@ pub fn split(body: &[u8]) -> Result<Split> {
     let mut system = None;
     let mut tools = None;
 
-    if let Some(m) = json::find_member(body, &top, "messages") {
-        if body[m.value.start] == b'[' {
+    if let Some(m) = json::find_member(body, &top, "messages")
+        && body[m.value.start] == b'[' {
             let (els, close) = json::elements(body, &m.value)?;
             let interior = m.value.start + 1..close;
             // compact means exactly e0,e1,...,en with nothing else
@@ -217,7 +217,6 @@ pub fn split(body: &[u8]) -> Result<Split> {
             }
             cuts.push((interior, HoleKind::Messages));
         }
-    }
     if let Some(m) = json::find_member(body, &top, "system") {
         system = Some(cut_blocks(&body[m.value.clone()])?);
         cuts.push((m.value.clone(), HoleKind::System));
@@ -329,8 +328,8 @@ fn walk_opaque(b: &[u8], n: &json::Node, out: &mut Vec<Span>) {
     match n {
         json::Node::Obj(ms) => {
             for (k, v) in ms {
-                if let json::Node::Tok(s) = v {
-                    if b[s.start] == b'"'
+                if let json::Node::Tok(s) = v
+                    && b[s.start] == b'"'
                         && s.len() - 2 >= MIN_OPAQUE
                         && (json::key_is(b, k, "signature") || json::key_is(b, k, "data"))
                         && is_b64(json::inner(b, s))
@@ -338,7 +337,6 @@ fn walk_opaque(b: &[u8], n: &json::Node, out: &mut Vec<Span>) {
                         out.push(s.start + 1..s.end - 1);
                         continue;
                     }
-                }
                 walk_opaque(b, v, out);
             }
         }

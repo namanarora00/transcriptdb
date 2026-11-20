@@ -28,7 +28,7 @@ fn traffic(seed: u64, sessions: u64, per: usize) -> Vec<SynthRequest> {
 }
 
 fn put(db: &mut Db, q: &SynthRequest) -> PutOutcome {
-    db.put(&Put { session: &q.session, agent: &q.agent, id: &q.id, time: &q.time, meta: b"", body: &q.body }).unwrap()
+    db.put(&Put { session: &q.session, agent: &q.agent, id: &q.id, time: &q.time, meta: b"", body: &q.body, digest: None }).unwrap()
 }
 
 fn check_all(db: &Db, reqs: &[SynthRequest]) {

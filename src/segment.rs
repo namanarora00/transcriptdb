@@ -228,7 +228,7 @@ impl SegWriter {
 
     pub fn piece(&mut self, raw: &[u8]) -> Result<(u64, u32)> {
         let c = self.comp.compress(raw)?;
-        Ok(self.piece_compressed(&c)?)
+        self.piece_compressed(&c)
     }
 
     pub fn piece_compressed(&mut self, c: &[u8]) -> Result<(u64, u32)> {

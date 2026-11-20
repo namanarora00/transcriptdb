@@ -7,7 +7,7 @@ publish = false
 
 [dependencies]
 zstd = "0.13"
-sha2 = "0.10"
+sha2 = { version = "0.10", features = ["asm"] }
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 crc32c = "0.6"
 memchr = "2"
