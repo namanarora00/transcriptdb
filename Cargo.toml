@@ -1,0 +1,23 @@
+[package]
+name = "transcriptdb"
+version = "0.1.0"
+edition = "2024"
+description = "A storage and query engine for agent transcripts"
+publish = false
+
+[dependencies]
+zstd = "0.13"
+sha2 = "0.10"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+crc32c = "0.6"
+memchr = "2"
+base64 = "0.22"
+libc = "0.2"
+
+[profile.release]
+debug = 1
+lto = "thin"
+codegen-units = 4
+
+[profile.test]
+opt-level = 1

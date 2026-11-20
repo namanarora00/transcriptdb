@@ -1,0 +1,5 @@
+/target
+# Stores and real-log output never go in the repo.
+/data
+*.tdb
+*.log
