@@ -74,6 +74,30 @@ scripts/crash-test.sh 1000 # SIGKILL the writer 1000 times at random moments
 `check-rebuild.sh` writes its store outside the repo (`$TMPDIR/transcriptdb-check`) and deletes it
 at the end unless `KEEP=1`. Both it and the crash test exit non-zero on any failure.
 
+## Measured (2026-11-20, every Claude Code log on one Mac, Apple Silicon, 10 cores)
+
+| | Result |
+|---|---|
+| Request lines in the logs | 153,504 (123,156 distinct ids; resumed sessions repeat requests) |
+| Rebuilt from the logs, equal to `requestDigest` | 153,484; 20 not rebuildable (a message is missing from the log) |
+| Ingest | 123,117 requests, 148.3 GB of bodies in 223 s; store write path ~1.0 GB/s |
+| Store size | 511.8 MB: frames 186.8, opaque 294.1, pieces 12.2, index 18.8 (290x smaller than the bodies) |
+| Message frames | 623.6 MB of distinct message bytes in 186.8 MB (3.3x) |
+| Storage runs per request | as flushed: 85.6% one, max 3; after merge: 98.8% one, 1.2% two, max 3 |
+| Rebuild check | 123,117 of 123,117 byte for byte; 148 GB rebuilt in 24 s on 10 threads |
+| Rebuild one request (mean 1.28 MB), warm | median 0.41 ms, p95 1.9 ms, p99 6.0 ms |
+| 40 messages in a row / whole session | median 0.11 ms / 0.29 ms |
+| Crash test | 1,000 SIGKILLs, 13,059 acknowledged, 0 lost, 0 wrong bytes |
+
+Against the Python proof of concept (48-session sample): size per byte of distinct text 0.50 vs
+0.51; rebuild median 0.41 vs 0.85 ms; replay 0.29 vs 0.41 ms. The proof of concept's
+"11,718 of 11,718 byte for byte" was checked against its own reconstruction; the numbers here are
+checked against Claude Code's digest.
+
+Not measured yet: cold-disk reads, size against a zstd `--long` archive of the same requests (needs
+~150 GB of scratch disk), torn log records from real power loss (SIGKILL cannot tear a `write`;
+a unit test covers the path).
+
 ## Command line
 
 ```
