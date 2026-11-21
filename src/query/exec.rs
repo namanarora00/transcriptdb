@@ -187,7 +187,8 @@ pub enum EqKey {
 }
 
 pub fn eq_key(db: &Db, s: u32, pos: u32, field: &str) -> Result<Option<EqKey>, QError> {
-    let ss = db.steps(s);
+    let ss_arc = db.steps(s);
+    let ss = &*ss_arc;
     let Some(f) = db.step_dicts().fields.code(field.as_bytes()) else { return Ok(None) };
     Ok(match ss.fields_of(pos).iter().find(|x| x.0 == f) {
         None => None,
@@ -198,9 +199,15 @@ pub fn eq_key(db: &Db, s: u32, pos: u32, field: &str) -> Result<Option<EqKey>, Q
 
 /// Matches of a compiled pattern in one session.
 pub fn session_matches(db: &Db, c: &Compiled, s: u32, now: i64, scanned: &AtomicUsize) -> Result<Option<Vec<Match>>, QError> {
-    let ss = db.steps(s);
-    if ss.rows.is_empty() || !c.elems.iter().all(|t| t.possible_in(ss, s)) {
+    let ss_arc = db.steps(s);
+    let ss = &*ss_arc;
+    if ss.rows.is_empty() {
         return Ok(None);
+    }
+    for t in &c.elems {
+        if !t.possible_in(db, ss, s, now)? {
+            return Ok(None);
+        }
     }
     scanned.fetch_add(ss.rows.len(), Ordering::Relaxed);
     let mut masks = vec![0u64; ss.rows.len()];
@@ -336,8 +343,9 @@ pub fn run(db: &Db, q: &Query, threads: usize) -> Result<Run, QError> {
             st.plan_ms = t0.elapsed().as_secs_f64() * 1e3;
             let t1 = Instant::now();
             let per = parallel(db.session_count(), threads, |s| {
-                let ss = db.steps(s);
-                if !test.possible_in(ss, s) {
+                let ss_arc = db.steps(s);
+                let ss = &*ss_arc;
+                if !test.possible_in(db, ss, s, now)? {
                     return Ok(None);
                 }
                 scanned.fetch_add(ss.rows.len(), Ordering::Relaxed);
@@ -651,30 +659,19 @@ fn fast_summarize(db: &Db, t: &Table, aggs: &[(String, AggFn, Option<Expr>)], by
     const LONG_TAG: u64 = 1 << 62;
     let sd = db.step_dicts();
     let parts: Vec<KeyPart> = by.iter().map(|(_, e)| key_part(db, e).unwrap()).collect();
-    // session index -> interned id of its session or agent string
-    let mut sid_ids: HashMap<&str, u64> = HashMap::new();
-    let mut agent_ids: HashMap<&str, u64> = HashMap::new();
-    let mut sid_of = Vec::with_capacity(db.session_count());
-    let mut agent_of = Vec::with_capacity(db.session_count());
-    let mut sid_names: Vec<&str> = Vec::new();
-    let mut agent_names: Vec<&str> = Vec::new();
-    for s in 0..db.session_count() as u32 {
-        let (sid, agent) = db.session_key(s);
-        let n = sid_ids.len() as u64;
-        sid_of.push(*sid_ids.entry(sid.as_str()).or_insert_with(|| {
-            sid_names.push(sid.as_str());
-            n
-        }));
-        let n = agent_ids.len() as u64;
-        agent_of.push(*agent_ids.entry(agent.as_str()).or_insert_with(|| {
-            agent_names.push(agent.as_str());
-            n
-        }));
-    }
+    // session or agent strings, and field values, interned for this query: value codes
+    // are per session, so a value's group id comes from its text
+    let mut sid_ids: HashMap<String, u64> = HashMap::new();
+    let mut agent_ids: HashMap<String, u64> = HashMap::new();
+    let mut sid_names: Vec<String> = Vec::new();
+    let mut agent_names: Vec<String> = Vec::new();
+    let mut val_ids: FxMap<(u32, Vec<u8>), u64> = FxMap::default();
+    let mut val_names: Vec<Vec<u8>> = Vec::new();
     let mut longs: Vec<Vec<u8>> = Vec::new();
     let mut long_ids: HashMap<Vec<u8>, u64> = HashMap::new();
-    let mut field_key = |s: u32, pos: u32, f: u32, longs: &mut Vec<Vec<u8>>| -> Result<u64, QError> {
-        let ss = db.steps(s);
+    // per session being read: its (session, agent) ids and its value codes -> ids
+    let mut sess_vals: FxMap<(u32, u32), u64> = FxMap::default();
+    let mut field_key = |s: u32, ss: &crate::steps::SessionSteps, pos: u32, f: u32, sess_vals: &mut FxMap<(u32, u32), u64>| -> Result<u64, QError> {
         Ok(match ss.fields_of(pos).iter().find(|x| x.0 == f) {
             None => NULL,
             Some(&(_, v)) if crate::steps::is_long(v) => {
@@ -690,7 +687,14 @@ fn fast_summarize(db: &Db, t: &Table, aggs: &[(String, AggFn, Option<Expr>)], by
                     }
                 }
             }
-            Some(&(_, v)) => v as u64,
+            Some(&(_, v)) => *sess_vals.entry((f, v)).or_insert_with(|| {
+                let text = ss.value(f, v).to_vec();
+                let n = val_names.len() as u64;
+                *val_ids.entry((f, text.clone())).or_insert_with(|| {
+                    val_names.push(text);
+                    n
+                })
+            }),
         })
     };
     let tests: Vec<Option<Test>> = aggs
@@ -709,7 +713,6 @@ fn fast_summarize(db: &Db, t: &Table, aggs: &[(String, AggFn, Option<Expr>)], by
         [KeyPart::Sid] => sid_names.len(),
         [KeyPart::Agent] => agent_names.len(),
         [KeyPart::Failed] | [KeyPart::Ok] => 2,
-        [KeyPart::Field(f)] => sd.values[*f as usize].len(),
         _ => 0,
     };
     let mut dense: Vec<u32> = vec![u32::MAX; dense_len];
@@ -739,23 +742,39 @@ fn fast_summarize(db: &Db, t: &Table, aggs: &[(String, AggFn, Option<Expr>)], by
     let mut acc = Accs { na, keys: Vec::new(), count: Vec::new(), sum: Vec::new(), lo: Vec::new(), hi: Vec::new(), distinct: Vec::new() };
     let nums: Vec<Option<NumCol>> = aggs.iter().map(|(_, _, a)| a.as_ref().and_then(num_col)).collect();
     let mut cur_s = u32::MAX;
-    let mut ss = db.steps(0);
+    let mut cur: Option<std::sync::Arc<crate::steps::SessionSteps>> = None;
+    let (mut sid_cur, mut agent_cur) = (0u64, 0u64);
     for r in &t.rows {
         let (s, pos) = (r.session, r.steps[0]);
         if s != cur_s {
             cur_s = s;
-            ss = db.steps(s);
+            cur = Some(db.try_steps(s).map_err(|e| QError::new(e.to_string()))?);
+            sess_vals.clear();
+            if parts.iter().chain(dkey.iter().flatten()).any(|p| matches!(p, KeyPart::Sid | KeyPart::Agent)) {
+                let (sid, agent) = db.session_key(s);
+                let n = sid_ids.len() as u64;
+                sid_cur = *sid_ids.entry(sid.clone()).or_insert_with(|| {
+                    sid_names.push(sid);
+                    n
+                });
+                let n = agent_ids.len() as u64;
+                agent_cur = *agent_ids.entry(agent.clone()).or_insert_with(|| {
+                    agent_names.push(agent);
+                    n
+                });
+            }
         }
+        let ss: &crate::steps::SessionSteps = cur.as_ref().unwrap();
         let row = ss.rows[pos as usize];
         let mut key = [0u64; 4];
         for (i, p) in parts.iter().enumerate() {
             key[i] = match *p {
                 KeyPart::Tool => row.tool as u64,
-                KeyPart::Sid => sid_of[s as usize],
-                KeyPart::Agent => agent_of[s as usize],
+                KeyPart::Sid => sid_cur,
+                KeyPart::Agent => agent_cur,
                 KeyPart::Failed => row.failed as u64,
                 KeyPart::Ok => !row.failed as u64,
-                KeyPart::Field(f) => field_key(s, pos, f, &mut longs)?,
+                KeyPart::Field(f) => field_key(s, ss, pos, f, &mut sess_vals)?,
                 KeyPart::MissingField => NULL,
                 KeyPart::BinTime(d) => row.time_ms.div_euclid(d) as u64,
             };
@@ -804,9 +823,9 @@ fn fast_summarize(db: &Db, t: &Table, aggs: &[(String, AggFn, Option<Expr>)], by
                 AggFn::DCount => {
                     let k = match dkey[ai] {
                         Some(KeyPart::Tool) => row.tool as u64,
-                        Some(KeyPart::Sid) => sid_of[s as usize],
-                        Some(KeyPart::Agent) => agent_of[s as usize],
-                        Some(KeyPart::Field(fid)) => field_key(s, pos, fid, &mut longs)?,
+                        Some(KeyPart::Sid) => sid_cur,
+                        Some(KeyPart::Agent) => agent_cur,
+                        Some(KeyPart::Field(fid)) => field_key(s, ss, pos, fid, &mut sess_vals)?,
                         _ => NULL,
                     };
                     if k != NULL {
@@ -825,14 +844,15 @@ fn fast_summarize(db: &Db, t: &Table, aggs: &[(String, AggFn, Option<Expr>)], by
         }
         match p {
             KeyPart::Tool => Value::Str(String::from_utf8_lossy(sd.tools.get(k as u32)).into()),
-            KeyPart::Sid => Value::Str(sid_names[k as usize].into()),
-            KeyPart::Agent => Value::Str(agent_names[k as usize].into()),
+            KeyPart::Sid => Value::Str(sid_names[k as usize].as_str().into()),
+            KeyPart::Agent => Value::Str(agent_names[k as usize].as_str().into()),
             KeyPart::Failed | KeyPart::Ok => Value::Bool(k == 1),
             KeyPart::Field(f) => {
                 if k & LONG_TAG != 0 {
                     Value::from_json(&longs[(k & !LONG_TAG) as usize])
                 } else {
-                    Value::from_json(sd.values[f as usize].get(k as u32))
+                    let _ = f;
+                    Value::from_json(&val_names[k as usize])
                 }
             }
             KeyPart::MissingField => Value::Null,

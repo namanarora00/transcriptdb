@@ -34,8 +34,12 @@ fn put(db: &mut Db, q: &SynthRequest) -> PutOutcome {
 fn check_all(db: &Db, reqs: &[SynthRequest]) {
     for q in reqs {
         let ri = db.request_index(&q.id).unwrap_or_else(|| panic!("{} missing", q.id));
-        let got = db.rebuild_checked(ri).unwrap();
-        assert!(got == q.body, "{} rebuilt differently", q.id);
+        let got = db.rebuild(ri).unwrap();
+        if got != q.body {
+            let d = got.iter().zip(&q.body).position(|(a, b)| a != b).unwrap_or(got.len().min(q.body.len()));
+            panic!("{} (req {ri:x}) rebuilt differently: {} vs {} bytes, first difference at {d}: got {:?} want {:?}", q.id, got.len(), q.body.len(), String::from_utf8_lossy(&got[d.saturating_sub(40)..(d + 40).min(got.len())]), String::from_utf8_lossy(&q.body[d.saturating_sub(40)..(d + 40).min(q.body.len())]));
+        }
+        assert!(db.rebuild_checked(ri).is_ok());
     }
 }
 
@@ -58,11 +62,11 @@ fn rebuild_through_flush_reopen_and_compact() {
     let mut db = Db::open(&dir, opts(256 << 10)).unwrap();
     assert!(db.recovery.replayed > 0 || db.recovery.segments > 0);
     check_all(&db, &reqs);
-    let before: Vec<u32> = (0..db.request_count() as u32).map(|i| db.request_runs(i).unwrap()).collect();
+    let before: Vec<u32> = db.all_requests().unwrap().into_iter().map(|i| db.request_runs(i).unwrap()).collect();
     db.compact().unwrap();
     assert_eq!(db.stats().segments, 1);
     check_all(&db, &reqs);
-    let after: Vec<u32> = (0..db.request_count() as u32).map(|i| db.request_runs(i).unwrap()).collect();
+    let after: Vec<u32> = db.all_requests().unwrap().into_iter().map(|i| db.request_runs(i).unwrap()).collect();
     let one = after.iter().filter(|&&r| r == 1).count();
     let max = *after.iter().max().unwrap();
     eprintln!(
@@ -146,7 +150,7 @@ fn messages_are_stored_once_per_position() {
         put(&mut db, q);
     }
     db.commit().unwrap();
-    let total_msgs: u64 = (0..db.request_count() as u32).map(|i| db.request(i).n_msgs as u64).sum();
+    let total_msgs: u64 = db.all_requests().unwrap().into_iter().map(|i| db.request(i).unwrap().n_msgs as u64).sum();
     let st = db.stats();
     eprintln!("{} requests carry {total_msgs} messages; {} stored", db.request_count(), st.nodes);
     assert!((st.nodes as u64) * 5 < total_msgs);
@@ -171,7 +175,7 @@ fn steps_match_the_reference_and_survive_reopen_and_compact() {
                         let f = ss
                             .fields_of(i as u32)
                             .iter()
-                            .map(|&(f, v)| (sd.fields.get(f).to_vec(), if transcriptdb::steps::is_long(v) { format!("LONG {:?}", ss.long_at(v)).into_bytes() } else { sd.values[f as usize].get(v).to_vec() }))
+                            .map(|&(f, v)| (sd.fields.get(f).to_vec(), if transcriptdb::steps::is_long(v) { format!("LONG {:?}", ss.long_at(v)).into_bytes() } else { ss.value(f, v).to_vec() }))
                             .collect();
                         (r.call_node, r.result_node, r.prev, sd.tools.get(r.tool).to_vec(), r.time_ms, r.out_bytes, r.call_block, r.result_block, r.failed, f)
                     })
@@ -233,12 +237,13 @@ fn values_not_kept_rebuild_blank_and_keep_their_sizes() {
         }
         assert!(held > reqs.len() / 2, "most synthetic requests hold thinking or images ({held})");
         // steps, and the sizes of results that held images, are the same as when kept
-        let decoded = |db: &Db, s: u32| -> Vec<(Vec<u8>, u32, u32, u32, bool, Vec<(Vec<u8>, Vec<u8>)>)> {
+        type Decoded = Vec<(Vec<u8>, u32, u32, u32, bool, Vec<(Vec<u8>, Vec<u8>)>)>;
+        let decoded = |db: &Db, s: u32| -> Decoded {
             let (ss, sd) = (db.steps(s), db.step_dicts());
             (0..ss.rows.len() as u32)
                 .map(|i| {
                     let r = ss.rows[i as usize];
-                    let f = ss.fields_of(i).iter().map(|&(f, v)| (sd.fields.get(f).to_vec(), if transcriptdb::steps::is_long(v) { format!("{:?}", ss.long_at(v)).into_bytes() } else { sd.values[f as usize].get(v).to_vec() })).collect();
+                    let f = ss.fields_of(i).iter().map(|&(f, v)| (sd.fields.get(f).to_vec(), if transcriptdb::steps::is_long(v) { format!("{:?}", ss.long_at(v)).into_bytes() } else { ss.value(f, v).to_vec() })).collect();
                     (sd.tools.get(r.tool).to_vec(), r.call_node, r.prev, r.out_bytes, r.failed, f)
                 })
                 .collect()
@@ -268,4 +273,86 @@ fn values_not_kept_rebuild_blank_and_keep_their_sizes() {
     }
     std::fs::remove_dir_all(&da).unwrap();
     std::fs::remove_dir_all(&db_dir).unwrap();
+}
+
+/// Sessions that pause and wake up again after their data settled in merged segments,
+/// with merges, sessions leaving memory and tiny caches all the time.
+#[test]
+fn merges_wakeups_and_small_caches_keep_everything_exact() {
+    let dir = tmpdir("merges");
+    let o = Options { flush_bytes: 48 << 10, sync: SyncMode::Os, merge_at: 3, seg_bytes: 160 << 10, idle_flushes: 1, cache_bytes: 192 << 10, ..Options::default() };
+    let early: Vec<Vec<SynthRequest>> = (0..10).map(|s| synth::session(41, s, 36)).collect();
+    let mut order: Vec<&SynthRequest> = Vec::new();
+    for s in &early {
+        order.extend(s[..18].iter());
+    }
+    // request ids from another seed repeat ("synth-<n>-<k>"): keep them apart
+    let later: Vec<SynthRequest> = traffic(43, 12, 30).into_iter().map(|q| SynthRequest { id: format!("late-{}", q.id), ..q }).collect();
+    order.extend(later.iter());
+    for s in &early {
+        order.extend(s[18..].iter());
+    }
+    let mut db = Db::open(&dir, o.clone()).unwrap();
+    for (i, q) in order.iter().enumerate() {
+        put(&mut db, q);
+        if i % 5 == 0 {
+            db.commit().unwrap();
+        }
+    }
+    db.commit().unwrap();
+    let all: Vec<SynthRequest> = order.iter().map(|q| SynthRequest { session: q.session.clone(), agent: q.agent.clone(), id: q.id.clone(), time: q.time.clone(), body: q.body.clone() }).collect();
+    let check = |db: &Db| {
+        check_all(db, &all);
+        let c = transcriptdb::check::check_steps(db, 2).unwrap();
+        assert!(c.ok(), "{c:?}");
+        for (name, c) in db.stats().caches {
+            assert!(c.bytes <= c.budget, "{name} cache over budget");
+        }
+    };
+    let st = db.stats();
+    assert!(st.merges.merges >= 3, "{:?}", st.merges);
+    assert!(db.segments().iter().filter(|s| s.1 == 1).count() >= 2, "{:?}", db.segments());
+    // the paused sessions woke up after their first half was merged: they span parts
+    let spread = (0..10).filter(|&s| db.part_count(s).unwrap() >= 2).count();
+    assert!(spread >= 5, "only {spread} woken sessions span several parts");
+    check(&db);
+    drop(db);
+    let mut db = Db::open(&dir, o.clone()).unwrap();
+    check(&db);
+    db.compact().unwrap();
+    assert!(db.segments().iter().all(|s| s.1 == 1));
+    assert!((0..db.session_count() as u32).all(|s| db.part_count(s).unwrap() == 1), "compaction leaves one part per session");
+    check(&db);
+    db.clear_caches();
+    check(&db);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn a_store_opens_in_one_place_at_a_time() {
+    let dir = tmpdir("lock");
+    let db = Db::open(&dir, opts(1 << 20)).unwrap();
+    assert!(Db::open(&dir, opts(1 << 20)).is_err(), "second open while the first holds the store");
+    drop(db);
+    Db::open(&dir, opts(1 << 20)).unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn many_files_with_few_open_at_once() {
+    let dir = tmpdir("files");
+    let o = Options { flush_bytes: 24 << 10, sync: SyncMode::Os, merge_at: 50, open_files: 4, cache_bytes: 64 << 10, ..Options::default() };
+    let reqs = traffic(51, 10, 30);
+    let mut db = Db::open(&dir, o.clone()).unwrap();
+    for q in &reqs {
+        put(&mut db, q);
+        db.commit().unwrap();
+    }
+    db.flush().unwrap();
+    assert!(db.stats().segments + db.stats().blobs > 20, "{} files", db.stats().segments + db.stats().blobs);
+    check_all(&db, &reqs);
+    drop(db);
+    let db = Db::open(&dir, o).unwrap();
+    check_all(&db, &reqs);
+    std::fs::remove_dir_all(&dir).unwrap();
 }

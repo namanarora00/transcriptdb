@@ -31,7 +31,8 @@ fn block(m: &[u8], k: u16) -> Option<&[u8]> {
 }
 
 fn raw_steps(db: &Db, s: u32) -> Result<Vec<RawStep>, QError> {
-    let ss = db.steps(s);
+    let ss_arc = db.steps(s);
+    let ss = &*ss_arc;
     let mut cache: HashMap<u32, Vec<u8>> = HashMap::new();
     let mut out = Vec::with_capacity(ss.rows.len());
     for r in &ss.rows {
@@ -234,7 +235,8 @@ impl Brute<'_> {
 
 /// Matches by brute force for one session.
 pub fn session_matches(db: &Db, p: &Pattern, pre: Option<&Expr>, s: u32, now: i64) -> Result<Vec<Match>, QError> {
-    let ss = db.steps(s);
+    let ss_arc = db.steps(s);
+    let ss = &*ss_arc;
     if ss.rows.is_empty() {
         return Ok(Vec::new());
     }
@@ -335,7 +337,13 @@ pub fn compare(db: &Db, src: &str, max_steps: usize) -> Result<(usize, Vec<u32>)
 /// A random `match` query over the store's own tools, for checking.
 pub fn random_query(db: &Db, r: &mut crate::synth::Rng) -> String {
     let sd = db.step_dicts();
-    let mut tools: Vec<(usize, u32)> = (0..sd.tools.len() as u32).map(|t| (sd.tool_post.get(t as usize).map_or(0, |v| v.len()), t)).collect();
+    let mut counts = vec![0usize; sd.tools.len()];
+    for s in 0..db.session_count() as u32 {
+        for r in &db.steps(s).rows {
+            counts[r.tool as usize] += 1;
+        }
+    }
+    let mut tools: Vec<(usize, u32)> = counts.into_iter().enumerate().map(|(t, n)| (n, t as u32)).collect();
     tools.sort_by(|a, b| b.cmp(a));
     let names: Vec<String> = tools.iter().take(6).map(|(_, t)| String::from_utf8_lossy(sd.tools.get(*t)).into_owned()).collect();
     if names.is_empty() {

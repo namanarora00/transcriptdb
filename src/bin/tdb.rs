@@ -7,6 +7,7 @@
 //!   tdb compact       --store DIR
 //!   tdb bench         --store DIR [--n 300] [--seed S]
 //!   tdb crash-test    --store DIR [--kills 1000] [--seed S] [--sync full|fsync|os]
+//!   tdb growth        --store DIR [--rounds 5] [--base 300] [--wake 0.1] [--cache-mb 256] [--flush-mb 64]
 //!
 //! Real logs are read from `--logs` (default `~/.claude/projects`) at run time only.
 //! Output is counts, sizes and times; no log content is printed.
@@ -81,6 +82,7 @@ impl Args {
             level: self.num("level", 3) as i32,
             frame_size: (self.num("frame-kb", 64) as usize) << 10,
             keep: self.keep(),
+            cache_bytes: (self.num("cache-mb", 256) as usize) << 20,
             ..Options::default()
         }
     }
@@ -277,7 +279,7 @@ fn check_claude(a: &Args) {
                     }
                     bytes.fetch_add(out.len(), Ordering::Relaxed);
                     let h = sha256(&out);
-                    let stored_ok = h == db.request(ri).digest;
+                    let stored_ok = db.request(ri).is_ok_and(|r| r.digest == h);
                     let log_ok = d.is_none_or(|d| d == h);
                     if !stored_ok {
                         bad_stored.fetch_add(1, Ordering::Relaxed);
@@ -327,7 +329,7 @@ fn check_claude(a: &Args) {
                             }
                             let ri = db.request_index(&list[i].0).unwrap();
                             let good = match (split::blank_dropped(body, &keep), db.rebuild(ri)) {
-                                (Ok(want), Ok(got)) => sha256(body) == db.request(ri).digest && want == got,
+                                (Ok(want), Ok(got)) => db.request(ri).is_ok_and(|r| r.digest == sha256(body)) && want == got,
                                 _ => false,
                             };
                             if good {
@@ -403,29 +405,49 @@ fn check_claude(a: &Args) {
 }
 
 fn stats(a: &Args) {
+    let t = Instant::now();
     let db = Db::open(a.store(), a.opts()).expect("open store");
+    let t_open = t.elapsed().as_secs_f64();
     let st = db.stats();
-    let n = db.request_count() as u32;
+    let mem_line = format!(
+        "memory after open: catalogs {} for {} files, sessions taking writes {} ({}), unflushed {}",
+        mb(st.catalog_bytes as u64),
+        st.segments + st.blobs,
+        mb(st.active_bytes as u64),
+        st.active_sessions,
+        mb(st.mem_bytes as u64)
+    );
     let mut runs: HashMap<u32, usize> = HashMap::new();
     let mut msgs = 0u64;
-    for i in 0..n {
+    let all = db.all_requests().expect("list requests");
+    for &i in &all {
         *runs.entry(db.request_runs(i).unwrap()).or_default() += 1;
-        msgs += db.request(i).n_msgs as u64;
+        msgs += db.request(i).unwrap().n_msgs as u64;
     }
+    let n = all.len();
     let opaque_text: u64 = st.opaque_bytes * 4 / 3;
-    let data = st.frame_bytes + st.piece_bytes + st.opq_file_bytes + st.index_bytes;
+    let data = st.seg_file_bytes + st.blob_file_bytes;
     println!("sessions {}  requests {}  messages in requests {}  stored messages (tree nodes) {}", st.sessions, st.requests, msgs, st.nodes);
     println!("distinct message text: {} ({} message bytes + about {} of base64 opaque values)", mb(st.node_bytes + opaque_text), mb(st.node_bytes), mb(opaque_text));
-    println!("on disk: segments {} + opaque {} = {} across {} segment(s); log {}", mb(st.seg_file_bytes), mb(st.opq_file_bytes), mb(st.seg_file_bytes + st.opq_file_bytes), st.segments, mb(st.wal_bytes));
+    println!(
+        "on disk: segments {} + blob files {} = {}; {} segment(s) ({} from flushes not merged yet), {} blob file(s); log {}",
+        mb(st.seg_file_bytes),
+        mb(st.blob_file_bytes),
+        mb(data),
+        st.segments,
+        st.level0,
+        st.blobs,
+        mb(st.wal_bytes)
+    );
     println!("  message frames {}  ({:.2}x smaller than the {} they hold)", mb(st.frame_bytes), st.node_bytes as f64 / st.frame_bytes.max(1) as f64, mb(st.node_bytes));
-    println!("  opaque values {} raw ({} values kept, {} not kept)", mb(st.opq_file_bytes), st.opaques - st.opaques_dropped, st.opaques_dropped);
+    println!("  opaque values {} raw ({} values kept, {} not kept)", mb(st.opaque_bytes), st.opaques - st.opaques_dropped, st.opaques_dropped);
     println!("  shared pieces {} compressed from {} ({} pieces: skeletons, system, tools, markers)", mb(st.piece_bytes), mb(st.piece_raw_bytes), st.pieces);
     println!("  index {}", mb(st.index_bytes));
     println!("  all data files: {} for {} of distinct text ({:.3} bytes per byte)", mb(data), mb(st.node_bytes + opaque_text), data as f64 / (st.node_bytes + opaque_text).max(1) as f64);
     if a.get("opaque").is_some() {
         let total = data.max(1) as f64;
         println!("  opaque values by kind (kept: values, size, share of all data files; not kept: values, size they had):");
-        for (kind, n, bytes, nd, dbytes) in db.opaque_kinds() {
+        for (kind, n, bytes, nd, dbytes) in db.opaque_kinds().expect("opaque kinds") {
             println!("    {:<20} {:>8}  {:>10}  {:>5.1}%    {:>8}  {:>10}", kind, n, mb(bytes), bytes as f64 * 100.0 / total, nd, mb(dbytes));
         }
     }
@@ -434,27 +456,34 @@ fn stats(a: &Args) {
     let tot = n.max(1) as f64;
     let line: Vec<String> = rv.iter().take(6).map(|(r, c)| format!("{r} run(s): {} ({:.1}%)", c, *c as f64 * 100.0 / tot)).collect();
     println!("storage runs per request: {}; max {}", line.join(", "), rv.last().map(|x| x.0).unwrap_or(0));
+    println!("{mem_line}; opened in {t_open:.3}s");
+    let st = db.stats();
+    let c: Vec<String> = st.caches.iter().map(|(k, c)| format!("{k} {}", mb(c.bytes as u64))).collect();
+    println!("caches after reading every request (budget {} in all): {}", mb(a.opts().cache_bytes as u64), c.join(", "));
 }
+
 
 fn compact(a: &Args) {
     let mut db = Db::open(a.store(), a.opts()).expect("open store");
     let t = Instant::now();
     db.compact().expect("compact");
-    println!("merged into one segment in {:.1}s", t.elapsed().as_secs_f64());
+    println!("merged into {} segment(s), each session whole and main line first, in {:.1}s", db.segment_count(), t.elapsed().as_secs_f64());
 }
 
 fn bench(a: &Args) {
     let db = Db::open(a.store(), a.opts()).expect("open store");
     let n = a.num("n", 300) as usize;
     let mut r = Rng::new(a.num("seed", 5));
-    let total = db.request_count() as u64;
-    let pick: Vec<u32> = (0..n).map(|_| r.below(total) as u32).collect();
-    let long: Vec<u32> = (0..total as u32).filter(|&i| db.request(i).n_msgs >= 40).collect();
-    let ranges: Vec<(u32, u32, usize)> = (0..n.min(long.len() * 4))
+    let all = db.all_requests().expect("list requests");
+    let total = all.len() as u64;
+    let pick: Vec<u64> = (0..n).map(|_| all[r.below(total) as usize]).collect();
+    let long: Vec<u64> = all.iter().copied().filter(|&i| db.request(i).unwrap().n_msgs >= 40).collect();
+    let ranges: Vec<(u64, u32, usize)> = (0..n.min(long.len() * 4))
         .map(|_| {
             let ri = *r.pick(&long);
-            let k = r.below(db.request(ri).n_msgs as u64 - 40 + 1) as usize;
-            (ri, db.request(ri).session, k)
+            let rec = db.request(ri).unwrap();
+            let k = r.below(rec.n_msgs as u64 - 40 + 1) as usize;
+            (ri, rec.session, k)
         })
         .collect();
     let sessions: Vec<u32> = (0..n.min(db.session_count())).map(|_| r.below(db.session_count() as u64) as u32).collect();
@@ -523,7 +552,8 @@ fn steps_summary(a: &Args) {
     let mut total = 0usize;
     let mut forked = 0usize;
     for s in 0..db.session_count() as u32 {
-        let ss = db.steps(s);
+        let ss_arc = db.steps(s);
+        let ss = &*ss_arc;
         total += ss.rows.len();
         for (i, r) in ss.rows.iter().enumerate() {
             let e = per_tool.entry(r.tool).or_default();
@@ -536,7 +566,7 @@ fn steps_summary(a: &Args) {
         }
     }
     let shape_bytes: usize = (0..db.session_count() as u32).map(|s| db.steps(s).shape.len()).sum();
-    println!("steps {total} in {} sessions; {} tools, {} input fields, {} distinct short values", db.session_count(), sd.tools.len(), sd.fields.len(), sd.values.iter().map(|d| d.len()).sum::<usize>());
+    println!("steps {total} in {} sessions; {} tools, {} input fields, {} short values (distinct per session)", db.session_count(), sd.tools.len(), sd.fields.len(), (0..db.session_count() as u32).map(|s| db.steps(s).vals.iter().map(|(_, d)| d.len()).sum::<usize>()).sum::<usize>());
     println!("shape strings: {} bytes in all; steps whose prev is not the step before (forks, parallel calls): {forked}", shape_bytes);
     let mut v: Vec<_> = per_tool.into_iter().collect();
     v.sort_by_key(|x| std::cmp::Reverse(x.1 .0));
@@ -575,11 +605,11 @@ fn head_to_head(a: &Args) {
         println!("{}", h2h::load(&db, &mut pg).expect("load"));
     }
     let st = db.stats();
-    let engine_bytes = st.seg_file_bytes + st.opq_file_bytes;
+    let engine_bytes = st.seg_file_bytes + st.blob_file_bytes;
     let sizes = h2h::pg_sizes(&mut pg).expect("sizes");
     let pg_total: u64 = sizes.iter().map(|x| x.1).sum();
     println!("\n== size on disk");
-    println!("  TranscriptDB store: {} (segments {}, opaque {})", mb(engine_bytes), mb(st.seg_file_bytes), mb(st.opq_file_bytes));
+    println!("  TranscriptDB store: {} (segments {}, blob files {})", mb(engine_bytes), mb(st.seg_file_bytes), mb(st.blob_file_bytes));
     println!("  PostgreSQL tables with indexes and TOAST: {} ({})", mb(pg_total), sizes.iter().map(|(n, b)| format!("{n} {}", mb(*b))).collect::<Vec<_>>().join(", "));
     println!("  PostgreSQL / TranscriptDB: {:.2}x", pg_total as f64 / engine_bytes as f64);
     let reps = a.num("reps", 5) as usize;
@@ -750,7 +780,9 @@ const CRASH_PER: usize = 30;
 fn crash_child(a: &Args) {
     let seed = a.num("seed", 1);
     let run = a.num("run", 0);
-    let opts = Options { sync: a.sync(), flush_bytes: 384 << 10, ..Options::default() };
+    // small flushes, frequent merges into small segments, sessions leaving memory after one
+    // idle flush and tiny caches: kills land in every part of the write path
+    let opts = Options { sync: a.sync(), flush_bytes: 384 << 10, merge_at: 3, seg_bytes: 1 << 20, idle_flushes: 1, cache_bytes: 4 << 20, ..Options::default() };
     let mut db = Db::open(a.store(), opts).expect("open store");
     {
         let mut l = std::io::stdout().lock();
@@ -897,8 +929,8 @@ fn crash_test(a: &Args) {
     // final full check: every acknowledged request, and every stored request against the generator
     let db = Db::open(&dir, Options { sync: SyncMode::Os, ..Options::default() }).expect("recovery failed");
     let mut stored_wrong = 0;
-    for i in 0..db.request_count() as u32 {
-        let id = db.request(i).id.to_string();
+    for i in db.all_requests().expect("list requests") {
+        let id = db.request(i).expect("read request").id.to_string();
         let want = expect(&id, &mut expected);
         if db.rebuild(i).map(|b| sha256(&b) != want).unwrap_or(true) {
             stored_wrong += 1;
@@ -940,10 +972,149 @@ fn main() {
         "bench" => bench(&a),
         "crash-child" => crash_child(&a),
         "crash-test" => crash_test(&a),
+        "growth" => growth(&a),
+        "probe" => probe(&a),
         _ => {
             eprintln!("usage: tdb <ingest-claude|check-claude|stats|compact|bench|crash-test> --store DIR [options]");
             std::process::exit(2);
         }
     }
     let _ = Path::new(".");
+}
+
+/// Highest resident memory of this process so far, in bytes.
+fn peak_rss() -> u64 {
+    let mut u: libc::rusage = unsafe { std::mem::zeroed() };
+    unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut u) };
+    let v = u.ru_maxrss as u64;
+    if cfg!(target_os = "macos") { v } else { v * 1024 }
+}
+
+/// Open a store and use it a little, for `growth`: one line of numbers.
+fn probe(a: &Args) {
+    let t = Instant::now();
+    let db = Db::open(a.store(), a.opts()).expect("open store");
+    let open_s = t.elapsed().as_secs_f64();
+    let rss_open = peak_rss();
+    let st = db.stats();
+    let mut r = Rng::new(a.num("seed", 3));
+    let mut lat = Vec::new();
+    for _ in 0..a.num("n", 200) {
+        let s = r.below(db.session_count() as u64) as u32;
+        let reqs = db.session_requests(s);
+        let ri = reqs[r.below(reqs.len() as u64) as usize];
+        let t = Instant::now();
+        db.rebuild(ri).expect("rebuild");
+        lat.push(t.elapsed().as_secs_f64() * 1e3);
+    }
+    let rss_reads = peak_rss();
+    let t = Instant::now();
+    let res = transcriptdb::query::run(&db, r#"where tool == "Bash" and failed | summarize n = count()"#, 1).expect("query");
+    let q_s = t.elapsed().as_secs_f64();
+    let rss_query = peak_rss();
+    let hits = transcriptdb::query::exec::render(&db, &res.table, 1).map(|(_, c)| c.first().and_then(|r| r.first()).cloned().unwrap_or_default()).unwrap_or_default();
+    println!(
+        "PROBE {open_s:.4} {} {rss_open} {:.3} {:.3} {rss_reads} {q_s:.3} {rss_query} {} {} {} {hits}",
+        st.catalog_bytes,
+        q(&mut lat.clone(), 0.5),
+        q(&mut lat, 0.99),
+        st.segments,
+        st.level0,
+        st.blobs
+    );
+}
+
+/// Grow a store from 1x to 2^(rounds-1)x synthetic sessions and measure, after each round
+/// and in a fresh process, what opening and using it costs. A share of sessions pause and
+/// take more requests a round later, after their data has been flushed and merged.
+fn growth(a: &Args) {
+    let dir = a.store();
+    let _ = std::fs::remove_dir_all(&dir);
+    let rounds = a.num("rounds", 5);
+    let base = a.num("base", 300);
+    let wake: f64 = a.get("wake").map(|v| v.parse().expect("number")).unwrap_or(0.1);
+    let seed = a.num("seed", 17);
+    let opts = Options { sync: SyncMode::Os, ..a.opts() };
+    let mut db = Db::open(&dir, opts.clone()).expect("open store");
+    let mut r = Rng::new(seed);
+    let mut next_no = 0u64;
+    let mut waiting: Vec<Vec<synth::SynthRequest>> = Vec::new();
+    let (mut raw, mut woken) = (0u64, 0u64);
+    let mut acc = transcriptdb::db::MergeStats::default();
+    let exe = std::env::current_exe().expect("own path");
+    println!("round  sessions  requests   raw in    store  | open s  catalogs  RSS open  RSS reads | read med  p99 ms | query s  RSS query | segs (L0) blobs | rewritten | ingest MB/s");
+    for round in 0..rounds {
+        let target = base << round;
+        let t = Instant::now();
+        let mut queue: Vec<Vec<synth::SynthRequest>> = std::mem::take(&mut waiting);
+        woken += queue.len() as u64;
+        while next_no < target {
+            let mut reqs = synth::session(seed, next_no, 45);
+            if r.chance(wake) {
+                waiting.push(reqs.split_off(30));
+            }
+            queue.push(reqs);
+            next_no += 1;
+        }
+        let mut round_raw = 0u64;
+        // like real traffic: 64 sessions at a time, their requests interleaved
+        for chunk in queue.chunks_mut(64) {
+            for s in chunk.iter_mut() {
+                s.reverse();
+            }
+            loop {
+                let mut any = false;
+                for s in chunk.iter_mut() {
+                    if let Some(q) = s.pop() {
+                        db.put(&Put { session: &q.session, agent: &q.agent, id: &q.id, time: &q.time, meta: b"", body: &q.body, digest: None }).expect("put");
+                        round_raw += q.body.len() as u64;
+                        any = true;
+                    }
+                }
+                db.commit().expect("commit");
+                if !any {
+                    break;
+                }
+            }
+        }
+        db.flush().expect("flush");
+        raw += round_raw;
+        let ingest_s = t.elapsed().as_secs_f64();
+        let st = db.stats();
+        acc.merges += st.merges.merges;
+        acc.flushed += st.merges.flushed;
+        acc.bytes_out += st.merges.bytes_out;
+        // the probe opens the store in its own process; one process at a time
+        drop(db);
+        let out = Command::new(&exe).args(["probe", "--store", dir.to_str().unwrap(), "--cache-mb", &a.num("cache-mb", 256).to_string()]).output().expect("run probe");
+        let text = String::from_utf8_lossy(&out.stdout);
+        let line = text.lines().find(|l| l.starts_with("PROBE ")).unwrap_or_else(|| panic!("probe failed: {}", String::from_utf8_lossy(&out.stderr)));
+        let f: Vec<&str> = line.split_whitespace().skip(1).collect();
+        db = Db::open(&dir, opts.clone()).expect("open store again");
+        let store = st.seg_file_bytes + st.blob_file_bytes;
+        let rewritten = (acc.flushed + acc.bytes_out) as f64 / store.max(1) as f64;
+        let n = |i: usize| -> f64 { f[i].parse().unwrap_or(0.0) };
+        println!(
+            "{round:>5}  {:>8}  {:>8}  {:>8}  {:>7}  | {:>6.3}  {:>8}  {:>8}  {:>9} | {:>8.3}  {:>6.3} | {:>7.3}  {:>9} | {:>4} ({}) {:>5} | {:>8.2}x | {:>6.0}",
+            st.sessions,
+            st.requests,
+            mb(raw),
+            mb(store),
+            n(0),
+            mb(n(1) as u64),
+            mb(n(2) as u64),
+            mb(n(5) as u64),
+            n(3),
+            n(4),
+            n(6),
+            mb(n(7) as u64),
+            f[8],
+            f[9],
+            f[10],
+            rewritten,
+            round_raw as f64 / 1e6 / ingest_s
+        );
+    }
+    let st = db.stats();
+    println!("sessions woken after their data was flushed and merged: {woken}; merges {}; bytes written by flushes {} and merges {} for a store of {}", acc.merges, mb(acc.flushed), mb(acc.bytes_out), mb(st.seg_file_bytes + st.blob_file_bytes));
 }

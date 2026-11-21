@@ -153,8 +153,8 @@ pub fn load(db: &Db, pg: &mut Pg) -> R<String> {
     })
     .map_err(pe)?;
     pg.copy_in("COPY requests FROM STDIN", |c| {
-        for ri in 0..db.request_count() as u32 {
-            let r = db.request(ri);
+        for ri in db.all_requests().map_err(|e| PgError(e.to_string()))? {
+            let r = db.request(ri).map_err(|e| PgError(e.to_string()))?;
             let path = db.request_path(ri).map_err(|e| PgError(e.to_string()))?;
             let arr: Vec<String> = path.iter().map(|&n| node_msg[r.session as usize][n as usize].to_string()).collect();
             c.field(Some(r.id.as_bytes()));
@@ -187,7 +187,8 @@ pub fn load(db: &Db, pg: &mut Pg) -> R<String> {
     }
     pg.copy_in("COPY steps FROM STDIN", |c| {
         for s in 0..ns {
-            let ss = db.steps(s);
+            let ss_arc = db.steps(s);
+            let ss = &*ss_arc;
             let (turn_of, depth, _) = &steps_cache[s as usize];
             for (pos, r) in ss.rows.iter().enumerate() {
                 c.int(s as i64);
@@ -213,7 +214,8 @@ pub fn load(db: &Db, pg: &mut Pg) -> R<String> {
     let mut path_rows = 0usize;
     pg.copy_in("COPY path_steps FROM STDIN", |c| {
         for s in 0..ns {
-            let ss = db.steps(s);
+            let ss_arc = db.steps(s);
+            let ss = &*ss_arc;
             let (turn_of, depth, paths) = &steps_cache[s as usize];
             let mut steps_of: HashMap<u32, Vec<u32>> = HashMap::new();
             for (pos, &t) in turn_of.iter().enumerate() {
@@ -503,12 +505,13 @@ pub fn run_reads(db: &Db, pg: &mut Pg, n: usize, seed: u64) -> R<Vec<ReadOutcome
     let mut r = Rng::new(seed);
     let mut res = Vec::new();
     let e = |x: crate::codec::Error| x.to_string();
+    let all = db.all_requests().map_err(e)?;
     // 1. a request's messages, in order
     {
         let (mut te, mut tp, mut same) = (Vec::new(), Vec::new(), 0);
         for _ in 0..n {
-            let ri = r.below(db.request_count() as u64) as u32;
-            let rec = db.request(ri);
+            let ri = all[r.below(all.len() as u64) as usize];
+            let rec = db.request(ri).map_err(e)?;
             let a = Instant::now();
             let path = db.request_path(ri).map_err(e)?;
             let msgs = db.read_messages(rec.session, &path, &mut ReadStats::default()).map_err(e)?;
@@ -532,7 +535,8 @@ pub fn run_reads(db: &Db, pg: &mut Pg, n: usize, seed: u64) -> R<Vec<ReadOutcome
         let (mut te, mut tp, mut same) = (Vec::new(), Vec::new(), 0);
         for _ in 0..n {
             let s = *r.pick(&long);
-            let ss = db.steps(s);
+            let ss_arc = db.steps(s);
+            let ss = &*ss_arc;
             let k = r.below(ss.rows.len() as u64 - 19) as usize;
             let a = Instant::now();
             let mut ids = Vec::with_capacity(40);

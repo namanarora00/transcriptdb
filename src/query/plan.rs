@@ -11,7 +11,7 @@ use super::QError;
 use crate::db::Db;
 use crate::record::NONE;
 use crate::steps::{self, SessionSteps};
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 /// A column of a step.
@@ -83,7 +83,8 @@ pub fn long_value(db: &Db, s: u32, ss: &SessionSteps, pos: u32, v: u32, name: &s
 
 /// The value of one step column.
 pub fn step_value(db: &Db, s: u32, pos: u32, col: &StepCol) -> Result<Value, QError> {
-    let ss = db.steps(s);
+    let ss_arc = db.steps(s);
+    let ss = &*ss_arc;
     let r = ss.rows[pos as usize];
     let sd = db.step_dicts();
     Ok(match col {
@@ -103,7 +104,7 @@ pub fn step_value(db: &Db, s: u32, pos: u32, col: &StepCol) -> Result<Value, QEr
                     Some(t) => Value::from_json(&t),
                     None => Value::Null,
                 },
-                Some(&(_, v)) => Value::from_json(sd.values[f as usize].get(v)),
+                Some(&(_, v)) => Value::from_json(ss.value(f, v)),
             }
         }
     })
@@ -169,14 +170,14 @@ pub enum Sp {
     Const(bool),
     /// By tool code.
     Tool(Arc<[bool]>),
-    /// By value code of input field `f`, worked out the first time a step has that value
-    /// (0 = not yet, 1 = false, 2 = true); `missing` when the step lacks the field; long values
-    /// are read (just their bytes) and tested with `expr`.
-    Field { name: String, f: Option<u32>, table: Arc<[AtomicU8]>, missing: bool, expr: Arc<Expr> },
-    /// `isnotnull(field)` (`want`) or `isnull(field)`; `null` is the code of a JSON null.
-    Present { f: Option<u32>, null: Option<u32>, want: bool },
-    /// By session index.
-    Session(Arc<[bool]>),
+    /// By value of input field `f`: each session's value is tested the first time a step
+    /// has it, and remembered for that session (see [`Memo`]); `missing` when the step lacks
+    /// the field; long values are read (just their bytes) and tested with `expr`.
+    Field { name: String, f: Option<u32>, uid: u64, missing: bool, expr: Arc<Expr> },
+    /// `isnotnull(field)` (`want`) or `isnull(field)`.
+    Present { f: Option<u32>, want: bool },
+    /// By session (its id or agent), tested once per session.
+    Session { uid: u64, col: StepCol, expr: Arc<Expr> },
     /// Evaluated per step.
     Generic(Arc<Expr>),
     And(Vec<Sp>),
@@ -200,9 +201,43 @@ fn single_col(e: &Expr) -> Result<Option<StepCol>, QError> {
 }
 
 thread_local! {
-    /// Compiled one-column tests, so a test repeated in one query is evaluated over its
-    /// dictionary once. Cleared at the start of every query.
+    /// Compiled one-column tests, so a test repeated in one query shares its memo. Cleared
+    /// at the start of every query.
     static ATOMS: std::cell::RefCell<std::collections::HashMap<String, Sp>> = std::cell::RefCell::new(std::collections::HashMap::new());
+    static MEMO: std::cell::RefCell<Memo> = std::cell::RefCell::new(Memo::default());
+}
+
+static NEXT_UID: AtomicU64 = AtomicU64::new(1);
+
+/// Per thread, for the session being tested: one table per field test, indexed by the
+/// session's value code (0 = not yet, 1 = false, 2 = true), and session tests' answers.
+/// Each session has its own value codes, so the tables start over with each session.
+#[derive(Default)]
+struct Memo {
+    session: u32,
+    steps: usize,
+    tables: Vec<(u64, Vec<u8>)>,
+}
+
+impl Memo {
+    fn for_session(&mut self, s: u32, ss: &SessionSteps) {
+        let id = ss as *const SessionSteps as usize;
+        if self.session != s || self.steps != id {
+            self.session = s;
+            self.steps = id;
+            self.tables.clear();
+        }
+    }
+    fn table(&mut self, uid: u64, n: usize) -> &mut Vec<u8> {
+        let i = match self.tables.iter().position(|t| t.0 == uid) {
+            Some(i) => i,
+            None => {
+                self.tables.push((uid, vec![0; n]));
+                self.tables.len() - 1
+            }
+        };
+        &mut self.tables[i].1
+    }
 }
 
 pub fn clear_cache() {
@@ -258,24 +293,12 @@ fn compile_atom(db: &Db, e: &Expr, now: i64) -> Result<Sp, QError> {
                 // isnull / isnotnull need no value at all
                 if let Expr::Call(fun, args) = e
                     && (fun == "isnull" || fun == "isnotnull") && args.len() == 1 && matches!(args[0], Expr::Ref(_)) {
-                        let null = f.and_then(|f| sd.values[f as usize].code(b"null"));
-                        return Ok(Sp::Present { f, null, want: fun == "isnotnull" });
+                        return Ok(Sp::Present { f, want: fun == "isnotnull" });
                     }
-                let n = f.map(|f| sd.values[f as usize].len()).unwrap_or(0);
-                let table: Arc<[AtomicU8]> = (0..n).map(|_| AtomicU8::new(0)).collect();
                 let missing = eval(e, &OneCol { col: &col, v: Value::Null, now })?.truthy();
-                Sp::Field { name, f, table, missing, expr: Arc::new(e.clone()) }
+                Sp::Field { name, f, uid: NEXT_UID.fetch_add(1, Ordering::Relaxed), missing, expr: Arc::new(e.clone()) }
             }
-            Some(c @ (StepCol::Session | StepCol::Agent)) => {
-                let t: Vec<bool> = (0..db.session_count() as u32)
-                    .map(|s| {
-                        let k = db.session_key(s);
-                        let v = if c == StepCol::Session { &k.0 } else { &k.1 };
-                        eval(e, &OneCol { col: &c, v: Value::Str(v.as_str().into()), now }).map(|v| v.truthy())
-                    })
-                    .collect::<Result<_, _>>()?;
-                Sp::Session(t.into())
-            }
+            Some(c @ (StepCol::Session | StepCol::Agent)) => Sp::Session { uid: NEXT_UID.fetch_add(1, Ordering::Relaxed), col: c, expr: Arc::new(e.clone()) },
             _ => Sp::Generic(Arc::new(e.clone())),
         }
     })
@@ -321,7 +344,7 @@ impl Sp {
         Ok(match self {
             Sp::Const(b) => *b,
             Sp::Tool(t) => t[ss.rows[pos as usize].tool as usize],
-            Sp::Field { name, f, table, missing, expr } => {
+            Sp::Field { name, f, uid, missing, expr } => {
                 let Some(f) = f else { return Ok(*missing) };
                 match ss.fields_of(pos).iter().find(|x| x.0 == *f) {
                     None => *missing,
@@ -333,22 +356,29 @@ impl Sp {
                         };
                         eval(expr, &OneCol { col: &col, v: val, now })?.truthy()
                     }
-                    Some(&(_, v)) => match table[v as usize].load(Ordering::Relaxed) {
-                        1 => false,
-                        2 => true,
-                        _ => {
-                            let b = test_raw(expr, name, db.step_dicts().values[*f as usize].get(v), now)?;
-                            table[v as usize].store(if b { 2 } else { 1 }, Ordering::Relaxed);
-                            b
+                    Some(&(_, v)) => {
+                        let known = MEMO.with(|m| {
+                            let mut m = m.borrow_mut();
+                            m.for_session(s, ss);
+                            m.table(*uid, ss.value_count(*f))[v as usize]
+                        });
+                        match known {
+                            1 => false,
+                            2 => true,
+                            _ => {
+                                let b = test_raw(expr, name, ss.value(*f, v), now)?;
+                                MEMO.with(|m| m.borrow_mut().table(*uid, ss.value_count(*f))[v as usize] = if b { 2 } else { 1 });
+                                b
+                            }
                         }
-                    },
+                    }
                 }
             }
-            Sp::Present { f, null, want } => {
-                let present = f.is_some_and(|f| ss.fields_of(pos).iter().any(|x| x.0 == f && Some(x.1) != *null));
+            Sp::Present { f, want } => {
+                let present = f.is_some_and(|f| ss.fields_of(pos).iter().any(|x| x.0 == f && (steps::is_long(x.1) || ss.value(f, x.1) != b"null")));
                 present == *want
             }
-            Sp::Session(t) => t[s as usize],
+            Sp::Session { .. } => !self.session_false(db, s, ss, now)?,
             Sp::Generic(e) => eval(e, &StepCtx { db, s, pos, now })?.truthy(),
             Sp::And(v) => {
                 for x in v {
@@ -394,7 +424,7 @@ impl Sp {
                 r
             }
             Sp::Not(x) => !x.shape_eval(db, tool, failed, now)?,
-            Sp::Field { .. } | Sp::Present { .. } | Sp::Session(_) => return None,
+            Sp::Field { .. } | Sp::Present { .. } | Sp::Session { .. } => return None,
         })
     }
 
@@ -446,14 +476,45 @@ impl Sp {
     }
 
     /// True when no step of session `s` can pass (decided from session columns alone).
-    pub fn session_false(&self, s: u32) -> bool {
-        match self {
+    pub fn session_false(&self, db: &Db, s: u32, ss: &SessionSteps, now: i64) -> Result<bool, QError> {
+        Ok(match self {
             Sp::Const(b) => !*b,
-            Sp::Session(t) => !t[s as usize],
-            Sp::And(v) => v.iter().any(|x| x.session_false(s)),
-            Sp::Or(v) => v.iter().all(|x| x.session_false(s)),
+            Sp::Session { uid, col, expr } => {
+                let known = MEMO.with(|m| {
+                    let mut m = m.borrow_mut();
+                    m.for_session(s, ss);
+                    m.table(*uid, 1)[0]
+                });
+                match known {
+                    1 => true,
+                    2 => false,
+                    _ => {
+                        let k = db.session_key(s);
+                        let v = if *col == StepCol::Session { k.0 } else { k.1 };
+                        let pass = eval(expr, &OneCol { col, v: Value::Str(v.as_str().into()), now })?.truthy();
+                        MEMO.with(|m| m.borrow_mut().table(*uid, 1)[0] = if pass { 2 } else { 1 });
+                        !pass
+                    }
+                }
+            }
+            Sp::And(v) => {
+                for x in v {
+                    if x.session_false(db, s, ss, now)? {
+                        return Ok(true);
+                    }
+                }
+                false
+            }
+            Sp::Or(v) => {
+                for x in v {
+                    if !x.session_false(db, s, ss, now)? {
+                        return Ok(false);
+                    }
+                }
+                true
+            }
             _ => false,
-        }
+        })
     }
 }
 
@@ -480,15 +541,13 @@ impl Test {
         self.sp.test(db, s, ss, pos, now)
     }
 
-    /// False when session `s` has none of the tools this test needs.
-    pub fn possible_in(&self, ss: &SessionSteps, s: u32) -> bool {
-        if self.sp.session_false(s) {
-            return false;
-        }
-        match &self.tools {
+    /// False when session `s` has none of the tools this test needs, or fails a session test.
+    pub fn possible_in(&self, db: &Db, ss: &SessionSteps, s: u32, now: i64) -> Result<bool, QError> {
+        let tools = match &self.tools {
             None => true,
             Some(t) => t.iter().enumerate().any(|(i, &b)| b && ss.has_tool(i as u32)),
-        }
+        };
+        Ok(tools && !self.sp.session_false(db, s, ss, now)?)
     }
 }
 

@@ -6,6 +6,10 @@
 
 #![allow(clippy::needless_range_loop, clippy::should_implement_trait, clippy::type_complexity)]
 
+pub mod blob;
+pub mod block;
+pub mod bloom;
+pub mod cache;
 pub mod check;
 pub mod claude;
 pub mod codec;
@@ -24,5 +28,5 @@ pub mod synth;
 pub mod trace;
 pub mod wal;
 
-pub use db::{Db, Options, Put, PutOutcome, ReadStats, Stats};
+pub use db::{req_id, req_parts, Db, Options, Put, PutOutcome, ReadStats, ReqId, Stats};
 pub use wal::SyncMode;

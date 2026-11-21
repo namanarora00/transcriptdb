@@ -208,8 +208,9 @@ pub struct RawField {
     pub len: u32,
 }
 
-/// One session's steps as columns.
-#[derive(Debug, Default)]
+/// One session's steps as columns. Tool and field codes are the store's (see
+/// [`StepDicts`]); input values are coded per session, in `vals`.
+#[derive(Debug, Default, Clone)]
 pub struct SessionSteps {
     pub rows: Vec<StepRow>,
     /// Fields of step `i` are `fields[fstart[i]..fstart[i + 1]]`.
@@ -220,11 +221,14 @@ pub struct SessionSteps {
     pub longs: Vec<(u32, u32)>,
     /// One shape code per step.
     pub shape: Vec<u8>,
+    /// Per field id seen in this session: its values.
+    pub vals: Vec<(u32, Dict)>,
     /// Per tree node: the last step completed at or above it on its path (`NONE` if none).
+    /// Kept only while the session takes writes.
     pub tail: Vec<u32>,
     /// Steps `0..flushed` are in segments.
     pub flushed: u32,
-    /// Calls seen since the store opened, by tool_use id.
+    /// Calls seen since the session was loaded for writing, by tool_use id.
     pub calls: HashMap<Box<[u8]>, CallInfo>,
     /// Bitset of tool codes present in the session.
     pub tool_set: Vec<u64>,
@@ -246,43 +250,90 @@ impl SessionSteps {
         }
         &self.fields[self.fstart[i as usize] as usize..self.fstart[i as usize + 1] as usize]
     }
+
+    /// Values of field `f` in this session.
+    pub fn field_dict(&self, f: u32) -> Option<&Dict> {
+        self.vals.iter().find(|x| x.0 == f).map(|x| &x.1)
+    }
+
+    /// The JSON text of value `v` of field `f` (a short value; see [`is_long`]).
+    pub fn value(&self, f: u32, v: u32) -> &[u8] {
+        self.field_dict(f).expect("field present in session").get(v)
+    }
+
+    pub fn value_code(&self, f: u32, text: &[u8]) -> Option<u32> {
+        self.field_dict(f)?.code(text)
+    }
+
+    pub fn value_count(&self, f: u32) -> usize {
+        self.field_dict(f).map_or(0, |d| d.len())
+    }
+
+    pub fn intern_value(&mut self, f: u32, text: &[u8]) -> u32 {
+        let i = match self.vals.iter().position(|x| x.0 == f) {
+            Some(i) => i,
+            None => {
+                self.vals.push((f, Dict::default()));
+                self.vals.len() - 1
+            }
+        };
+        self.vals[i].1.intern(text)
+    }
+
+    /// Append a step, keeping shape codes and the tool set in step.
+    pub fn push(&mut self, row: StepRow, fields: &[(u32, FieldVal)]) -> u32 {
+        let pos = self.rows.len() as u32;
+        if self.fstart.is_empty() {
+            self.fstart.push(0);
+        }
+        self.rows.push(row);
+        for &(f, v) in fields {
+            let code = match v {
+                FieldVal::Code(c) => c,
+                FieldVal::Long { off, len } => {
+                    self.longs.push((off, len));
+                    LONG_BASE + self.longs.len() as u32 - 1
+                }
+            };
+            self.fields.push((f, code));
+        }
+        self.fstart.push(self.fields.len() as u32);
+        self.shape.push(StepDicts::shape_code(row.tool, row.failed));
+        let w = (row.tool / 64) as usize;
+        if self.tool_set.len() <= w {
+            self.tool_set.resize(w + 1, 0);
+        }
+        self.tool_set[w] |= 1 << (row.tool % 64);
+        pos
+    }
+
+    /// Bytes this takes in memory, roughly.
+    pub fn bytes(&self) -> usize {
+        self.rows.len() * 40 + self.fields.len() * 8 + self.fstart.len() * 4 + self.longs.len() * 8 + self.shape.len() + self.tail.len() * 4 + self.vals.iter().map(|(_, d)| d.bytes() + d.len() * 48).sum::<usize>() + self.calls.len() * 96 + 256
+    }
 }
 
-/// Dictionaries shared by all sessions, plus postings (the field index).
+/// Tool and field names, shared by all sessions: there are few of them, and shared codes
+/// make shape codes and tool tests the same in every session.
 #[derive(Debug, Default)]
 pub struct StepDicts {
     pub tools: Dict,
     pub fields: Dict,
-    /// Per field id: its values.
-    pub values: Vec<Dict>,
-    /// Per tool code: steps as `session << 32 | step`.
-    pub tool_post: Vec<Vec<u64>>,
-    /// Per field id, per value code: steps as `session << 32 | step`.
-    pub value_post: Vec<HashMap<u32, Vec<u64>>>,
 }
 
 impl StepDicts {
     pub fn field(&mut self, name: &[u8]) -> u32 {
-        let f = self.fields.intern(name);
-        while self.values.len() <= f as usize {
-            self.values.push(Dict::default());
-            self.value_post.push(HashMap::new());
-        }
-        f
+        self.fields.intern(name)
     }
 
-    /// Intern a (short) value of a field.
-    pub fn value(&mut self, field: u32, v: &[u8]) -> u32 {
-        self.values[field as usize].intern(v)
-    }
-
-    pub fn call_info(&mut self, node: u32, block: u16, name: &[u8], fields: &[RawField]) -> CallInfo {
+    /// Code a call's tool and fields; short values go into the session's dictionaries.
+    pub fn call_info(&mut self, ss: &mut SessionSteps, node: u32, block: u16, name: &[u8], fields: &[RawField]) -> CallInfo {
         let tool = self.tools.intern(name);
         let fields = fields
             .iter()
             .map(|r| {
                 let f = self.field(&r.key);
-                let v = if r.len as usize > MAX_VALUE { FieldVal::Long { off: r.off, len: r.len } } else { FieldVal::Code(self.values[f as usize].intern(&r.val)) };
+                let v = if r.len as usize > MAX_VALUE { FieldVal::Long { off: r.off, len: r.len } } else { FieldVal::Code(ss.intern_value(f, &r.val)) };
                 (f, v)
             })
             .collect();
@@ -292,44 +343,6 @@ impl StepDicts {
     pub fn shape_code(tool: u32, failed: bool) -> u8 {
         let t = if tool < SHAPE_OTHER as u32 { tool as u8 } else { SHAPE_OTHER };
         t << 1 | failed as u8
-    }
-
-    /// Append a step to a session, keeping shape and postings in step.
-    pub fn push(&mut self, session: u32, ss: &mut SessionSteps, row: StepRow, fields: &[(u32, FieldVal)]) -> u32 {
-        let pos = ss.rows.len() as u32;
-        if ss.fstart.is_empty() {
-            ss.fstart.push(0);
-        }
-        ss.rows.push(row);
-        for &(f, v) in fields {
-            let code = match v {
-                FieldVal::Code(c) => c,
-                FieldVal::Long { off, len } => {
-                    ss.longs.push((off, len));
-                    LONG_BASE + ss.longs.len() as u32 - 1
-                }
-            };
-            ss.fields.push((f, code));
-        }
-        ss.fstart.push(ss.fields.len() as u32);
-        ss.shape.push(Self::shape_code(row.tool, row.failed));
-        let w = (row.tool / 64) as usize;
-        if ss.tool_set.len() <= w {
-            ss.tool_set.resize(w + 1, 0);
-        }
-        ss.tool_set[w] |= 1 << (row.tool % 64);
-        let key = (session as u64) << 32 | pos as u64;
-        let t = row.tool as usize;
-        if self.tool_post.len() <= t {
-            self.tool_post.resize_with(t + 1, Vec::new);
-        }
-        self.tool_post[t].push(key);
-        for &(f, v) in fields {
-            if let FieldVal::Code(c) = v {
-                self.value_post[f as usize].entry(c).or_default().push(key);
-            }
-        }
-        pos
     }
 }
 

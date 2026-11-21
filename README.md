@@ -24,24 +24,53 @@ plus a session id, an agent id (empty for the main agent) and a request id.
    new nodes, on the end of the main line or as a fork (a side query, a rewind, a compaction).
    A request is then just its *tip* node: its messages are the path from the root.
 4. **Opaque store.** In new messages, long base64 strings under `signature` or `data` (thinking
-   signatures, images) are cut out and kept as raw bytes in a separate file per segment
-   (decoded when re-encoding gives the same text back, kept as text otherwise).
+   signatures, images, documents) are cut out and kept as raw bytes (decoded when re-encoding
+   gives the same text back, kept as text otherwise). Each is classified by where it sits, and
+   `Options::keep` (`tdb --drop thinking,images,documents,other`) chooses which kinds to keep:
+   a value not kept is stored as its kind, hash and size only, and requests that held it
+   rebuild with an empty string in its place (thinking text is cut out too when thinking is
+   dropped). Step result sizes still count the original values.
 5. **Shared pieces.** Skeletons, system blocks, tool lists and marker texts are interned by
    hash across all sessions.
 6. **Log.** Everything the request adds goes into one checksummed record in the write-ahead log
    (`src/wal.rs`). `Db::commit` writes and syncs it (`F_FULLFSYNC` on macOS by default); only
    then does the request count as saved. In-memory state only ever changes by applying a log
    record, live or during recovery, so recovery rebuilds exactly the same state.
-7. **Flush** (`src/segment.rs`). Every 64 MB, the in-memory part becomes an immutable segment:
-   per session, the new nodes laid out *main line first* (`src/layout.rs`) and cut into 64 KB
-   zstd frames with an offset table; the pieces; the request records; an index. The manifest
+7. **Flush** (`src/segment.rs`, `src/blob.rs`). Every 64 MB, the in-memory part becomes an
+   immutable level-0 segment and a blob file. The segment holds a *part* of each session it
+   touched: the new nodes laid out *main line first* (`src/layout.rs`) and cut into 64 KB zstd
+   frames, plus the session's new requests and steps, encoded into compressed blocks. The blob
+   file holds the new pieces and opaque values, with dense id ranges. The manifest
    (`src/manifest.rs`) is replaced atomically (write, sync, rename, sync the directory) and old
    log files are deleted.
-8. **Merge** (`Db::compact`). Rewrites all segments into one, each session in one stretch,
-   stored main line first over its whole tree, so most requests become a single run of frames.
+8. **Merge.** Once four level-0 segments wait, they are merged with the level-1 segments whose
+   session ranges they touch (and the last level-1 segment before brand-new sessions, while it
+   is under 256 MB). Each session is rewritten whole, main line first over its whole tree, into
+   level-1 segments split by size and partitioned by session id, so finished sessions settle
+   and are not rewritten again. Blob files are never rewritten. `Db::compact` merges everything.
 9. **Recovery** (`Db::open`). Reads the manifest, deletes files it does not list (a crash during
-   a flush or merge), loads the segments, replays the log after the checkpoint and cuts a torn
-   last record.
+   a flush or merge), reads each file's catalog, replays the log after the checkpoint and cuts a
+   torn last record.
+
+## What stays in memory
+
+Memory does not grow with the stored data; it is fixed parts plus one small catalog per file:
+
+- **Catalogs.** Per segment: its session id range, counts, time range, the tool and field names
+  its steps use, Bloom filters of session keys and request ids, and where its blocks are. Per
+  blob file: its id ranges and a Bloom filter of content hashes. Opening a store reads the
+  manifest and these catalogs, nothing else.
+- **Sessions taking writes.** A session's message tree index, pending tool calls and step tails
+  stay in memory while it takes writes, and leave two flushes after its last write. A session
+  that wakes up later is read back from its parts.
+- **Unflushed data** (up to 64 MB), and **caches with fixed budgets** (256 MB in all by default)
+  for sessions, steps, blocks, directories, request tables, blob tables and pieces.
+
+A session is a self-contained unit: its messages, requests and steps (with its own dictionary of
+input values; tool and field names are shared) live in its parts and are read on demand. A
+request is addressed as (session, index in the session). Finding a session by key, a request by
+id, or an existing piece or opaque value by hash asks the Bloom filters first and reads only the
+files that may hold it.
 
 "Main line first" weighs each node by the number of requests that pass through it and writes
 the tree depth first, heaviest child first. The main line is then one run, and each side branch
@@ -276,14 +305,19 @@ tdb h2h           --store DIR [--pg 127.0.0.1:5455] [--no-load x] [--reps 5] [--
 ## On disk
 
 ```
-MANIFEST              live segments, checkpoint, first live log file (crc32c)
+MANIFEST              live segment and blob files, id counters, checkpoint, first live log (crc32c)
 wal-NNNNNN.log        [len][crc32c][record]...
-seg-NNNNNN.tdb        frames per session chunk | pieces | zstd index | footer
-seg-NNNNNN.opq        opaque values, raw
+seg-NNNNNN.tdb        frames per session part | blocks: groups of parts (messages + requests,
+                      steps), request id table, session directory | catalog | footer
+blob-NNNNNN.tdb       opaque values (raw) and pieces (zstd) | table block | catalog | footer
 ```
 
 ## What's next
 
-1. A bigger head-to-head once there is disk for it (the full logs, not a sample), and text search
-   with an index so substring tests stop scanning every distinct value.
-2. Derived columns (rules at write time, backfilled on merge), then text search.
+1. Derived columns (rules at write time, backfilled when a merge rewrites a session), then text
+   search with an index so substring tests stop scanning every distinct value.
+2. Queries that skip whole segments from their catalogs (time range, tool names) before reading
+   any session, and a request id table split into blocks for very large segments.
+3. Fewer rewrites when an old session wakes up: today its whole level-1 segment is rewritten;
+   a small overflow part could wait until enough of the segment changed.
+4. A bigger head-to-head on the full logs, and a multi-terabyte run on an external disk.

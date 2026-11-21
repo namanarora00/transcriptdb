@@ -97,7 +97,8 @@ fn tool_chip(db: &Db, t: u32) -> String {
 }
 
 fn strip(db: &Db, s: u32, max: usize) -> String {
-    let ss = db.steps(s);
+    let ss_arc = db.steps(s);
+    let ss = &*ss_arc;
     let mut o = String::from("<div class=\"strip\">");
     for r in ss.rows.iter().take(max) {
         let _ = write!(o, "<i class=\"{}\" style=\"background:hsl({} 60% 55%)\"></i>", if r.failed { "f" } else { "" }, hue(r.tool));
@@ -118,27 +119,24 @@ pub fn index_page(db: &Db) -> String {
         st.sessions,
         st.requests,
         st.steps,
-        bytes(st.seg_file_bytes + st.opq_file_bytes)
+        bytes(st.seg_file_bytes + st.blob_file_bytes)
     );
     let mut order: Vec<u32> = (0..db.session_count() as u32).collect();
     order.sort_by_key(|&s| std::cmp::Reverse(db.steps(s).rows.len()));
     b.push_str("<h2>Sessions</h2><div class=\"wrap\"><table><tr><th>Session</th><th class=\"num\">Requests</th><th class=\"num\">Messages</th><th class=\"num\">Steps</th><th class=\"num\">Failed</th><th>Steps in order</th></tr>");
     let reqs_per = {
-        let mut v = vec![0usize; db.session_count()];
-        for i in 0..db.request_count() as u32 {
-            v[db.request(i).session as usize] += 1;
-        }
-        v
+        (0..db.session_count() as u32).map(|s| db.session_requests(s).len()).collect::<Vec<usize>>()
     };
     for s in order {
         let (sid, agent) = db.session_key(s);
-        let ss = db.steps(s);
+        let ss_arc = db.steps(s);
+        let ss = &*ss_arc;
         let failed = ss.rows.iter().filter(|r| r.failed).count();
         let _ = write!(
             b,
             "<tr><td><a href=\"/s/{s}\"><code>{}</code></a>{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td><td>{}</td></tr>",
-            esc(&cut(sid, 13)),
-            if agent.is_empty() { String::new() } else { format!(" <span class=\"muted\">agent {}</span>", esc(&cut(agent, 10))) },
+            esc(&cut(&sid, 13)),
+            if agent.is_empty() { String::new() } else { format!(" <span class=\"muted\">agent {}</span>", esc(&cut(&agent, 10))) },
             reqs_per[s as usize],
             db.session_len(s),
             ss.rows.len(),
@@ -151,13 +149,14 @@ pub fn index_page(db: &Db) -> String {
 }
 
 pub fn session_page(db: &Db, s: u32) -> String {
-    let ss = db.steps(s);
+    let ss_arc = db.steps(s);
+    let ss = &*ss_arc;
     let sd = db.step_dicts();
     let (sid, agent) = db.session_key(s);
     let mut b = String::new();
-    let _ = write!(b, "<div><a href=\"/\">← sessions</a></div><h1><code>{}</code></h1>", esc(sid));
+    let _ = write!(b, "<div><a href=\"/\">← sessions</a></div><h1><code>{}</code></h1>", esc(&sid));
     if !agent.is_empty() {
-        let _ = write!(b, "<div class=\"muted\">agent {}</div>", esc(agent));
+        let _ = write!(b, "<div class=\"muted\">agent {}</div>", esc(&agent));
     }
     let failed = ss.rows.iter().filter(|r| r.failed).count();
     let span = match (ss.rows.first(), ss.rows.last()) {
@@ -185,7 +184,7 @@ pub fn session_page(db: &Db, s: u32) -> String {
         };
         let mut inputs = String::new();
         for &(f, v) in ss.fields_of(i32_) {
-            let val = if steps::is_long(v) { "<i>long</i>".to_string() } else { esc(&cut(&lossy(sd.values[f as usize].get(v)), 90)) };
+            let val = if steps::is_long(v) { "<i>long</i>".to_string() } else { esc(&cut(&lossy(ss.value(f, v)), 90)) };
             let _ = write!(inputs, "<div class=\"kv\">{}: <b>{}</b></div>", esc(&lossy(sd.fields.get(f))), val);
         }
         let _ = write!(
@@ -197,7 +196,7 @@ pub fn session_page(db: &Db, s: u32) -> String {
         );
     }
     b.push_str("</table></div>");
-    page(&format!("Session {}", cut(sid, 13)), &b)
+    page(&format!("Session {}", cut(&sid, 13)), &b)
 }
 
 /// Indented JSON, tokens kept as they are.
@@ -257,7 +256,8 @@ fn block_of(msg: &[u8], k: u16) -> Vec<u8> {
 }
 
 pub fn step_page(db: &Db, s: u32, i: u32) -> Result<String> {
-    let ss = db.steps(s);
+    let ss_arc = db.steps(s);
+    let ss = &*ss_arc;
     let r = ss.rows[i as usize];
     let call = block_of(&db.message(s, r.call_node)?, r.call_block);
     let result = block_of(&db.message(s, r.result_node)?, r.result_block);
