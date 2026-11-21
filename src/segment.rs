@@ -25,9 +25,13 @@ use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-const SEG_MAGIC: &[u8; 8] = b"TDBSEG03";
+const SEG_MAGIC: &[u8; 8] = b"TDBSEG04";
 /// Raw bytes per group block of encoded parts.
 const GROUP: usize = 64 * 1024;
+/// Request ids per block of the request table.
+const REQ_BLOCK: usize = 2048;
+/// Bloom filter bits per key: about 0.2% false positives.
+const BLOOM_BITS: usize = 14;
 
 pub fn seg_path(dir: &Path, num: u32) -> PathBuf {
     dir.join(format!("seg-{num:06}.tdb"))
@@ -112,7 +116,8 @@ pub struct SegCat {
     pub sess_bloom: Bloom,
     pub blocks: Vec<BlockRef>,
     pub dir: u32,
-    pub reqtab: u32,
+    /// (first request id, block) per block of the request id table.
+    pub reqtab: Vec<(Box<str>, u32)>,
     pub frame_bytes: u64,
     pub node_bytes: u64,
 }
@@ -147,7 +152,11 @@ impl SegCat {
             b.encode(&mut e);
         }
         e.var(self.dir as u64);
-        e.var(self.reqtab as u64);
+        e.var(self.reqtab.len() as u64);
+        for (id, b) in &self.reqtab {
+            e.bytes(id.as_bytes());
+            e.var(*b as u64);
+        }
         e.var(self.frame_bytes);
         e.var(self.node_bytes);
         e.buf
@@ -174,13 +183,21 @@ impl SegCat {
             c.blocks.push(BlockRef::decode(&mut d)?);
         }
         c.dir = d.var32()?;
-        c.reqtab = d.var32()?;
+        for _ in 0..d.var()? {
+            c.reqtab.push((d.string()?.into_boxed_str(), d.var32()?));
+        }
         c.frame_bytes = d.var()?;
         c.node_bytes = d.var()?;
-        if !d.done() || c.dir as usize >= c.blocks.len() || c.reqtab as usize >= c.blocks.len() {
+        if !d.done() || c.dir as usize >= c.blocks.len() || c.reqtab.iter().any(|x| x.1 as usize >= c.blocks.len()) {
             return corrupt("bad segment catalog");
         }
         Ok(c)
+    }
+
+    /// The request table block that would hold `id`.
+    pub fn reqtab_block_for(&self, id: &str) -> Option<u32> {
+        let i = self.reqtab.partition_point(|x| *x.0 <= *id);
+        i.checked_sub(1).map(|i| self.reqtab[i].1)
     }
 
     pub fn may_hold(&self, s: u32) -> bool {
@@ -189,7 +206,7 @@ impl SegCat {
 
     /// Bytes this catalog takes in memory, roughly.
     pub fn bytes(&self) -> usize {
-        256 + self.key_bloom.bytes() + self.req_bloom.bytes() + self.sess_bloom.bytes() + self.blocks.len() * 24 + self.tools.iter().chain(&self.fields).map(|x| x.len() + 24).sum::<usize>()
+        256 + self.key_bloom.bytes() + self.req_bloom.bytes() + self.sess_bloom.bytes() + self.blocks.len() * 24 + self.reqtab.iter().map(|x| x.0.len() + 32).sum::<usize>() + self.tools.iter().chain(&self.fields).map(|x| x.len() + 24).sum::<usize>()
     }
 }
 
@@ -566,28 +583,30 @@ impl SegWriter {
         self.seal(false)?;
         self.seal(true)?;
         self.reqs.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-        let mut e = Enc::new();
-        e.var(self.reqs.len() as u64);
-        for (id, s, k) in &self.reqs {
-            e.bytes(id.as_bytes());
-            e.var(*s as u64);
-            e.var(*k as u64);
+        for c in self.reqs.chunks(REQ_BLOCK) {
+            let mut e = Enc::new();
+            e.var(c.len() as u64);
+            for (id, s, k) in c {
+                e.bytes(id.as_bytes());
+                e.var(*s as u64);
+                e.var(*k as u64);
+            }
+            let r = write_block(&mut self.f, &mut self.pos, &e.buf, 3)?;
+            self.cat.blocks.push(r);
+            self.cat.reqtab.push((c[0].0.clone(), self.cat.blocks.len() as u32 - 1));
         }
-        let r = write_block(&mut self.f, &mut self.pos, &e.buf, 3)?;
-        self.cat.blocks.push(r);
-        self.cat.reqtab = self.cat.blocks.len() as u32 - 1;
         let r = write_block(&mut self.f, &mut self.pos, &encode_dir(&self.dir), 3)?;
         self.cat.blocks.push(r);
         self.cat.dir = self.cat.blocks.len() as u32 - 1;
-        let mut kb = Bloom::new(self.dir.len(), 10);
+        let mut kb = Bloom::new(self.dir.len(), BLOOM_BITS);
         for d in &self.dir {
             kb.add(key_hash(&key_bytes(&d.key.0, &d.key.1)));
         }
-        let mut rb = Bloom::new(self.reqs.len(), 10);
+        let mut rb = Bloom::new(self.reqs.len(), BLOOM_BITS);
         for (id, _, _) in &self.reqs {
             rb.add(key_hash(id.as_bytes()));
         }
-        let mut sb = Bloom::new(self.dir.len(), 10);
+        let mut sb = Bloom::new(self.dir.len(), BLOOM_BITS);
         for d in &self.dir {
             sb.add(key_hash(&d.session.to_le_bytes()));
         }

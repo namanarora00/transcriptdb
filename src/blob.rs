@@ -5,19 +5,26 @@
 //! of the session structure.
 //!
 //! `blob-N.tdb`: magic, payloads (opaque values raw, pieces zstd-compressed one by one),
-//! the table block, then the catalog (id ranges, a Bloom filter of hashes, where the table
-//! is) and the footer.
+//! the tables in blocks (pieces and opaque values by id, 1024 to a block; a hash index
+//! sorted by hash, 2048 to a block), then the catalog (id ranges, a Bloom filter of
+//! hashes, where each block is, the first hash of each index block) and the footer. A
+//! lookup reads one small block, never a whole table.
 
 use crate::block::{file, handle, read_block, read_catalog, write_block, write_catalog, BlockRef};
 use crate::bloom::Bloom;
 use crate::codec::{corrupt, Dec, Enc, Result};
 use crate::wal::{sync_file, SyncMode};
-use std::fs::{File, OpenOptions};
+use std::fs::OpenOptions;
 use std::io::{BufWriter, Write};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 
-const MAGIC: &[u8; 8] = b"TDBBLB01";
+const MAGIC: &[u8; 8] = b"TDBBLB02";
+/// Table entries per id block, and per hash index block.
+pub const ID_BLOCK: usize = 1024;
+pub const HASH_BLOCK: usize = 2048;
+/// Bloom filter bits per hash: about 0.2% false positives.
+const BLOOM_BITS: usize = 14;
 
 pub fn blob_path(dir: &Path, num: u32) -> PathBuf {
     dir.join(format!("blob-{num:06}.tdb"))
@@ -43,82 +50,29 @@ pub struct OpaqueEnt {
     pub len: u32,
 }
 
-/// What a blob file holds, loaded on demand.
-#[derive(Debug, Default)]
-pub struct BlobTable {
-    pub piece_lo: u32,
-    pub pieces: Vec<PieceEnt>,
-    pub opaque_lo: u64,
-    pub opaques: Vec<OpaqueEnt>,
-    /// (hash, 0 = piece / 1 = opaque, id), sorted: finds an existing copy by content.
-    pub by_hash: Vec<(u128, u8, u64)>,
+/// One block of a blob file's tables.
+#[derive(Debug)]
+pub enum TBlock {
+    Pieces(Vec<PieceEnt>),
+    Opaques(Vec<OpaqueEnt>),
+    /// (hash, 0 = piece / 1 = opaque, id), sorted.
+    Hashes(Vec<(u128, u8, u64)>),
 }
 
-impl BlobTable {
+impl TBlock {
     pub fn bytes(&self) -> usize {
-        self.pieces.len() * 48 + self.opaques.len() * 48 + self.by_hash.len() * 32
-    }
-
-    pub fn find(&self, tag: u8, hash: u128) -> Option<u64> {
-        let i = self.by_hash.partition_point(|x| (x.0, x.1) < (hash, tag));
-        // several opaque copies can share a hash (one not kept, one kept later): the last wins
-        let mut found = None;
-        for x in &self.by_hash[i..] {
-            if (x.0, x.1) != (hash, tag) {
-                break;
-            }
-            found = Some(x.2);
+        64 + match self {
+            TBlock::Pieces(v) => v.len() * 48,
+            TBlock::Opaques(v) => v.len() * 48,
+            TBlock::Hashes(v) => v.len() * 32,
         }
-        found
-    }
-
-    fn encode(&self) -> Vec<u8> {
-        let mut e = Enc::new();
-        e.var(self.piece_lo as u64);
-        e.var(self.pieces.len() as u64);
-        for p in &self.pieces {
-            e.u8(p.kind);
-            e.u128(p.hash);
-            e.var(p.off);
-            e.var(p.clen as u64);
-            e.var(p.rawlen as u64);
-        }
-        e.var(self.opaque_lo);
-        e.var(self.opaques.len() as u64);
-        for o in &self.opaques {
-            e.u8(o.enc);
-            e.u8(o.kind | if o.dropped { 0x80 } else { 0 });
-            e.u128(o.hash);
-            e.var(o.off);
-            e.var(o.len as u64);
-        }
-        e.buf
-    }
-
-    fn decode(b: &[u8]) -> Result<BlobTable> {
-        let mut d = Dec::new(b);
-        let piece_lo = d.var32()?;
-        let n = d.var()? as usize;
-        let mut pieces = Vec::with_capacity(n.min(1 << 20));
-        for _ in 0..n {
-            pieces.push(PieceEnt { kind: d.u8()?, hash: d.u128()?, off: d.var()?, clen: d.var32()?, rawlen: d.var32()? });
-        }
-        let opaque_lo = d.var()?;
-        let n = d.var()? as usize;
-        let mut opaques = Vec::with_capacity(n.min(1 << 20));
-        for _ in 0..n {
-            let (enc, k) = (d.u8()?, d.u8()?);
-            opaques.push(OpaqueEnt { enc, kind: k & 0x7f, dropped: k & 0x80 != 0, hash: d.u128()?, off: d.var()?, len: d.var32()? });
-        }
-        if !d.done() {
-            return corrupt("trailing bytes in a blob table");
-        }
-        let mut by_hash: Vec<(u128, u8, u64)> = pieces.iter().enumerate().map(|(i, p)| (p.hash, 0, piece_lo as u64 + i as u64)).collect();
-        by_hash.extend(opaques.iter().enumerate().map(|(i, o)| (o.hash, 1, opaque_lo + i as u64)));
-        by_hash.sort_unstable();
-        Ok(BlobTable { piece_lo, pieces, opaque_lo, opaques, by_hash })
     }
 }
+
+/// Block kinds, for caching blocks by (file, kind, index).
+pub const PIECES: u8 = 0;
+pub const OPAQUES: u8 = 1;
+pub const HASHES: u8 = 2;
 
 /// What every open store keeps in memory about a blob file.
 #[derive(Debug, Clone)]
@@ -129,7 +83,10 @@ pub struct BlobCat {
     pub n_opaques: u64,
     /// Over the low 64 bits of every piece and opaque hash.
     pub bloom: Bloom,
-    pub table: BlockRef,
+    pub piece_blocks: Vec<BlockRef>,
+    pub opaque_blocks: Vec<BlockRef>,
+    /// (first hash, first tag, block) per hash index block.
+    pub hash_blocks: Vec<(u128, u8, BlockRef)>,
     pub opaque_bytes: u64,
     pub piece_bytes: u64,
     pub piece_raw_bytes: u64,
@@ -137,11 +94,105 @@ pub struct BlobCat {
     pub n_dropped: u64,
 }
 
+impl BlobCat {
+    /// Bytes this catalog takes in memory, roughly.
+    pub fn bytes(&self) -> usize {
+        128 + self.bloom.bytes() + (self.piece_blocks.len() + self.opaque_blocks.len()) * 24 + self.hash_blocks.len() * 48
+    }
+
+    /// The hash index block that would hold the last entry for (`hash`, `tag`).
+    pub fn hash_block_for(&self, tag: u8, hash: u128) -> Option<usize> {
+        let i = self.hash_blocks.partition_point(|b| (b.0, b.1) <= (hash, tag));
+        i.checked_sub(1)
+    }
+}
+
+/// The last id with (`hash`, `tag`) in a sorted hash block (several opaque copies can share
+/// a hash: one not kept, one kept later; the last wins).
+pub fn find_in(v: &[(u128, u8, u64)], tag: u8, hash: u128) -> Option<u64> {
+    let i = v.partition_point(|x| (x.0, x.1) <= (hash, tag));
+    (i > 0 && (v[i - 1].0, v[i - 1].1) == (hash, tag)).then(|| v[i - 1].2)
+}
+
+fn encode_pieces(v: &[PieceEnt]) -> Vec<u8> {
+    let mut e = Enc::new();
+    e.var(v.len() as u64);
+    for p in v {
+        e.u8(p.kind);
+        e.u128(p.hash);
+        e.var(p.off);
+        e.var(p.clen as u64);
+        e.var(p.rawlen as u64);
+    }
+    e.buf
+}
+
+fn encode_opaques(v: &[OpaqueEnt]) -> Vec<u8> {
+    let mut e = Enc::new();
+    e.var(v.len() as u64);
+    for o in v {
+        e.u8(o.enc);
+        e.u8(o.kind | if o.dropped { 0x80 } else { 0 });
+        e.u128(o.hash);
+        e.var(o.off);
+        e.var(o.len as u64);
+    }
+    e.buf
+}
+
+fn encode_hashes(v: &[(u128, u8, u64)]) -> Vec<u8> {
+    let mut e = Enc::new();
+    e.var(v.len() as u64);
+    for &(h, t, id) in v {
+        e.u128(h);
+        e.u8(t);
+        e.var(id);
+    }
+    e.buf
+}
+
+fn decode_block(kind: u8, b: &[u8]) -> Result<TBlock> {
+    let mut d = Dec::new(b);
+    let n = d.var()? as usize;
+    if n > ID_BLOCK.max(HASH_BLOCK) {
+        return corrupt("blob table block too long");
+    }
+    let t = match kind {
+        PIECES => {
+            let mut v = Vec::with_capacity(n);
+            for _ in 0..n {
+                v.push(PieceEnt { kind: d.u8()?, hash: d.u128()?, off: d.var()?, clen: d.var32()?, rawlen: d.var32()? });
+            }
+            TBlock::Pieces(v)
+        }
+        OPAQUES => {
+            let mut v = Vec::with_capacity(n);
+            for _ in 0..n {
+                let (enc, k) = (d.u8()?, d.u8()?);
+                v.push(OpaqueEnt { enc, kind: k & 0x7f, dropped: k & 0x80 != 0, hash: d.u128()?, off: d.var()?, len: d.var32()? });
+            }
+            TBlock::Opaques(v)
+        }
+        _ => {
+            let mut v = Vec::with_capacity(n);
+            for _ in 0..n {
+                v.push((d.u128()?, d.u8()?, d.var()?));
+            }
+            TBlock::Hashes(v)
+        }
+    };
+    if !d.done() {
+        return corrupt("trailing bytes in a blob table block");
+    }
+    Ok(t)
+}
+
 pub struct BlobWriter {
-    f: BufWriter<File>,
+    f: BufWriter<std::fs::File>,
     pos: u64,
     comp: zstd::bulk::Compressor<'static>,
-    t: BlobTable,
+    pieces: Vec<PieceEnt>,
+    opaques: Vec<OpaqueEnt>,
     cat: BlobCat,
 }
 
@@ -152,15 +203,27 @@ impl BlobWriter {
         f.write_all(MAGIC)?;
         let mut comp = zstd::bulk::Compressor::new(level)?;
         comp.set_parameter(zstd::zstd_safe::CParameter::ChecksumFlag(true))?;
-        let t = BlobTable { piece_lo, opaque_lo, ..BlobTable::default() };
-        let cat = BlobCat { piece_lo, n_pieces: 0, opaque_lo, n_opaques: 0, bloom: Bloom::default(), table: BlockRef::default(), opaque_bytes: 0, piece_bytes: 0, piece_raw_bytes: 0, n_dropped: 0 };
-        Ok(BlobWriter { f, pos: 8, comp, t, cat })
+        let cat = BlobCat {
+            piece_lo,
+            n_pieces: 0,
+            opaque_lo,
+            n_opaques: 0,
+            bloom: Bloom::default(),
+            piece_blocks: Vec::new(),
+            opaque_blocks: Vec::new(),
+            hash_blocks: Vec::new(),
+            opaque_bytes: 0,
+            piece_bytes: 0,
+            piece_raw_bytes: 0,
+            n_dropped: 0,
+        };
+        Ok(BlobWriter { f, pos: 8, comp, pieces: Vec::new(), opaques: Vec::new(), cat })
     }
 
     pub fn piece(&mut self, kind: u8, hash: u128, raw: &[u8]) -> Result<()> {
         let c = self.comp.compress(raw)?;
         self.f.write_all(&c)?;
-        self.t.pieces.push(PieceEnt { kind, hash, off: self.pos, clen: c.len() as u32, rawlen: raw.len() as u32 });
+        self.pieces.push(PieceEnt { kind, hash, off: self.pos, clen: c.len() as u32, rawlen: raw.len() as u32 });
         self.pos += c.len() as u64;
         self.cat.piece_bytes += c.len() as u64;
         self.cat.piece_raw_bytes += raw.len() as u64;
@@ -170,36 +233,46 @@ impl BlobWriter {
     /// Make room for `n` opaque values; [`BlobWriter::opaque`] then fills them in any order,
     /// so values can sit in the order they are read rather than the order they arrived.
     pub fn opaques(&mut self, n: usize) {
-        self.t.opaques = vec![OpaqueEnt { enc: 0, kind: 0, dropped: true, hash: 0, off: 0, len: 0 }; n];
+        self.opaques = vec![OpaqueEnt { enc: 0, kind: 0, dropped: true, hash: 0, off: 0, len: 0 }; n];
     }
 
     /// Opaque value `i` of this file (id `opaque_lo + i`).
     pub fn opaque(&mut self, i: usize, enc: u8, kind: u8, hash: u128, payload: &[u8]) -> Result<()> {
         self.f.write_all(payload)?;
-        self.t.opaques[i] = OpaqueEnt { enc, kind, dropped: false, hash, off: self.pos, len: payload.len() as u32 };
+        self.opaques[i] = OpaqueEnt { enc, kind, dropped: false, hash, off: self.pos, len: payload.len() as u32 };
         self.pos += payload.len() as u64;
         self.cat.opaque_bytes += payload.len() as u64;
         Ok(())
     }
 
     pub fn dropped(&mut self, i: usize, enc: u8, kind: u8, hash: u128, len: u32) {
-        self.t.opaques[i] = OpaqueEnt { enc, kind, dropped: true, hash, off: 0, len };
+        self.opaques[i] = OpaqueEnt { enc, kind, dropped: true, hash, off: 0, len };
         self.cat.n_dropped += 1;
     }
 
     pub fn finish(mut self, mode: SyncMode) -> Result<()> {
-        let raw = self.t.encode();
-        self.cat.table = write_block(&mut self.f, &mut self.pos, &raw, 3)?;
-        let mut bloom = Bloom::new(self.t.pieces.len() + self.t.opaques.len(), 10);
-        for p in &self.t.pieces {
-            bloom.add(p.hash as u64);
+        for c in self.pieces.chunks(ID_BLOCK) {
+            let r = write_block(&mut self.f, &mut self.pos, &encode_pieces(c), 3)?;
+            self.cat.piece_blocks.push(r);
         }
-        for o in &self.t.opaques {
-            bloom.add(o.hash as u64);
+        for c in self.opaques.chunks(ID_BLOCK) {
+            let r = write_block(&mut self.f, &mut self.pos, &encode_opaques(c), 3)?;
+            self.cat.opaque_blocks.push(r);
+        }
+        let mut by_hash: Vec<(u128, u8, u64)> = self.pieces.iter().enumerate().map(|(i, p)| (p.hash, 0, self.cat.piece_lo as u64 + i as u64)).collect();
+        by_hash.extend(self.opaques.iter().enumerate().map(|(i, o)| (o.hash, 1, self.cat.opaque_lo + i as u64)));
+        by_hash.sort_unstable();
+        for c in by_hash.chunks(HASH_BLOCK) {
+            let r = write_block(&mut self.f, &mut self.pos, &encode_hashes(c), 3)?;
+            self.cat.hash_blocks.push((c[0].0, c[0].1, r));
+        }
+        let mut bloom = Bloom::new(by_hash.len(), BLOOM_BITS);
+        for x in &by_hash {
+            bloom.add(x.0 as u64);
         }
         self.cat.bloom = bloom;
-        self.cat.n_pieces = self.t.pieces.len() as u32;
-        self.cat.n_opaques = self.t.opaques.len() as u64;
+        self.cat.n_pieces = self.pieces.len() as u32;
+        self.cat.n_opaques = self.opaques.len() as u64;
         let mut e = Enc::new();
         let c = &self.cat;
         e.var(c.piece_lo as u64);
@@ -207,7 +280,18 @@ impl BlobWriter {
         e.var(c.opaque_lo);
         e.var(c.n_opaques);
         c.bloom.encode(&mut e);
-        c.table.encode(&mut e);
+        for list in [&c.piece_blocks, &c.opaque_blocks] {
+            e.var(list.len() as u64);
+            for r in list {
+                r.encode(&mut e);
+            }
+        }
+        e.var(c.hash_blocks.len() as u64);
+        for (h, t, r) in &c.hash_blocks {
+            e.u128(*h);
+            e.u8(*t);
+            r.encode(&mut e);
+        }
         e.var(c.opaque_bytes);
         e.var(c.piece_bytes);
         e.var(c.piece_raw_bytes);
@@ -232,27 +316,48 @@ impl Blob {
         let f = file(&path)?;
         let (c, file_bytes) = read_catalog(&f, MAGIC, &format!("blob file {num}"))?;
         let mut d = Dec::new(&c);
+        let (piece_lo, n_pieces, opaque_lo, n_opaques) = (d.var32()?, d.var32()?, d.var()?, d.var()?);
+        let bloom = Bloom::decode(&mut d)?;
+        let mut lists = [Vec::new(), Vec::new()];
+        for l in lists.iter_mut() {
+            for _ in 0..d.var()? {
+                l.push(BlockRef::decode(&mut d)?);
+            }
+        }
+        let [piece_blocks, opaque_blocks] = lists;
+        let mut hash_blocks = Vec::new();
+        for _ in 0..d.var()? {
+            hash_blocks.push((d.u128()?, d.u8()?, BlockRef::decode(&mut d)?));
+        }
         let cat = BlobCat {
-            piece_lo: d.var32()?,
-            n_pieces: d.var32()?,
-            opaque_lo: d.var()?,
-            n_opaques: d.var()?,
-            bloom: Bloom::decode(&mut d)?,
-            table: BlockRef::decode(&mut d)?,
+            piece_lo,
+            n_pieces,
+            opaque_lo,
+            n_opaques,
+            bloom,
+            piece_blocks,
+            opaque_blocks,
+            hash_blocks,
             opaque_bytes: d.var()?,
             piece_bytes: d.var()?,
             piece_raw_bytes: d.var()?,
             n_dropped: d.var()?,
         };
+        if !d.done() || cat.piece_blocks.len() != (cat.n_pieces as usize).div_ceil(ID_BLOCK) || cat.opaque_blocks.len() as u64 != cat.n_opaques.div_ceil(ID_BLOCK as u64) {
+            return corrupt(format!("blob file {num}: bad catalog"));
+        }
         Ok(Blob { num, uid: crate::block::uid(), path, cat, file_bytes })
     }
 
-    pub fn table(&self) -> Result<BlobTable> {
-        let t = BlobTable::decode(&read_block(&*handle(self.uid, &self.path)?, &self.cat.table, &format!("blob file {}", self.num))?)?;
-        if t.pieces.len() as u32 != self.cat.n_pieces || t.opaques.len() as u64 != self.cat.n_opaques {
-            return corrupt(format!("blob file {}: table does not match its catalog", self.num));
+    /// Table block `i` of kind `kind` ([`PIECES`], [`OPAQUES`] or [`HASHES`]).
+    pub fn table_block(&self, kind: u8, i: usize) -> Result<TBlock> {
+        let r = match kind {
+            PIECES => self.cat.piece_blocks.get(i),
+            OPAQUES => self.cat.opaque_blocks.get(i),
+            _ => self.cat.hash_blocks.get(i).map(|x| &x.2),
         }
-        Ok(t)
+        .ok_or_else(|| crate::codec::Error::Corrupt(format!("blob file {} has no table block {i}", self.num)))?;
+        decode_block(kind, &read_block(&*handle(self.uid, &self.path)?, r, &format!("blob file {}", self.num))?)
     }
 
     pub fn read(&self, off: u64, len: u32) -> Result<Vec<u8>> {

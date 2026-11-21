@@ -999,7 +999,7 @@ fn probe(a: &Args) {
     let st = db.stats();
     let mut r = Rng::new(a.num("seed", 3));
     let mut lat = Vec::new();
-    for _ in 0..a.num("n", 200) {
+    for _ in 0..a.num("n", 2000) {
         let s = r.below(db.session_count() as u64) as u32;
         let reqs = db.session_requests(s);
         let ri = reqs[r.below(reqs.len() as u64) as usize];
@@ -1008,19 +1008,24 @@ fn probe(a: &Args) {
         lat.push(t.elapsed().as_secs_f64() * 1e3);
     }
     let rss_reads = peak_rss();
+    // the first 200 reads find cold caches in a fresh process; the last half, warm ones
+    let mut cold = lat[..lat.len().min(200)].to_vec();
+    let mut warm = lat[lat.len() / 2..].to_vec();
     let t = Instant::now();
     let res = transcriptdb::query::run(&db, r#"where tool == "Bash" and failed | summarize n = count()"#, 1).expect("query");
     let q_s = t.elapsed().as_secs_f64();
     let rss_query = peak_rss();
     let hits = transcriptdb::query::exec::render(&db, &res.table, 1).map(|(_, c)| c.first().and_then(|r| r.first()).cloned().unwrap_or_default()).unwrap_or_default();
     println!(
-        "PROBE {open_s:.4} {} {rss_open} {:.3} {:.3} {rss_reads} {q_s:.3} {rss_query} {} {} {} {hits}",
+        "PROBE {open_s:.4} {} {rss_open} {:.3} {:.3} {rss_reads} {q_s:.3} {rss_query} {} {} {} {hits} {:.3} {:.3}",
         st.catalog_bytes,
-        q(&mut lat.clone(), 0.5),
-        q(&mut lat, 0.99),
+        q(&mut cold.clone(), 0.5),
+        q(&mut cold, 0.99),
         st.segments,
         st.level0,
-        st.blobs
+        st.blobs,
+        q(&mut warm.clone(), 0.5),
+        q(&mut warm, 0.99)
     );
 }
 
@@ -1038,33 +1043,46 @@ fn growth(a: &Args) {
     let mut db = Db::open(&dir, opts.clone()).expect("open store");
     let mut r = Rng::new(seed);
     let mut next_no = 0u64;
-    let mut waiting: Vec<Vec<synth::SynthRequest>> = Vec::new();
+    // sessions to wake next round (their last requests); generated again when needed, since
+    // every synthetic request carries its whole history and a round's bodies run to gigabytes
+    let mut waiting: Vec<u64> = Vec::new();
     let (mut raw, mut woken) = (0u64, 0u64);
     let mut acc = transcriptdb::db::MergeStats::default();
     let exe = std::env::current_exe().expect("own path");
-    println!("round  sessions  requests   raw in    store  | open s  catalogs  RSS open  RSS reads | read med  p99 ms | query s  RSS query | segs (L0) blobs | rewritten | ingest MB/s");
+    println!("round  sessions  requests   raw in    store  | open s  catalogs  RSS open  RSS reads | cold med   p99 | warm med   p99 ms | query s  RSS query | segs (L0) blobs | rewritten | ingest MB/s");
     for round in 0..rounds {
         let target = base << round;
         let t = Instant::now();
-        let mut queue: Vec<Vec<synth::SynthRequest>> = std::mem::take(&mut waiting);
-        woken += queue.len() as u64;
+        // (session number, wake-up?) for this round
+        let mut work: Vec<(u64, bool)> = std::mem::take(&mut waiting).into_iter().map(|n| (n, true)).collect();
+        woken += work.len() as u64;
         while next_no < target {
-            let mut reqs = synth::session(seed, next_no, 45);
+            work.push((next_no, false));
             if r.chance(wake) {
-                waiting.push(reqs.split_off(30));
+                waiting.push(next_no);
             }
-            queue.push(reqs);
             next_no += 1;
         }
+        let pausing: std::collections::HashSet<u64> = waiting.iter().copied().collect();
         let mut round_raw = 0u64;
         // like real traffic: 64 sessions at a time, their requests interleaved
-        for chunk in queue.chunks_mut(64) {
-            for s in chunk.iter_mut() {
-                s.reverse();
-            }
+        for chunk in work.chunks(64) {
+            let mut queues: Vec<Vec<synth::SynthRequest>> = chunk
+                .iter()
+                .map(|&(no, wake_up)| {
+                    let mut reqs = synth::session(seed, no, 45);
+                    if wake_up {
+                        reqs.drain(..30);
+                    } else if pausing.contains(&no) {
+                        reqs.truncate(30);
+                    }
+                    reqs.reverse();
+                    reqs
+                })
+                .collect();
             loop {
                 let mut any = false;
-                for s in chunk.iter_mut() {
+                for s in queues.iter_mut() {
                     if let Some(q) = s.pop() {
                         db.put(&Put { session: &q.session, agent: &q.agent, id: &q.id, time: &q.time, meta: b"", body: &q.body, digest: None }).expect("put");
                         round_raw += q.body.len() as u64;
@@ -1095,7 +1113,7 @@ fn growth(a: &Args) {
         let rewritten = (acc.flushed + acc.bytes_out) as f64 / store.max(1) as f64;
         let n = |i: usize| -> f64 { f[i].parse().unwrap_or(0.0) };
         println!(
-            "{round:>5}  {:>8}  {:>8}  {:>8}  {:>7}  | {:>6.3}  {:>8}  {:>8}  {:>9} | {:>8.3}  {:>6.3} | {:>7.3}  {:>9} | {:>4} ({}) {:>5} | {:>8.2}x | {:>6.0}",
+            "{round:>5}  {:>8}  {:>8}  {:>8}  {:>7}  | {:>6.3}  {:>8}  {:>8}  {:>9} | {:>8.3} {:>5.3} | {:>8.3} {:>5.3}    | {:>7.3}  {:>9} | {:>4} ({}) {:>5} | {:>8.2}x | {:>6.0}",
             st.sessions,
             st.requests,
             mb(raw),
@@ -1106,6 +1124,8 @@ fn growth(a: &Args) {
             mb(n(5) as u64),
             n(3),
             n(4),
+            n(12),
+            n(13),
             n(6),
             mb(n(7) as u64),
             f[8],

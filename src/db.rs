@@ -18,7 +18,7 @@
 //! Flushes write level-0 segments; merges combine them with the level-1 segments whose
 //! session ranges they touch, so finished sessions settle and are not rewritten again.
 
-use crate::blob::{blob_path, Blob, BlobTable, BlobWriter};
+use crate::blob::{blob_path, find_in, Blob, BlobWriter, TBlock, HASHES, ID_BLOCK, OPAQUES, PIECES};
 use crate::bloom::key_hash;
 use crate::cache::{Cache, CacheStats};
 use crate::codec::{corrupt, Error, Result};
@@ -274,9 +274,11 @@ pub struct Db {
     /// In file order, so piece and opaque id ranges ascend.
     blobs: Vec<Arc<Blob>>,
     dirs: Cache<u32, Vec<DirEnt>>,
-    reqtabs: Cache<u32, ReqTab>,
+    /// Request table blocks by (segment, block).
+    reqtabs: Cache<(u32, u32), ReqTab>,
     blocks: Cache<(u32, u32), Vec<u8>>,
-    tables: Cache<u32, BlobTable>,
+    /// Blob table blocks by (file, kind, index).
+    tables: Cache<(u32, u8, u32), TBlock>,
     cores: Cache<u32, SessionCore>,
     stepc: Cache<u32, SessionSteps>,
     pieces: Cache<u32, Vec<u8>>,
@@ -365,13 +367,13 @@ impl Db {
             seg_codes: HashMap::new(),
             blobs: Vec::new(),
             dirs: Cache::new(cb / 16),
-            reqtabs: Cache::new(cb / 16),
-            blocks: Cache::new(cb / 8),
-            tables: Cache::new(cb / 16),
+            reqtabs: Cache::sharded(cb / 16, 16),
+            blocks: Cache::sharded(cb / 8, 16),
+            tables: Cache::sharded(cb / 16, 16),
             cores: Cache::new(cb / 4),
             stepc: Cache::new(cb / 4),
-            pieces: Cache::new(cb / 16),
-            skels: Cache::new(cb / 32),
+            pieces: Cache::sharded(cb / 16, 16),
+            skels: Cache::sharded(cb / 32, 16),
             active: HashMap::new(),
             key_ix: HashMap::new(),
             next_session: 0,
@@ -479,13 +481,14 @@ impl Db {
         Ok(self.blocks.insert((seg.num, b), Arc::new(raw), n))
     }
 
-    fn table(&self, blob: &Blob) -> Result<Arc<BlobTable>> {
-        if let Some(t) = self.tables.get(&blob.num) {
+    fn tblock(&self, blob: &Blob, kind: u8, i: usize) -> Result<Arc<TBlock>> {
+        let k = (blob.num, kind, i as u32);
+        if let Some(t) = self.tables.get(&k) {
             return Ok(t);
         }
-        let t = blob.table()?;
+        let t = blob.table_block(kind, i)?;
         let n = t.bytes();
-        Ok(self.tables.insert(blob.num, Arc::new(t), n))
+        Ok(self.tables.insert(k, Arc::new(t), n))
     }
 
     /// Every part of session `s`, in order.
@@ -524,12 +527,13 @@ impl Db {
             if !seg.cat.req_bloom.may_contain(h) {
                 continue;
             }
-            let tab = match self.reqtabs.get(&seg.num) {
+            let Some(b) = seg.cat.reqtab_block_for(id) else { continue };
+            let tab = match self.reqtabs.get(&(seg.num, b)) {
                 Some(t) => t,
                 None => {
-                    let t = decode_reqtab(&seg.block(seg.cat.reqtab)?)?;
+                    let t = decode_reqtab(&seg.block(b)?)?;
                     let size = t.iter().map(|x| x.0.len() + 32).sum();
-                    self.reqtabs.insert(seg.num, Arc::new(t), size)
+                    self.reqtabs.insert((seg.num, b), Arc::new(t), size)
                 }
             };
             if let Ok(i) = tab.binary_search_by(|x| (*x.0).cmp(id)) {
@@ -546,8 +550,12 @@ impl Db {
             return Ok(mem);
         }
         for b in self.blobs.iter().rev() {
-            if b.cat.bloom.may_contain(hash as u64)
-                && let Some(id) = self.table(b)?.find(tag, hash)
+            if !b.cat.bloom.may_contain(hash as u64) {
+                continue;
+            }
+            let Some(i) = b.cat.hash_block_for(tag, hash) else { continue };
+            if let TBlock::Hashes(v) = &*self.tblock(b, HASHES, i)?
+                && let Some(id) = find_in(v, tag, hash)
             {
                 return Ok(Some(id));
             }
@@ -569,23 +577,25 @@ impl Db {
         self.opaque_meta_in(id, &mut HashMap::new())
     }
 
-    /// [`Db::opaque_meta`], keeping the blob tables it needs in `tables` for the next call.
-    fn opaque_meta_in(&self, id: u64, tables: &mut HashMap<u32, Arc<BlobTable>>) -> Result<OpaqueMeta> {
+    /// [`Db::opaque_meta`], keeping the table blocks it needs in `tables` for the next call.
+    fn opaque_meta_in(&self, id: u64, tables: &mut HashMap<(u32, u32), Arc<TBlock>>) -> Result<OpaqueMeta> {
         if id >= self.manifest.opaques {
             let (enc, _, hash, payload, len) = self.mem.opaques.get((id - self.manifest.opaques) as usize).ok_or_else(|| bad(format!("missing opaque value {id}")))?;
             let loc = if payload.is_some() { OLoc::Mem((id - self.manifest.opaques) as u32) } else { OLoc::Dropped { len: *len } };
             return Ok(OpaqueMeta { enc: *enc, hash: *hash, loc });
         }
         let b = self.blob_for_opaque(id)?;
-        let t = match tables.get(&b.num) {
+        let i = (id - b.cat.opaque_lo) as usize;
+        let t = match tables.get(&(b.num, (i / ID_BLOCK) as u32)) {
             Some(t) => t.clone(),
             None => {
-                let t = self.table(b)?;
-                tables.insert(b.num, t.clone());
+                let t = self.tblock(b, OPAQUES, i / ID_BLOCK)?;
+                tables.insert((b.num, (i / ID_BLOCK) as u32), t.clone());
                 t
             }
         };
-        let o = t.opaques[(id - b.cat.opaque_lo) as usize];
+        let TBlock::Opaques(v) = &*t else { return corrupt("blob block of the wrong kind") };
+        let o = *v.get(i % ID_BLOCK).ok_or_else(|| bad(format!("missing opaque value {id}")))?;
         let loc = if o.dropped { OLoc::Dropped { len: o.len } } else { OLoc::Blob { blob: b.num, off: o.off, len: o.len } };
         Ok(OpaqueMeta { enc: o.enc, hash: o.hash, loc })
     }
@@ -1528,8 +1538,10 @@ impl Db {
             return Ok(p);
         }
         let b = self.blob_for_piece(id)?;
-        let t = self.table(b)?;
-        let e = t.pieces[(id - b.cat.piece_lo) as usize];
+        let i = (id - b.cat.piece_lo) as usize;
+        let t = self.tblock(b, PIECES, i / ID_BLOCK)?;
+        let TBlock::Pieces(v) = &*t else { return corrupt("blob block of the wrong kind") };
+        let e = *v.get(i % ID_BLOCK).ok_or_else(|| bad(format!("missing piece {id}")))?;
         let c = b.read(e.off, e.clen)?;
         let d = crate::segment::decompress(&c, e.rawlen as usize)?;
         if d.len() != e.rawlen as usize {
@@ -1784,7 +1796,7 @@ impl Db {
             st.piece_bytes += b.cat.piece_bytes;
             st.piece_raw_bytes += b.cat.piece_raw_bytes;
             st.opaques_dropped += b.cat.n_dropped as usize;
-            st.catalog_bytes += b.cat.bloom.bytes() + 128;
+            st.catalog_bytes += b.cat.bytes();
         }
         st.nodes += self.mem.nodes.len();
         st.node_bytes += self.mem.nodes.iter().map(|n| n.len() as u64).sum::<u64>();
@@ -1805,7 +1817,7 @@ impl Db {
             ("blocks", self.blocks.stats()),
             ("directories", self.dirs.stats()),
             ("request tables", self.reqtabs.stats()),
-            ("blob tables", self.tables.stats()),
+            ("blob table blocks", self.tables.stats()),
             ("pieces", self.pieces.stats()),
         ];
         st
@@ -1907,8 +1919,12 @@ impl Db {
             }
         };
         for b in &self.blobs {
-            for o in &self.table(b)?.opaques {
-                add(o.kind, !o.dropped, o.len as u64);
+            for i in 0..b.cat.opaque_blocks.len() {
+                if let TBlock::Opaques(v) = &*self.tblock(b, OPAQUES, i)? {
+                    for o in v {
+                        add(o.kind, !o.dropped, o.len as u64);
+                    }
+                }
             }
         }
         for (_, kind, _, p, len) in &self.mem.opaques {

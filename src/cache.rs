@@ -1,5 +1,7 @@
 //! A shared cache with a byte budget. Eviction is CLOCK: entries used since the hand last
-//! passed get a second chance, the rest are dropped oldest first.
+//! passed get a second chance, the rest are dropped oldest first. A cache can be split into
+//! shards, each with its own lock and an equal share of the budget, so many threads looking
+//! up small entries do not queue on one lock.
 
 use std::collections::{HashMap, VecDeque};
 use std::hash::Hash;
@@ -20,7 +22,8 @@ struct Inner<K, V> {
 }
 
 pub struct Cache<K, V> {
-    inner: Mutex<Inner<K, V>>,
+    shards: Vec<Mutex<Inner<K, V>>>,
+    /// Per shard.
     budget: usize,
 }
 
@@ -35,11 +38,28 @@ pub struct CacheStats {
 
 impl<K: Hash + Eq + Clone, V> Cache<K, V> {
     pub fn new(budget: usize) -> Self {
-        Cache { inner: Mutex::new(Inner { map: HashMap::new(), order: VecDeque::new(), bytes: 0, hits: 0, misses: 0 }), budget }
+        Self::sharded(budget, 1)
+    }
+
+    /// `n` shards of `budget / n` bytes each; an entry bigger than a shard is not kept.
+    pub fn sharded(budget: usize, n: usize) -> Self {
+        let n = n.max(1);
+        let shards = (0..n).map(|_| Mutex::new(Inner { map: HashMap::new(), order: VecDeque::new(), bytes: 0, hits: 0, misses: 0 })).collect();
+        Cache { shards, budget: budget / n }
+    }
+
+    fn shard(&self, k: &K) -> &Mutex<Inner<K, V>> {
+        if self.shards.len() == 1 {
+            return &self.shards[0];
+        }
+        use std::hash::Hasher;
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        k.hash(&mut h);
+        &self.shards[(h.finish() % self.shards.len() as u64) as usize]
     }
 
     pub fn get(&self, k: &K) -> Option<Arc<V>> {
-        let mut g = self.inner.lock().unwrap();
+        let mut g = self.shard(k).lock().unwrap();
         match g.map.get_mut(k) {
             Some(e) => {
                 e.used = true;
@@ -60,7 +80,7 @@ impl<K: Hash + Eq + Clone, V> Cache<K, V> {
         if size > self.budget {
             return v;
         }
-        let mut g = self.inner.lock().unwrap();
+        let mut g = self.shard(&k).lock().unwrap();
         if let Some(old) = g.map.insert(k.clone(), Entry { v: v.clone(), size, used: false }) {
             g.bytes -= old.size;
         } else {
@@ -87,22 +107,31 @@ impl<K: Hash + Eq + Clone, V> Cache<K, V> {
     }
 
     pub fn remove(&self, k: &K) {
-        let mut g = self.inner.lock().unwrap();
+        let mut g = self.shard(k).lock().unwrap();
         if let Some(e) = g.map.remove(k) {
             g.bytes -= e.size;
         }
     }
 
     pub fn clear(&self) {
-        let mut g = self.inner.lock().unwrap();
-        g.map.clear();
-        g.order.clear();
-        g.bytes = 0;
+        for s in &self.shards {
+            let mut g = s.lock().unwrap();
+            g.map.clear();
+            g.order.clear();
+            g.bytes = 0;
+        }
     }
 
     pub fn stats(&self) -> CacheStats {
-        let g = self.inner.lock().unwrap();
-        CacheStats { entries: g.map.len(), bytes: g.bytes, budget: self.budget, hits: g.hits, misses: g.misses }
+        let mut st = CacheStats { budget: self.budget * self.shards.len(), ..CacheStats::default() };
+        for s in &self.shards {
+            let g = s.lock().unwrap();
+            st.entries += g.map.len();
+            st.bytes += g.bytes;
+            st.hits += g.hits;
+            st.misses += g.misses;
+        }
+        st
     }
 }
 
