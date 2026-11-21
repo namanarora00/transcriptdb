@@ -261,6 +261,14 @@ fn has_term(s: &str, term: &str) -> bool {
 }
 
 pub fn str_op(op: StrOp, s: &str, pat: &str, cs: bool) -> bool {
+    if !cs && s.is_ascii() && pat.is_ascii() {
+        let (h, n) = (s.as_bytes(), pat.as_bytes());
+        match op {
+            StrOp::StartsWith => return h.len() >= n.len() && h[..n.len()].eq_ignore_ascii_case(n),
+            StrOp::EndsWith => return h.len() >= n.len() && h[h.len() - n.len()..].eq_ignore_ascii_case(n),
+            _ => {}
+        }
+    }
     let (s, pat) = if cs { (s.to_string(), pat.to_string()) } else { (s.to_lowercase(), pat.to_lowercase()) };
     match op {
         StrOp::Has => has_term(&s, &pat),

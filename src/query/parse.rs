@@ -334,7 +334,13 @@ impl P {
     fn assigns(&mut self) -> Result<Vec<(String, Expr)>, QError> {
         let mut v = Vec::new();
         loop {
-            let n = self.ident()?;
+            let n = match self.peek().clone() {
+                Tok::Ident(n) if *self.peek2() == Tok::Assign => {
+                    self.bump();
+                    n
+                }
+                _ => return self.err("expected name = value"),
+            };
             self.expect(Tok::Assign, "'='")?;
             v.push((n, self.expr()?));
             if *self.peek() != Tok::Comma {
@@ -347,8 +353,9 @@ impl P {
 
     /// `name = expr` or `expr` (named after its last path part, or Column<i>).
     fn named_or_expr(&mut self) -> Result<(String, Expr), QError> {
-        if matches!(self.peek(), Tok::Ident(_)) && *self.peek2() == Tok::Assign {
-            let n = self.ident()?;
+        if let (Tok::Ident(n), Tok::Assign) = (self.peek().clone(), self.peek2().clone()) {
+            // any word can name a column, reserved or not
+            self.bump();
             self.bump();
             return Ok((n, self.expr()?));
         }
@@ -693,6 +700,12 @@ mod tests {
         assert_eq!(p.links[1], Link::Next);
         assert_eq!(p.within, Some(10));
         assert_eq!(p.eq, Some((vec!["file_path".to_string()], vec![0, 1])));
+    }
+
+    #[test]
+    fn reserved_words_can_name_columns() {
+        let q = parse("summarize matches = count(), then = dcount(session) | extend by = 1").unwrap();
+        assert_eq!(q.stages.len(), 2);
     }
 
     #[test]

@@ -173,11 +173,35 @@ fn single_col(e: &Expr) -> Result<Option<StepCol>, QError> {
     Ok(col)
 }
 
+thread_local! {
+    /// Compiled one-column tests, so a test repeated in one query is evaluated over its
+    /// dictionary once. Cleared at the start of every query.
+    static ATOMS: std::cell::RefCell<std::collections::HashMap<String, Sp>> = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+pub fn clear_cache() {
+    ATOMS.with(|c| c.borrow_mut().clear());
+}
+
 pub fn compile(db: &Db, e: &Expr, now: i64) -> Result<Sp, QError> {
     Ok(match e {
         Expr::And(v) => Sp::And(v.iter().map(|x| compile(db, x, now)).collect::<Result<_, _>>()?),
         Expr::Or(v) => Sp::Or(v.iter().map(|x| compile(db, x, now)).collect::<Result<_, _>>()?),
         Expr::Not(x) => Sp::Not(Box::new(compile(db, x, now)?)),
+        _ => {
+            let key = format!("{e:?}");
+            if let Some(sp) = ATOMS.with(|c| c.borrow().get(&key).cloned()) {
+                return Ok(sp);
+            }
+            let sp = compile_atom(db, e, now)?;
+            ATOMS.with(|c| c.borrow_mut().insert(key, sp.clone()));
+            sp
+        }
+    })
+}
+
+fn compile_atom(db: &Db, e: &Expr, now: i64) -> Result<Sp, QError> {
+    Ok(match e {
         _ => {
             let mut refs = Vec::new();
             e.refs(&mut refs);
@@ -376,11 +400,10 @@ impl Test {
 
     #[inline]
     pub fn test(&self, db: &Db, s: u32, ss: &SessionSteps, pos: u32, now: i64) -> Result<bool, QError> {
-        if let Some(t) = &self.shape {
-            if let Some(b) = t[ss.shape[pos as usize] as usize] {
+        if let Some(t) = &self.shape
+            && let Some(b) = t[ss.shape[pos as usize] as usize] {
                 return Ok(b);
             }
-        }
         self.sp.test(db, s, ss, pos, now)
     }
 

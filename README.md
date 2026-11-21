@@ -5,8 +5,8 @@ the **storage core**, written in Rust: each session is stored once as an ordered
 messages, any request can be rebuilt byte for byte, and a crash loses nothing acknowledged.
 
 On top of the stored messages it keeps **steps**: each tool call paired with its result, as
-dictionary-coded columns with a one-byte shape code per step. The pipe language with `match` is
-next; see [What's next](#whats-next).
+dictionary-coded columns with a one-byte shape code per step, and a **query language** in the
+style of Kusto with a `match` stage for sequences of steps.
 
 ## What the storage core does
 
@@ -76,6 +76,49 @@ request, parses the whole JSON and pairs results with calls inside that request,
 session as a timeline (tool, inputs, output size, failures, forks and same-turn calls), and one
 step's call and result.
 
+## Queries
+
+`src/query/`. Kusto-style pipes over steps:
+
+```
+where time > ago(30d)
+| match a: tool == "Bash" and failed
+    then b: tool in ("Edit", "Write") and file_path contains "test"
+    then c: tool == "Bash" and not failed
+    where no (tool in ("Edit", "Write") and not file_path contains "test") between a and c
+| extend took = c.time - a.time
+| summarize n = count(), sessions = dcount(session), typical = avg(took) by a.tool
+| top 10 by n
+```
+
+- Stages: `where`, `match`, `extend`, `project`, `summarize` (`count`, `countif`, `dcount`, `sum`,
+  `min`, `max`, `avg`, `by` keys including `bin(time, 1d)`), `top`, `sort`, `take`, `count`.
+- Step columns: `tool`, `failed`, `ok`, `time`, `out_bytes`, `step`, `session`, `agent`, and input
+  fields as `input.file_path` or just `file_path`. After `match`, name the element: `a.time`.
+- Operators: `== != < <= > >=`, `in (...)`, `not in`, `has`, `contains`, `startswith`, `endswith`,
+  `matches` (glob), case-insensitive (`_cs` for exact case); `and or not`; `+ - * /` on numbers,
+  times and durations (`7d`, `3h`, `10m`, `30s`, `250ms`); `ago()`, `now()`, `bin()`, `strlen()`,
+  `tolower()`, `iff()`, `isnull()`.
+- `match`: `then` = any later turn on the same path, `next` = the very next turn; `{m}`, `{m,n}`,
+  `{m,}` = consecutive turns; `within N` turns from first to last; `no (P) between a and c`; one
+  compared field (`a.file_path == c.file_path`) splits steps by value. Calls in one model turn are
+  unordered. A match is reported at the turn that completes it, binding the latest earlier steps
+  that allow it; matches do not overlap; each branch of a forked session is matched, its shared
+  start once.
+
+How a query runs: leading `where` stages and each element's test are compiled against the
+dictionaries (a test over one column is evaluated once per distinct value; tests on tool and
+outcome become a table over the 256 shape codes); sessions lacking a tool an element needs are
+skipped; the matcher makes one pass per session over its turn tree, in parallel across sessions;
+later stages work on the matched rows. Errors point at the query with a caret; unknown columns
+and mismatched types are refused before running.
+
+`tdb check-queries` generates random patterns from the store's own tools and compares the engine
+with `src/query/reference.rs`, a brute-force evaluator that reads tools, inputs and outcomes from
+the stored messages, lists every root-to-leaf path of each session's turn tree and tries every
+binding. Planted bugs in the matcher (exclusions ignored, `next` treated as `then`, repeats
+allowed to skip turns) each make it fail.
+
 ## Reading Claude Code's logs
 
 `src/claude.rs` turns `~/.claude/projects/**/*.jsonl` into request bodies. Newer Claude Code
@@ -120,11 +163,21 @@ at the end unless `KEEP=1`. Both it and the crash test exit non-zero on any fail
 | Crash test | 1,000 SIGKILLs, 13,059 acknowledged, 0 lost, 0 wrong bytes |
 | Steps (2026-11-21, 125,905 requests) | 146,175 steps in 1,062 sessions; engine and reference agree on all 141,513 distinct steps; 0 wrong `prev`, 0 results without a call |
 | Step columns | 134 tools, 192 input fields, 108,605 distinct short values; shape strings 146 KB; index +5 MB |
+| Queries vs reference (2026-11-21) | 100 generated queries, 758 real sessions up to 120 steps: engine = brute force in every session (337,573 matches); 300 on synthetic: same |
+| Bash, Edit, Bash, no Read between (146k steps) | 4.5 ms on 1 thread, 1.2 ms on 8; 1,576 matches in 33 sessions |
+| Bash fails, only test files edited, Bash passes | 5.5 ms on 1 thread (1.8 ms of it planning), 2.8 ms on 8 |
+| 3 Read/Grep in a row, then Edit | 1.3 ms on 1 thread, 0.4 ms on 8 |
+| Bash steps per week with failures (`summarize ... by bin(time, 7d)`) | 16.6 ms, nearly all in row-by-row aggregation |
 
 Against the Python proof of concept (48-session sample): size per byte of distinct text 0.50 vs
 0.51; rebuild median 0.41 vs 0.85 ms; replay 0.29 vs 0.41 ms. The proof of concept's
 "11,718 of 11,718 byte for byte" was checked against its own reconstruction; the numbers here are
 checked against Claude Code's digest.
+
+The three patterns are the proof of concept's; it timed them at 5.9, 7.1 and 1.8 ms (Python,
+288k steps from transcripts, flat step lists) and PostgreSQL window SQL at 146, 168 and 90 ms.
+Different data and semantics (turn trees here), so the PostgreSQL comparison still has to be
+run on the same steps.
 
 Not measured yet: cold-disk reads, size against a zstd `--long` archive of the same requests (needs
 ~150 GB of scratch disk), torn log records from real power loss (SIGKILL cannot tear a `write`;
@@ -143,6 +196,8 @@ tdb check-steps   --store DIR
 tdb steps         --store DIR [--top 15]
 tdb serve         --store DIR [--port 8377]
 tdb synth         --store DIR [--sessions 20 --per 40]
+tdb query         --store DIR --q 'QUERY' [--limit 30] [--threads N] [--repeat N]
+tdb check-queries --store DIR [--n 300] [--max-steps 400] [--seed S]
 ```
 
 ## On disk
@@ -156,6 +211,6 @@ seg-NNNNNN.opq        opaque values, raw
 
 ## What's next
 
-1. The query language: parser, checker, planner and the one-pass matcher over dictionary codes
-   and shape strings, walking `prev` across forks; then the head-to-head against PostgreSQL.
+1. The head-to-head against PostgreSQL on the same steps and messages (needs PostgreSQL
+   installed locally).
 2. Derived columns (rules at write time, backfilled on merge), then text search.

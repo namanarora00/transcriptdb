@@ -23,7 +23,7 @@ struct RawStep {
     failed: bool,
 }
 
-fn block<'a>(m: &'a [u8], k: u16) -> Option<&'a [u8]> {
+fn block(m: &[u8], k: u16) -> Option<&[u8]> {
     let ms = crate::json::members(m, &(0..m.len())).ok()?;
     let c = crate::json::find_member(m, &ms, "content")?;
     let (els, _) = crate::json::elements(m, &c.value).ok()?;
@@ -241,11 +241,10 @@ pub fn session_matches(db: &Db, p: &Pattern, pre: Option<&Expr>, s: u32, now: i6
     let raw = raw_steps(db, s)?;
     let test = |e: &Expr, pos: usize| -> Result<bool, QError> {
         let ctx = RawCtx { db, s, pos: pos as u32, st: &raw[pos], ss, now };
-        if let Some(pre) = pre {
-            if !eval(pre, &ctx)?.truthy() {
+        if let Some(pre) = pre
+            && !eval(pre, &ctx)?.truthy() {
                 return Ok(false);
             }
-        }
         Ok(eval(e, &ctx)?.truthy())
     };
     let mut pass = Vec::new();
@@ -271,13 +270,11 @@ pub fn session_matches(db: &Db, p: &Pattern, pre: Option<&Expr>, s: u32, now: i6
             let key = |i: usize| raw[i].fields.iter().find(|(k, _)| *k == f).map(|(_, v)| v.clone());
             let mut distinct: Vec<Vec<u8>> = Vec::new();
             for i in 0..raw.len() {
-                if ks.iter().any(|&k| pass[k][i]) {
-                    if let Some(v) = key(i) {
-                        if !distinct.contains(&v) {
+                if ks.iter().any(|&k| pass[k][i])
+                    && let Some(v) = key(i)
+                        && !distinct.contains(&v) {
                             distinct.push(v);
                         }
-                    }
-                }
             }
             for v in distinct {
                 let mut part = pass.clone();
@@ -300,6 +297,7 @@ pub fn session_matches(db: &Db, p: &Pattern, pre: Option<&Expr>, s: u32, now: i6
 pub fn compare(db: &Db, src: &str, max_steps: usize) -> Result<(usize, Vec<u32>), QError> {
     let q: Query = super::parse::parse(src)?;
     let now = 1_800_000_000_000;
+    plan::clear_cache();
     let mut i = 0;
     let mut pre_exprs = Vec::new();
     while let Some(Stage::Where(e)) = q.stages.get(i) {

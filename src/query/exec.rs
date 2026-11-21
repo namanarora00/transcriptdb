@@ -55,11 +55,10 @@ pub struct RowCtx<'a> {
 
 impl Ctx for RowCtx<'_> {
     fn col(&self, path: &[String]) -> Result<Value, QError> {
-        if path.len() == 1 {
-            if let Some(i) = self.t.cols.iter().position(|c| *c == path[0]) {
+        if path.len() == 1
+            && let Some(i) = self.t.cols.iter().position(|c| *c == path[0]) {
                 return Ok(self.row.vals.get(i).cloned().unwrap_or(Value::Null));
             }
-        }
         match &self.t.kind {
             Kind::Plain => Err(QError::new(format!("unknown column '{}'", path.join(".")))),
             Kind::Steps => step_value(self.db, self.row.session, self.row.steps[0], &resolve(path)?),
@@ -91,8 +90,8 @@ fn check_step_expr(db: &Db, e: &Expr) -> Result<(), QError> {
     let mut refs = Vec::new();
     e.refs(&mut refs);
     for r in refs {
-        if let StepCol::Field(f) = resolve(r)? {
-            if db.step_dicts().fields.code(f.as_bytes()).is_none() {
+        if let StepCol::Field(f) = resolve(r)?
+            && db.step_dicts().fields.code(f.as_bytes()).is_none() {
                 let mut names: Vec<String> = plan::BUILTINS.iter().map(|s| s.to_string()).collect();
                 let sd = db.step_dicts();
                 for i in 0..sd.fields.len() as u32 {
@@ -101,7 +100,6 @@ fn check_step_expr(db: &Db, e: &Expr) -> Result<(), QError> {
                 let close: Vec<&String> = names.iter().filter(|n| n.contains(&f[..f.len().min(3)])).take(6).collect();
                 return Err(QError::new(format!("no step has a column or input field '{f}'{}", if close.is_empty() { String::new() } else { format!(" (similar: {})", close.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")) })));
             }
-        }
     }
     type_check(e)
 }
@@ -125,11 +123,10 @@ fn type_check(e: &Expr) -> Result<(), QError> {
     };
     match e {
         E::Cmp(_, a, b) => {
-            if let (Some(x), Some(y)) = (kind(a), kind(b)) {
-                if x != y {
+            if let (Some(x), Some(y)) = (kind(a), kind(b))
+                && x != y {
                     return Err(QError::new(format!("cannot compare {x} with {y}")));
                 }
-            }
             type_check(a)?;
             type_check(b)
         }
@@ -229,11 +226,10 @@ pub fn session_matches(db: &Db, c: &Compiled, s: u32, now: i64, scanned: &Atomic
             let mut distinct: Vec<EqKey> = Vec::new();
             for (pos, m) in masks.iter().enumerate() {
                 let k = if m & bits != 0 { eq_key(db, s, pos as u32, field)? } else { None };
-                if let Some(k) = &k {
-                    if !distinct.contains(k) {
+                if let Some(k) = &k
+                    && !distinct.contains(k) {
                         distinct.push(k.clone());
                     }
-                }
                 keys.push(k);
             }
             for v in distinct {
@@ -287,6 +283,7 @@ pub struct Run {
 
 pub fn run(db: &Db, q: &Query, threads: usize) -> Result<Run, QError> {
     let now = now_ms();
+    plan::clear_cache();
     let t0 = Instant::now();
     let mut st = QStats { sessions: db.session_count(), ..QStats::default() };
     // leading where stages filter steps
