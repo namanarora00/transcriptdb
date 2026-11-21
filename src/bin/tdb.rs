@@ -460,6 +460,114 @@ fn steps_summary(a: &Args) {
     }
 }
 
+fn print_table(heads: &[String], cells: &[Vec<String>]) {
+    let clip = |s: &str| -> String {
+        let one = s.replace('\n', " ");
+        if one.chars().count() > 60 { format!("{}…", one.chars().take(59).collect::<String>()) } else { one }
+    };
+    let cells: Vec<Vec<String>> = cells.iter().map(|r| r.iter().map(|c| clip(c)).collect()).collect();
+    let mut w: Vec<usize> = heads.iter().map(|h| h.chars().count()).collect();
+    for r in &cells {
+        for (i, c) in r.iter().enumerate() {
+            w[i] = w[i].max(c.chars().count());
+        }
+    }
+    let line = |r: &[String]| r.iter().enumerate().map(|(i, c)| format!("{c:<width$}", width = w[i])).collect::<Vec<_>>().join("  ");
+    println!("{}", line(heads));
+    println!("{}", w.iter().map(|n| "-".repeat(*n)).collect::<Vec<_>>().join("  "));
+    for r in &cells {
+        println!("{}", line(r));
+    }
+}
+
+/// Generated match queries: the engine against the slow reference, session by session.
+fn check_queries(a: &Args) {
+    use transcriptdb::query::reference;
+    let db = Db::open(a.store(), a.opts()).expect("open store");
+    let n = a.num("n", 300);
+    let max_steps = a.num("max-steps", 400) as usize;
+    let mut r = Rng::new(a.num("seed", 3));
+    let t = Instant::now();
+    let (mut total, mut failed, mut with_matches) = (0usize, 0usize, 0usize);
+    let checked_sessions = (0..db.session_count() as u32).filter(|&s| db.steps(s).rows.len() <= max_steps).count();
+    for _ in 0..n {
+        let q = reference::random_query(&db, &mut r);
+        match reference::compare(&db, &q, max_steps) {
+            Ok((m, bad)) => {
+                total += m;
+                with_matches += (m > 0) as usize;
+                if !bad.is_empty() {
+                    failed += 1;
+                    if failed <= 10 {
+                        println!("DIFF in {} session(s) (first {:?}): {q}", bad.len(), &bad[..bad.len().min(5)]);
+                    }
+                }
+            }
+            Err(e) => {
+                failed += 1;
+                println!("ERROR {e}: {q}");
+            }
+        }
+    }
+    println!(
+        "{n} generated queries over {checked_sessions} sessions (of {}; sessions over {max_steps} steps left out): {failed} differ; {with_matches} queries had matches, {total} matches in all; {:.1}s",
+        db.session_count(),
+        t.elapsed().as_secs_f64()
+    );
+    if failed > 0 {
+        std::process::exit(1);
+    }
+}
+
+fn query(a: &Args) {
+    let src = match (a.get("q"), a.get("file")) {
+        (Some(q), _) => q.to_string(),
+        (None, Some(f)) => std::fs::read_to_string(f).expect("read query file"),
+        _ => {
+            eprintln!("usage: tdb query --store DIR --q 'QUERY' [--limit 30] [--threads N] [--repeat N]");
+            std::process::exit(2);
+        }
+    };
+    let t0 = Instant::now();
+    let db = Db::open(a.store(), a.opts()).expect("open store");
+    let open_s = t0.elapsed().as_secs_f64();
+    let reps = a.num("repeat", 1).max(1);
+    let mut best = f64::MAX;
+    let mut run = None;
+    for _ in 0..reps {
+        let t = Instant::now();
+        match transcriptdb::query::run(&db, &src, a.threads()) {
+            Ok(r) => {
+                best = best.min(t.elapsed().as_secs_f64() * 1e3);
+                run = Some(r);
+            }
+            Err(e) => {
+                eprintln!("error: {}", e.show(&src));
+                std::process::exit(1);
+            }
+        }
+    }
+    let r = run.unwrap();
+    let limit = a.num("limit", 30) as usize;
+    let (heads, cells) = transcriptdb::query::exec::render(&db, &r.table, limit).expect("render");
+    print_table(&heads, &cells);
+    let st = &r.stats;
+    println!(
+        "\n{} rows{}  |  {:.2} ms (best of {reps}): plan {:.2}, scan {:.2}, rest {:.2}  |  {} sessions, {} skipped, {} steps scanned, {} matches  |  store opened in {:.1}s",
+        r.table.rows.len(),
+        if r.table.rows.len() > limit { format!(" (showing {limit})") } else { String::new() },
+        best,
+        st.plan_ms,
+        st.scan_ms,
+        st.rest_ms,
+        st.sessions,
+        st.sessions_skipped,
+        st.steps_scanned,
+        st.matches,
+        open_s
+    );
+}
+
 /// A store of synthetic sessions (for trying things without real data).
 fn synth_store(a: &Args) {
     let mut db = Db::open(a.store(), a.opts()).expect("open store");
@@ -699,6 +807,8 @@ fn main() {
         "compact" => compact(&a),
         "check-steps" => check_steps(&a),
         "serve" => serve(&a),
+        "query" => query(&a),
+        "check-queries" => check_queries(&a),
         "synth" => synth_store(&a),
         "steps" => steps_summary(&a),
         "bench" => bench(&a),

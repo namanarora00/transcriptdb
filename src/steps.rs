@@ -187,9 +187,15 @@ pub struct SessionSteps {
     pub flushed: u32,
     /// Calls seen since the store opened, by tool_use id.
     pub calls: HashMap<Box<[u8]>, CallInfo>,
+    /// Bitset of tool codes present in the session.
+    pub tool_set: Vec<u64>,
 }
 
 impl SessionSteps {
+    pub fn has_tool(&self, t: u32) -> bool {
+        self.tool_set.get((t / 64) as usize).is_some_and(|w| w >> (t % 64) & 1 == 1)
+    }
+
     pub fn fields_of(&self, i: u32) -> &[(u32, u32)] {
         if self.fstart.is_empty() {
             return &[];
@@ -252,6 +258,11 @@ impl StepDicts {
         ss.fields.extend_from_slice(fields);
         ss.fstart.push(ss.fields.len() as u32);
         ss.shape.push(Self::shape_code(row.tool, row.failed));
+        let w = (row.tool / 64) as usize;
+        if ss.tool_set.len() <= w {
+            ss.tool_set.resize(w + 1, 0);
+        }
+        ss.tool_set[w] |= 1 << (row.tool % 64);
         let key = (session as u64) << 32 | pos as u64;
         let t = row.tool as usize;
         if self.tool_post.len() <= t {

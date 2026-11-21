@@ -13,6 +13,7 @@ pub mod db;
 pub mod json;
 pub mod layout;
 pub mod manifest;
+pub mod query;
 pub mod record;
 pub mod segment;
 pub mod split;
