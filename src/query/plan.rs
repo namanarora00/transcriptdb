@@ -201,56 +201,54 @@ pub fn compile(db: &Db, e: &Expr, now: i64) -> Result<Sp, QError> {
 }
 
 fn compile_atom(db: &Db, e: &Expr, now: i64) -> Result<Sp, QError> {
-    Ok(match e {
-        _ => {
-            let mut refs = Vec::new();
-            e.refs(&mut refs);
-            if refs.is_empty() {
-                struct NoCols(i64);
-                impl Ctx for NoCols {
-                    fn col(&self, _: &[String]) -> Result<Value, QError> {
-                        Err(QError::new("no columns here"))
-                    }
-                    fn now(&self) -> i64 {
-                        self.0
-                    }
+    Ok({
+        let mut refs = Vec::new();
+        e.refs(&mut refs);
+        if refs.is_empty() {
+            struct NoCols(i64);
+            impl Ctx for NoCols {
+                fn col(&self, _: &[String]) -> Result<Value, QError> {
+                    Err(QError::new("no columns here"))
                 }
-                return Ok(Sp::Const(eval(e, &NoCols(now))?.truthy()));
+                fn now(&self) -> i64 {
+                    self.0
+                }
             }
-            let sd = db.step_dicts();
-            match single_col(e)? {
-                Some(StepCol::Tool) => {
-                    let col = StepCol::Tool;
-                    let t: Vec<bool> = (0..sd.tools.len() as u32)
-                        .map(|c| eval(e, &OneCol { col: &col, v: Value::Str(String::from_utf8_lossy(sd.tools.get(c)).into()), now }).map(|v| v.truthy()))
-                        .collect::<Result<_, _>>()?;
-                    Sp::Tool(t.into())
-                }
-                Some(StepCol::Field(name)) => {
-                    let col = StepCol::Field(name.clone());
-                    let f = sd.fields.code(name.as_bytes());
-                    let table: Vec<bool> = match f {
-                        Some(f) => {
-                            let d = &sd.values[f as usize];
-                            (0..d.len() as u32).map(|c| eval(e, &OneCol { col: &col, v: Value::from_json(d.get(c)), now }).map(|v| v.truthy())).collect::<Result<_, _>>()?
-                        }
-                        None => Vec::new(),
-                    };
-                    let missing = eval(e, &OneCol { col: &col, v: Value::Null, now })?.truthy();
-                    Sp::Field { name, f, table: table.into(), missing, expr: Arc::new(e.clone()) }
-                }
-                Some(c @ (StepCol::Session | StepCol::Agent)) => {
-                    let t: Vec<bool> = (0..db.session_count() as u32)
-                        .map(|s| {
-                            let k = db.session_key(s);
-                            let v = if c == StepCol::Session { &k.0 } else { &k.1 };
-                            eval(e, &OneCol { col: &c, v: Value::Str(v.as_str().into()), now }).map(|v| v.truthy())
-                        })
-                        .collect::<Result<_, _>>()?;
-                    Sp::Session(t.into())
-                }
-                _ => Sp::Generic(Arc::new(e.clone())),
+            return Ok(Sp::Const(eval(e, &NoCols(now))?.truthy()));
+        }
+        let sd = db.step_dicts();
+        match single_col(e)? {
+            Some(StepCol::Tool) => {
+                let col = StepCol::Tool;
+                let t: Vec<bool> = (0..sd.tools.len() as u32)
+                    .map(|c| eval(e, &OneCol { col: &col, v: Value::Str(String::from_utf8_lossy(sd.tools.get(c)).into()), now }).map(|v| v.truthy()))
+                    .collect::<Result<_, _>>()?;
+                Sp::Tool(t.into())
             }
+            Some(StepCol::Field(name)) => {
+                let col = StepCol::Field(name.clone());
+                let f = sd.fields.code(name.as_bytes());
+                let table: Vec<bool> = match f {
+                    Some(f) => {
+                        let d = &sd.values[f as usize];
+                        (0..d.len() as u32).map(|c| eval(e, &OneCol { col: &col, v: Value::from_json(d.get(c)), now }).map(|v| v.truthy())).collect::<Result<_, _>>()?
+                    }
+                    None => Vec::new(),
+                };
+                let missing = eval(e, &OneCol { col: &col, v: Value::Null, now })?.truthy();
+                Sp::Field { name, f, table: table.into(), missing, expr: Arc::new(e.clone()) }
+            }
+            Some(c @ (StepCol::Session | StepCol::Agent)) => {
+                let t: Vec<bool> = (0..db.session_count() as u32)
+                    .map(|s| {
+                        let k = db.session_key(s);
+                        let v = if c == StepCol::Session { &k.0 } else { &k.1 };
+                        eval(e, &OneCol { col: &c, v: Value::Str(v.as_str().into()), now }).map(|v| v.truthy())
+                    })
+                    .collect::<Result<_, _>>()?;
+                Sp::Session(t.into())
+            }
+            _ => Sp::Generic(Arc::new(e.clone())),
         }
     })
 }
