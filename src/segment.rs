@@ -11,6 +11,7 @@ use crate::record::ReqRec;
 use crate::steps::StepRow;
 use crate::wal::{sync_file, SyncMode};
 use std::cell::RefCell;
+use std::sync::Arc;
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::os::unix::fs::FileExt;
@@ -367,6 +368,8 @@ pub struct ChunkInfo {
 
 pub struct Segment {
     pub num: u32,
+    /// Unique in this process (frames are cached by it).
+    uid: u64,
     f: File,
     o: File,
     pub frame_size: u32,
@@ -378,6 +381,33 @@ pub struct Segment {
 
 thread_local! {
     static DCTX: RefCell<Option<zstd::bulk::Decompressor<'static>>> = const { RefCell::new(None) };
+    /// Recently decompressed frames, per thread: frames never change, so this is always safe.
+    static FRAMES: RefCell<FrameCache> = RefCell::new(FrameCache::default());
+}
+
+static NEXT_UID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+const FRAME_CACHE: usize = 128;
+
+#[derive(Default)]
+struct FrameCache {
+    map: std::collections::HashMap<(u64, u32, usize), Arc<Vec<u8>>>,
+    order: std::collections::VecDeque<(u64, u32, usize)>,
+}
+
+impl FrameCache {
+    fn get(&self, k: &(u64, u32, usize)) -> Option<Arc<Vec<u8>>> {
+        self.map.get(k).cloned()
+    }
+    fn put(&mut self, k: (u64, u32, usize), v: Arc<Vec<u8>>) {
+        if self.map.insert(k, v).is_none() {
+            self.order.push_back(k);
+            while self.order.len() > FRAME_CACHE {
+                if let Some(old) = self.order.pop_front() {
+                    self.map.remove(&old);
+                }
+            }
+        }
+    }
 }
 
 pub fn decompress(src: &[u8], cap: usize) -> Result<Vec<u8>> {
@@ -420,30 +450,40 @@ impl Segment {
         let raw = zstd::stream::decode_all(&c[..])?;
         let index = SegIndex::decode(&raw)?;
         let chunks = index.chunks.iter().map(|c| ChunkInfo { raw_len: c.raw_len, frames: c.frames.clone() }).collect();
-        let seg = Segment { num, f, o, frame_size: index.frame_size, chunks, file_bytes: len, opq_bytes, index_bytes: clen };
+        let uid = NEXT_UID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let seg = Segment { num, uid, f, o, frame_size: index.frame_size, chunks, file_bytes: len, opq_bytes, index_bytes: clen };
         Ok((seg, index))
     }
 
-    /// Read frames `first..=last` of a chunk with one read and decompress each.
-    pub fn frames(&self, chunk: u32, first: usize, last: usize) -> Result<Vec<Vec<u8>>> {
-        let ch = &self.chunks[chunk as usize];
-        let start = ch.frames[first].0;
-        let end = ch.frames[last].0 + ch.frames[last].1 as u64;
-        let mut buf = vec![0u8; (end - start) as usize];
-        self.f.read_exact_at(&mut buf, start)?;
-        let fs = self.frame_size as usize;
-        let mut out = Vec::with_capacity(last - first + 1);
-        for k in first..=last {
-            let (o, l) = ch.frames[k];
-            let s = (o - start) as usize;
-            let cap = (ch.raw_len as usize - k * fs).min(fs);
-            let d = decompress(&buf[s..s + l as usize], cap)?;
-            if d.len() != cap {
-                return corrupt(format!("segment {} frame {k} has the wrong size", self.num));
+    /// Frames `first..=last` of a chunk, decompressed: from the cache, or with one read for
+    /// the run of frames that are not cached.
+    pub fn frames(&self, chunk: u32, first: usize, last: usize) -> Result<Vec<Arc<Vec<u8>>>> {
+        let mut out: Vec<Option<Arc<Vec<u8>>>> = (first..=last).map(|k| FRAMES.with(|c| c.borrow().get(&(self.uid, chunk, k)))).collect();
+        let missing: Vec<usize> = (first..=last).filter(|k| out[k - first].is_none()).collect();
+        if let (Some(&lo), Some(&hi)) = (missing.first(), missing.last()) {
+            let ch = &self.chunks[chunk as usize];
+            let start = ch.frames[lo].0;
+            let end = ch.frames[hi].0 + ch.frames[hi].1 as u64;
+            let mut buf = vec![0u8; (end - start) as usize];
+            self.f.read_exact_at(&mut buf, start)?;
+            let fs = self.frame_size as usize;
+            for k in lo..=hi {
+                if out[k - first].is_some() {
+                    continue;
+                }
+                let (o, l) = ch.frames[k];
+                let s = (o - start) as usize;
+                let cap = (ch.raw_len as usize - k * fs).min(fs);
+                let d = decompress(&buf[s..s + l as usize], cap)?;
+                if d.len() != cap {
+                    return corrupt(format!("segment {} frame {k} has the wrong size", self.num));
+                }
+                let d = Arc::new(d);
+                FRAMES.with(|c| c.borrow_mut().put((self.uid, chunk, k), d.clone()));
+                out[k - first] = Some(d);
             }
-            out.push(d);
         }
-        Ok(out)
+        Ok(out.into_iter().map(|x| x.unwrap()).collect())
     }
 
     pub fn piece_raw(&self, off: u64, clen: u32) -> Result<Vec<u8>> {

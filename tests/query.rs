@@ -157,3 +157,33 @@ fn generated_queries_match_the_reference() {
     assert!(with > 40, "too few generated queries matched anything ({with})");
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+fn columnar_summarize_equals_the_general_path() {
+    let dir = tmpdir("fastsum");
+    let mut db = Db::open(&dir, opts()).unwrap();
+    for s in 0..12 {
+        for q in synth::session(8, s, 40) {
+            db.put(&Put { session: &q.session, agent: &q.agent, id: &q.id, time: &q.time, meta: b"", body: &q.body, digest: None }).unwrap();
+        }
+    }
+    db.commit().unwrap();
+    let qs = [
+        "summarize n = count() by tool | sort by n desc, tool asc",
+        "summarize n = count(), f = countif(failed), a = avg(out_bytes), s = sum(out_bytes), lo = min(time), hi = max(time) by tool, failed",
+        "where tool == \"Edit\" | summarize n = count(), d = dcount(session) by file_path, bin(time, 1h)",
+        "summarize d = dcount(tool), e = dcount(file_path), x = max(out_bytes) by session, agent",
+        "where tool == \"nothing\" | summarize n = count()",
+        "summarize n = count() by command",
+    ];
+    for q in qs {
+        let (h1, c1) = query::exec::render(&db, &query::run(&db, q, 2).unwrap().table, 1000).unwrap();
+        let slow = q.replacen("summarize", "extend zz_ = 1 | summarize", 1);
+        let slow = if slow.starts_with("extend") { format!("where true | {slow}") } else { slow };
+        let (h2, c2) = query::exec::render(&db, &query::run(&db, &slow, 2).unwrap_or_else(|e| panic!("{}", e.show(&slow))).table, 1000).unwrap();
+        assert_eq!(h1, h2, "{q}");
+        assert_eq!(c1, c2, "{q}");
+        assert!(!c1.is_empty(), "{q}");
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}

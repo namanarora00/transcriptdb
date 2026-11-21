@@ -222,19 +222,37 @@ pub fn session_matches(db: &Db, c: &Compiled, s: u32, now: i64, scanned: &Atomic
         None => matcher::run(&c.spec, ss, &masks, &mut out),
         Some((field, ks)) => {
             let bits: u64 = ks.iter().fold(0, |a, &k| a | 1 << k);
-            let mut keys: Vec<Option<EqKey>> = Vec::with_capacity(ss.rows.len());
-            let mut distinct: Vec<EqKey> = Vec::new();
+            let mut keys: Vec<Option<u32>> = Vec::with_capacity(ss.rows.len());
+            // distinct values, with the compared elements each value has a step for
+            let mut ids: HashMap<EqKey, u32> = HashMap::new();
+            let mut seen: Vec<u64> = Vec::new();
             for (pos, m) in masks.iter().enumerate() {
                 let k = if m & bits != 0 { eq_key(db, s, pos as u32, field)? } else { None };
-                if let Some(k) = &k
-                    && !distinct.contains(k) {
-                        distinct.push(k.clone());
+                keys.push(k.map(|k| {
+                    let n = ids.len() as u32;
+                    let id = *ids.entry(k).or_insert(n);
+                    if id == n {
+                        seen.push(0);
                     }
-                keys.push(k);
+                    seen[id as usize] |= m & bits;
+                    id
+                }));
             }
-            for v in distinct {
-                let part: Vec<u64> = masks.iter().zip(&keys).map(|(m, k)| if k.as_ref() == Some(&v) { *m } else { m & !bits }).collect();
-                matcher::run(&c.spec, ss, &part, &mut out);
+            let mut part = vec![0u64; masks.len()];
+            for (v, &have) in seen.iter().enumerate() {
+                if have != bits {
+                    continue; // some compared element never sees this value
+                }
+                let mut start = usize::MAX;
+                for (pos, (m, k)) in masks.iter().zip(&keys).enumerate() {
+                    part[pos] = if *k == Some(v as u32) { *m } else { m & !bits };
+                    if start == usize::MAX && part[pos] & 1 == 1 {
+                        start = pos;
+                    }
+                }
+                if start != usize::MAX {
+                    matcher::run_from(&c.spec, ss, &part, start, &mut out);
+                }
             }
             out.sort();
             out.dedup();
@@ -284,6 +302,7 @@ pub struct Run {
 pub fn run(db: &Db, q: &Query, threads: usize) -> Result<Run, QError> {
     let now = now_ms();
     plan::clear_cache();
+    plan::set_threads(threads);
     let t0 = Instant::now();
     let mut st = QStats { sessions: db.session_count(), ..QStats::default() };
     // leading where stages filter steps
@@ -398,6 +417,7 @@ fn apply_stage(db: &Db, mut t: Table, stage: &Stage, now: i64) -> Result<Table, 
             }
             Table { kind: Kind::Plain, cols: v.iter().map(|(n, _)| n.clone()).collect(), rows }
         }
+        Stage::Summarize { aggs, by } if fast_summarize_fits(&t, aggs, by) => fast_summarize(db, &t, aggs, by, now)?,
         Stage::Summarize { aggs, by } => {
             struct Acc {
                 key: Vec<Value>,
@@ -524,6 +544,253 @@ fn apply_stage(db: &Db, mut t: Table, stage: &Stage, now: i64) -> Result<Table, 
         Stage::Take(n) => take(t, *n),
         Stage::Count => Table { kind: Kind::Plain, cols: vec!["count".into()], rows: vec![Row { session: NONE, steps: [NONE; MAX_ELEMS], vals: vec![Value::Int(t.rows.len() as i64)] }] },
     })
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum KeyPart {
+    Tool,
+    Sid,
+    Agent,
+    Failed,
+    Ok,
+    Field(u32),
+    MissingField,
+    BinTime(i64),
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum NumCol {
+    OutBytes,
+    Time,
+    Step,
+}
+
+fn key_part(db: &Db, e: &Expr) -> Option<KeyPart> {
+    match e {
+        Expr::Ref(p) => Some(match resolve(p).ok()? {
+            StepCol::Tool => KeyPart::Tool,
+            StepCol::Session => KeyPart::Sid,
+            StepCol::Agent => KeyPart::Agent,
+            StepCol::Failed => KeyPart::Failed,
+            StepCol::Ok => KeyPart::Ok,
+            StepCol::Field(f) => match db.step_dicts().fields.code(f.as_bytes()) {
+                Some(c) => KeyPart::Field(c),
+                None => KeyPart::MissingField,
+            },
+            _ => return None,
+        }),
+        Expr::Call(f, args) if (f == "bin" || f == "floor") && args.len() == 2 => match (&args[0], &args[1]) {
+            (Expr::Ref(p), Expr::Lit(Value::Dur(d))) if *d > 0 && resolve(p).ok()? == StepCol::Time => Some(KeyPart::BinTime(*d)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn num_col(e: &Expr) -> Option<NumCol> {
+    match e {
+        Expr::Ref(p) => match resolve(p).ok()? {
+            StepCol::OutBytes => Some(NumCol::OutBytes),
+            StepCol::Time => Some(NumCol::Time),
+            StepCol::Step => Some(NumCol::Step),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn fast_summarize_fits(t: &Table, aggs: &[(String, AggFn, Option<Expr>)], by: &[(String, Expr)]) -> bool {
+    if t.kind != Kind::Steps || !t.cols.is_empty() || by.len() > 4 {
+        return false;
+    }
+    let simple_key = |e: &Expr| matches!(e, Expr::Ref(_)) || matches!(e, Expr::Call(f, a) if (f == "bin" || f == "floor") && a.len() == 2 && matches!(&a[1], Expr::Lit(Value::Dur(_))) && matches!(&a[0], Expr::Ref(p) if p.len() == 1 && p[0] == "time"));
+    by.iter().all(|(_, e)| simple_key(e) && !matches!(e, Expr::Ref(p) if matches!(resolve(p), Ok(StepCol::OutBytes | StepCol::Time | StepCol::Step) | Err(_))))
+        && aggs.iter().all(|(_, f, a)| match (f, a) {
+            (AggFn::Count, _) | (AggFn::CountIf, Some(_)) => true,
+            (AggFn::Sum | AggFn::Avg, Some(e)) => matches!(num_col(e), Some(NumCol::OutBytes | NumCol::Step)),
+            (AggFn::Min | AggFn::Max, Some(e)) => num_col(e).is_some(),
+            (AggFn::DCount, Some(e)) => matches!(e, Expr::Ref(p) if matches!(resolve(p), Ok(StepCol::Tool | StepCol::Session | StepCol::Agent | StepCol::Field(_)))),
+            _ => false,
+        })
+}
+
+/// `summarize` over step rows on dictionary codes, without evaluating each row.
+/// Same groups, same order (first seen) and same arithmetic as the general path.
+fn fast_summarize(db: &Db, t: &Table, aggs: &[(String, AggFn, Option<Expr>)], by: &[(String, Expr)], now: i64) -> Result<Table, QError> {
+    const NULL: u64 = u64::MAX;
+    const LONG_TAG: u64 = 1 << 62;
+    let sd = db.step_dicts();
+    let parts: Vec<KeyPart> = by.iter().map(|(_, e)| key_part(db, e).unwrap()).collect();
+    // session index -> interned id of its session or agent string
+    let mut sid_ids: HashMap<&str, u64> = HashMap::new();
+    let mut agent_ids: HashMap<&str, u64> = HashMap::new();
+    let mut sid_of = Vec::with_capacity(db.session_count());
+    let mut agent_of = Vec::with_capacity(db.session_count());
+    let mut sid_names: Vec<&str> = Vec::new();
+    let mut agent_names: Vec<&str> = Vec::new();
+    for s in 0..db.session_count() as u32 {
+        let (sid, agent) = db.session_key(s);
+        let n = sid_ids.len() as u64;
+        sid_of.push(*sid_ids.entry(sid.as_str()).or_insert_with(|| {
+            sid_names.push(sid.as_str());
+            n
+        }));
+        let n = agent_ids.len() as u64;
+        agent_of.push(*agent_ids.entry(agent.as_str()).or_insert_with(|| {
+            agent_names.push(agent.as_str());
+            n
+        }));
+    }
+    let mut longs: Vec<Vec<u8>> = Vec::new();
+    let mut long_ids: HashMap<Vec<u8>, u64> = HashMap::new();
+    let mut field_key = |s: u32, pos: u32, f: u32, longs: &mut Vec<Vec<u8>>| -> Result<u64, QError> {
+        let ss = db.steps(s);
+        Ok(match ss.fields_of(pos).iter().find(|x| x.0 == f) {
+            None => NULL,
+            Some(&(_, v)) if v == crate::steps::LONG => {
+                let name = String::from_utf8_lossy(sd.fields.get(f)).into_owned();
+                match plan::read_input(db, s, ss, pos, &name)? {
+                    None => NULL,
+                    Some(raw) => {
+                        let n = long_ids.len() as u64;
+                        *long_ids.entry(raw.clone()).or_insert_with(|| {
+                            longs.push(raw);
+                            LONG_TAG | n
+                        })
+                    }
+                }
+            }
+            Some(&(_, v)) => v as u64,
+        })
+    };
+    let tests: Vec<Option<Test>> = aggs
+        .iter()
+        .map(|(_, f, a)| match (f, a) {
+            (AggFn::CountIf, Some(e)) => plan::compile(db, e, now).map(|sp| Some(Test::new(db, sp, now))),
+            _ => Ok(None),
+        })
+        .collect::<Result<_, _>>()?;
+    let dkey: Vec<Option<KeyPart>> = aggs.iter().map(|(_, f, a)| if *f == AggFn::DCount { a.as_ref().and_then(|e| key_part(db, e)) } else { None }).collect();
+    struct Acc {
+        key: [u64; 4],
+        count: Vec<i64>,
+        sum: Vec<f64>,
+        min: Vec<Option<i64>>,
+        max: Vec<Option<i64>>,
+        distinct: Vec<std::collections::HashSet<u64>>,
+    }
+    let na = aggs.len();
+    let mut groups: HashMap<[u64; 4], usize> = HashMap::new();
+    let mut accs: Vec<Acc> = Vec::new();
+    for r in &t.rows {
+        let (s, pos) = (r.session, r.steps[0]);
+        let row = db.steps(s).rows[pos as usize];
+        let mut key = [0u64; 4];
+        for (i, p) in parts.iter().enumerate() {
+            key[i] = match *p {
+                KeyPart::Tool => row.tool as u64,
+                KeyPart::Sid => sid_of[s as usize],
+                KeyPart::Agent => agent_of[s as usize],
+                KeyPart::Failed => row.failed as u64,
+                KeyPart::Ok => !row.failed as u64,
+                KeyPart::Field(f) => field_key(s, pos, f, &mut longs)?,
+                KeyPart::MissingField => NULL,
+                KeyPart::BinTime(d) => row.time_ms.div_euclid(d) as u64,
+            };
+        }
+        let gi = *groups.entry(key).or_insert_with(|| {
+            accs.push(Acc { key, count: vec![0; na], sum: vec![0.0; na], min: vec![None; na], max: vec![None; na], distinct: vec![Default::default(); na] });
+            accs.len() - 1
+        });
+        for (ai, (_, f, a)) in aggs.iter().enumerate() {
+            let num = || -> i64 {
+                match a.as_ref().and_then(num_col) {
+                    Some(NumCol::OutBytes) => row.out_bytes as i64,
+                    Some(NumCol::Time) => row.time_ms,
+                    _ => pos as i64,
+                }
+            };
+            let acc = &mut accs[gi];
+            match f {
+                AggFn::Count => acc.count[ai] += 1,
+                AggFn::CountIf => acc.count[ai] += tests[ai].as_ref().unwrap().test(db, s, db.steps(s), pos, now)? as i64,
+                AggFn::Sum | AggFn::Avg => {
+                    acc.sum[ai] += num() as f64;
+                    acc.count[ai] += 1;
+                }
+                AggFn::Min => {
+                    let v = num();
+                    acc.min[ai] = Some(acc.min[ai].map_or(v, |m| m.min(v)));
+                }
+                AggFn::Max => {
+                    let v = num();
+                    acc.max[ai] = Some(acc.max[ai].map_or(v, |m| m.max(v)));
+                }
+                AggFn::DCount => {
+                    let k = match dkey[ai] {
+                        Some(KeyPart::Tool) => row.tool as u64,
+                        Some(KeyPart::Sid) => sid_of[s as usize],
+                        Some(KeyPart::Agent) => agent_of[s as usize],
+                        Some(KeyPart::Field(fid)) => field_key(s, pos, fid, &mut longs)?,
+                        _ => NULL,
+                    };
+                    if k != NULL {
+                        acc.distinct[ai].insert(k);
+                    }
+                }
+            }
+        }
+    }
+    if by.is_empty() && accs.is_empty() {
+        accs.push(Acc { key: [0; 4], count: vec![0; na], sum: vec![0.0; na], min: vec![None; na], max: vec![None; na], distinct: vec![Default::default(); na] });
+    }
+    let key_value = |p: KeyPart, k: u64| -> Value {
+        if k == NULL {
+            return Value::Null;
+        }
+        match p {
+            KeyPart::Tool => Value::Str(String::from_utf8_lossy(sd.tools.get(k as u32)).into()),
+            KeyPart::Sid => Value::Str(sid_names[k as usize].into()),
+            KeyPart::Agent => Value::Str(agent_names[k as usize].into()),
+            KeyPart::Failed | KeyPart::Ok => Value::Bool(k == 1),
+            KeyPart::Field(f) => {
+                if k & LONG_TAG != 0 {
+                    Value::from_json(&longs[(k & !LONG_TAG) as usize])
+                } else {
+                    Value::from_json(sd.values[f as usize].get(k as u32))
+                }
+            }
+            KeyPart::MissingField => Value::Null,
+            KeyPart::BinTime(d) => Value::Time(k as i64 * d),
+        }
+    };
+    let mut rows = Vec::with_capacity(accs.len());
+    for a in &accs {
+        let mut vals: Vec<Value> = parts.iter().enumerate().map(|(i, p)| key_value(*p, a.key[i])).collect();
+        for (ai, (_, f, arg)) in aggs.iter().enumerate() {
+            let is_time = arg.as_ref().and_then(num_col) == Some(NumCol::Time);
+            vals.push(match f {
+                AggFn::Count | AggFn::CountIf => Value::Int(a.count[ai]),
+                AggFn::DCount => Value::Int(a.distinct[ai].len() as i64),
+                AggFn::Sum => Value::Int(a.sum[ai] as i64),
+                AggFn::Avg => {
+                    if a.count[ai] == 0 {
+                        Value::Null
+                    } else {
+                        Value::Float(a.sum[ai] / a.count[ai] as f64)
+                    }
+                }
+                AggFn::Min | AggFn::Max => match if *f == AggFn::Min { a.min[ai] } else { a.max[ai] } {
+                    None => Value::Null,
+                    Some(v) if is_time => Value::Time(v),
+                    Some(v) => Value::Int(v),
+                },
+            });
+        }
+        rows.push(Row { session: NONE, steps: [NONE; MAX_ELEMS], vals });
+    }
+    let cols = by.iter().map(|(n, _)| n.clone()).chain(aggs.iter().map(|(n, _, _)| n.clone())).collect();
+    Ok(Table { kind: Kind::Plain, cols, rows })
 }
 
 fn take(mut t: Table, n: usize) -> Table {

@@ -480,6 +480,46 @@ fn print_table(heads: &[String], cells: &[Vec<String>]) {
     }
 }
 
+/// The head-to-head against PostgreSQL on the same store.
+fn head_to_head(a: &Args) {
+    use transcriptdb::h2h;
+    let db = Db::open(a.store(), a.opts()).expect("open store");
+    let addr = a.get("pg").unwrap_or("127.0.0.1:5455").to_string();
+    let mut pg = transcriptdb::pg::Pg::connect(&addr, a.get("pg-user").unwrap_or("tdb"), a.get("pg-db").unwrap_or("h2h")).expect("connect to postgres");
+    if a.get("no-load").is_none() {
+        println!("{}", h2h::load(&db, &mut pg).expect("load"));
+    }
+    let st = db.stats();
+    let engine_bytes = st.seg_file_bytes + st.opq_file_bytes;
+    let sizes = h2h::pg_sizes(&mut pg).expect("sizes");
+    let pg_total: u64 = sizes.iter().map(|x| x.1).sum();
+    println!("\n== size on disk");
+    println!("  TranscriptDB store: {} (segments {}, opaque {})", mb(engine_bytes), mb(st.seg_file_bytes), mb(st.opq_file_bytes));
+    println!("  PostgreSQL tables with indexes and TOAST: {} ({})", mb(pg_total), sizes.iter().map(|(n, b)| format!("{n} {}", mb(*b))).collect::<Vec<_>>().join(", "));
+    println!("  PostgreSQL / TranscriptDB: {:.2}x", pg_total as f64 / engine_bytes as f64);
+    let reps = a.num("reps", 5) as usize;
+    let out = h2h::run_queries(&db, &mut pg, reps).expect("queries");
+    println!("\n== queries over {} steps in {} sessions (best of {reps}; TranscriptDB on 1 thread and on 8)", (0..db.session_count() as u32).map(|s| db.steps(s).rows.len()).sum::<usize>(), db.session_count());
+    println!("  {:<48} {:>6} {:>12} {:>9} {:>12} {:>9}  {}", "query", "same", "TDB 1 thread", "TDB 8", "PostgreSQL", "speedup", "answer");
+    let mut all_same = true;
+    for o in &out {
+        all_same &= o.same;
+        let ratio = o.pg_ms / o.engine_ms.max(1e-6);
+        let sp = if ratio >= 10.0 { format!("{ratio:.0}x") } else { format!("{ratio:.1}x") };
+        println!("  {:<48} {:>6} {:>9.2} ms {:>6.2} ms {:>9.2} ms {:>9}  {}", o.name, if o.same { "yes" } else { "NO" }, o.engine_ms, o.engine_ms_par, o.pg_ms, sp, o.detail);
+    }
+    let reads = h2h::run_reads(&db, &mut pg, a.num("reads", 200) as usize, a.num("seed", 5)).expect("reads");
+    println!("\n== reads (median / p95 ms per item; PostgreSQL over loopback TCP)");
+    for r in &reads {
+        all_same &= r.same == r.total;
+        println!("  {:<36} same {}/{}   TDB {:.3} / {:.3}   PostgreSQL {:.3} / {:.3}   {:.1}x at the median", r.name, r.same, r.total, r.engine.0, r.engine.1, r.pg.0, r.pg.1, r.pg.0 / r.engine.0.max(1e-9));
+    }
+    if !all_same {
+        println!("\nFAILED: some answers differ");
+        std::process::exit(1);
+    }
+}
+
 /// Generated match queries: the engine against the slow reference, session by session.
 fn check_queries(a: &Args) {
     use transcriptdb::query::reference;
@@ -809,6 +849,7 @@ fn main() {
         "serve" => serve(&a),
         "query" => query(&a),
         "check-queries" => check_queries(&a),
+        "h2h" => head_to_head(&a),
         "synth" => synth_store(&a),
         "steps" => steps_summary(&a),
         "bench" => bench(&a),

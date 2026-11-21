@@ -99,6 +99,12 @@ fn killed(sp: &Spec, k: usize, here: bool, gx: u64) -> bool {
 
 /// Run the pattern over one session. Matches are appended in step order.
 pub fn run(sp: &Spec, ss: &SessionSteps, masks: &[u64], out: &mut Vec<Match>) {
+    run_from(sp, ss, masks, 0, out)
+}
+
+/// Like [`run`], when no step before `start` passes the first element (nothing can start
+/// earlier, so turns that end before `start` are skipped).
+pub fn run_from(sp: &Spec, ss: &SessionSteps, masks: &[u64], start: usize, out: &mut Vec<Match>) {
     let rows = &ss.rows;
     let n = rows.len();
     if n == 0 || sp.n == 0 {
@@ -121,6 +127,13 @@ pub fn run(sp: &Spec, ss: &SessionSteps, masks: &[u64], out: &mut Vec<Match>) {
         let g = depth.len() as u32;
         for p in inst_of.iter_mut().take(j).skip(i) {
             *p = g;
+        }
+        if j <= start {
+            let pd = if r.prev == NONE { 0 } else { depth[inst_of[r.prev as usize] as usize] };
+            depth.push(pd + 1);
+            range.push((pool.len() as u32, 0));
+            i = j;
+            continue;
         }
         before.clear();
         let pd = if r.prev == NONE {

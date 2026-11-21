@@ -47,15 +47,26 @@ pub fn resolve(path: &[String]) -> Result<StepCol, QError> {
     })
 }
 
-/// The raw JSON text of input field `name` of a step, read from the stored message.
+/// The raw JSON text of input field `name` of a step, read from the stored message (the
+/// full message only if an opaque value sits inside that field).
 pub fn read_input(db: &Db, s: u32, ss: &SessionSteps, pos: u32, name: &str) -> Result<Option<Vec<u8>>, QError> {
     let r = ss.rows[pos as usize];
-    let m = db.message(s, r.call_node).map_err(|e| QError::new(e.to_string()))?;
-    let (calls, _) = steps::scan_message(&m);
-    Ok(calls
-        .iter()
-        .find(|c| c.block == r.call_block)
-        .and_then(|c| c.fields.iter().find(|(k, _)| *k == name.as_bytes()).map(|(_, v)| v.to_vec())))
+    let find = |m: &[u8]| -> Option<(usize, usize)> {
+        let (calls, _) = steps::scan_message(m);
+        let c = calls.iter().find(|c| c.block == r.call_block)?;
+        let (_, v) = c.fields.iter().find(|(k, _)| *k == name.as_bytes())?;
+        let start = v.as_ptr() as usize - m.as_ptr() as usize;
+        Some((start, start + v.len()))
+    };
+    let (stored, holes) = db.stored_message(s, r.call_node).map_err(|e| QError::new(e.to_string()))?;
+    match find(&stored) {
+        None => Ok(None),
+        Some((a, b)) if !holes.iter().any(|&h| (h as usize) >= a && (h as usize) <= b) => Ok(Some(stored[a..b].to_vec())),
+        Some(_) => {
+            let m = db.message(s, r.call_node).map_err(|e| QError::new(e.to_string()))?;
+            Ok(find(&m).map(|(a, b)| m[a..b].to_vec()))
+        }
+    }
 }
 
 /// The value of one step column.
@@ -183,6 +194,15 @@ pub fn clear_cache() {
     ATOMS.with(|c| c.borrow_mut().clear());
 }
 
+thread_local! {
+    static THREADS: std::cell::Cell<u32> = const { std::cell::Cell::new(1) };
+}
+
+/// How many threads planning may use (set per query).
+pub fn set_threads(n: usize) {
+    THREADS.with(|t| t.set(n.max(1) as u32));
+}
+
 pub fn compile(db: &Db, e: &Expr, now: i64) -> Result<Sp, QError> {
     Ok(match e {
         Expr::And(v) => Sp::And(v.iter().map(|x| compile(db, x, now)).collect::<Result<_, _>>()?),
@@ -231,7 +251,24 @@ fn compile_atom(db: &Db, e: &Expr, now: i64) -> Result<Sp, QError> {
                 let table: Vec<bool> = match f {
                     Some(f) => {
                         let d = &sd.values[f as usize];
-                        (0..d.len() as u32).map(|c| eval(e, &OneCol { col: &col, v: Value::from_json(d.get(c)), now }).map(|v| v.truthy())).collect::<Result<_, _>>()?
+                        let one = |c: u32| eval(e, &OneCol { col: &col, v: Value::from_json(d.get(c)), now }).map(|v| v.truthy());
+                        let n = d.len() as u32;
+                        let threads = THREADS.with(|t| t.get());
+                        if n < 4096 || threads == 1 {
+                            (0..n).map(one).collect::<Result<_, _>>()?
+                        } else {
+                            // large dictionaries (long text values): evaluate in parallel
+                            let per = n.div_ceil(threads);
+                            let parts: Vec<Result<Vec<bool>, QError>> = std::thread::scope(|sc| {
+                                let hs: Vec<_> = (0..threads).map(|t| sc.spawn(move || (t * per..((t + 1) * per).min(n)).map(one).collect::<Result<Vec<bool>, QError>>())).collect();
+                                hs.into_iter().map(|h| h.join().unwrap()).collect()
+                            });
+                            let mut all = Vec::with_capacity(n as usize);
+                            for p in parts {
+                                all.extend(p?);
+                            }
+                            all
+                        }
                     }
                     None => Vec::new(),
                 };

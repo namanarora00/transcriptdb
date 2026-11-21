@@ -90,7 +90,13 @@ impl Value {
     pub fn from_json(t: &[u8]) -> Value {
         match t.first() {
             None => Value::Null,
-            Some(b'"') => Value::Str(json_unescape(&t[1..t.len().saturating_sub(1)]).into()),
+            Some(b'"') => {
+                let inner = &t[1..t.len().saturating_sub(1)];
+                match std::str::from_utf8(inner) {
+                    Ok(plain) if !inner.contains(&b'\\') => Value::Str(plain.into()),
+                    _ => Value::Str(json_unescape(inner).into()),
+                }
+            }
             Some(b't') if t == b"true" => Value::Bool(true),
             Some(b'f') if t == b"false" => Value::Bool(false),
             Some(b'n') if t == b"null" => Value::Null,
@@ -163,55 +169,62 @@ impl fmt::Display for Value {
 }
 
 pub fn json_unescape(b: &[u8]) -> String {
-    if !b.contains(&b'\\') {
-        return String::from_utf8_lossy(b).into_owned();
-    }
-    let mut units: Vec<u16> = Vec::with_capacity(b.len());
     let mut out = String::with_capacity(b.len());
-    let flush = |units: &mut Vec<u16>, out: &mut String| {
-        if !units.is_empty() {
-            out.push_str(&String::from_utf16_lossy(units));
-            units.clear();
+    let mut i = 0;
+    let mut pending: Option<u16> = None; // a high surrogate waiting for its pair
+    let flush_pending = |pending: &mut Option<u16>, out: &mut String| {
+        if pending.take().is_some() {
+            out.push('\u{fffd}');
         }
     };
-    let mut i = 0;
     while i < b.len() {
-        if b[i] == b'\\' && i + 1 < b.len() {
-            let e = b[i + 1];
-            i += 2;
-            match e {
-                b'u' if i + 4 <= b.len() => {
-                    let v = std::str::from_utf8(&b[i..i + 4]).ok().and_then(|s| u16::from_str_radix(s, 16).ok()).unwrap_or(0xfffd);
-                    units.push(v);
-                    i += 4;
-                    continue;
+        let next = memchr::memchr(b'\\', &b[i..]).map(|k| i + k).unwrap_or(b.len());
+        if next > i {
+            flush_pending(&mut pending, &mut out);
+            out.push_str(&String::from_utf8_lossy(&b[i..next]));
+        }
+        if next + 1 >= b.len() {
+            if next < b.len() {
+                out.push('\\');
+            }
+            break;
+        }
+        let e = b[next + 1];
+        i = next + 2;
+        if e == b'u' && i + 4 <= b.len() {
+            let u = std::str::from_utf8(&b[i..i + 4]).ok().and_then(|h| u16::from_str_radix(h, 16).ok()).unwrap_or(0xfffd);
+            i += 4;
+            match (pending.take(), u) {
+                (Some(hi), 0xdc00..=0xdfff) => {
+                    let c = 0x10000 + (((hi as u32) - 0xd800) << 10) + (u as u32 - 0xdc00);
+                    out.push(char::from_u32(c).unwrap_or('\u{fffd}'));
                 }
-                _ => {
-                    flush(&mut units, &mut out);
-                    out.push(match e {
-                        b'n' => '\n',
-                        b't' => '\t',
-                        b'r' => '\r',
-                        b'b' => '\u{8}',
-                        b'f' => '\u{c}',
-                        other => other as char,
-                    });
+                (prev, 0xd800..=0xdbff) => {
+                    if prev.is_some() {
+                        out.push('\u{fffd}');
+                    }
+                    pending = Some(u);
+                }
+                (prev, _) => {
+                    if prev.is_some() {
+                        out.push('\u{fffd}');
+                    }
+                    out.push(char::from_u32(u as u32).unwrap_or('\u{fffd}'));
                 }
             }
-        } else {
-            flush(&mut units, &mut out);
-            let ch_len = match b[i] {
-                0x00..=0x7f => 1,
-                0xc0..=0xdf => 2,
-                0xe0..=0xef => 3,
-                _ => 4,
-            };
-            let end = (i + ch_len).min(b.len());
-            out.push_str(&String::from_utf8_lossy(&b[i..end]));
-            i = end;
+            continue;
         }
+        flush_pending(&mut pending, &mut out);
+        out.push(match e {
+            b'n' => '\n',
+            b't' => '\t',
+            b'r' => '\r',
+            b'b' => '\u{8}',
+            b'f' => '\u{c}',
+            other => other as char,
+        });
     }
-    flush(&mut units, &mut out);
+    flush_pending(&mut pending, &mut out);
     out
 }
 
@@ -260,10 +273,36 @@ fn has_term(s: &str, term: &str) -> bool {
     false
 }
 
+/// Case-insensitive ASCII substring search without allocating: find candidates by the
+/// first byte (either case), then compare the rest in place.
+fn ascii_ci_contains(h: &[u8], n: &[u8]) -> bool {
+    let Some(&first) = n.first() else { return true };
+    if h.len() < n.len() {
+        return false;
+    }
+    let (lo, up) = (first.to_ascii_lowercase(), first.to_ascii_uppercase());
+    let last_start = h.len() - n.len();
+    let mut i = 0;
+    while i <= last_start {
+        match memchr::memchr2(lo, up, &h[i..=last_start]) {
+            None => return false,
+            Some(k) => {
+                let at = i + k;
+                if h[at..at + n.len()].eq_ignore_ascii_case(n) {
+                    return true;
+                }
+                i = at + 1;
+            }
+        }
+    }
+    false
+}
+
 pub fn str_op(op: StrOp, s: &str, pat: &str, cs: bool) -> bool {
     if !cs && s.is_ascii() && pat.is_ascii() {
         let (h, n) = (s.as_bytes(), pat.as_bytes());
         match op {
+            StrOp::Contains => return ascii_ci_contains(h, n),
             StrOp::StartsWith => return h.len() >= n.len() && h[..n.len()].eq_ignore_ascii_case(n),
             StrOp::EndsWith => return h.len() >= n.len() && h[h.len() - n.len()..].eq_ignore_ascii_case(n),
             _ => {}
@@ -450,6 +489,9 @@ mod tests {
         assert!(has_term("cargo test --all", "test"));
         assert!(!has_term("cargo tests", "test"));
         assert!(str_op(StrOp::Contains, "Error: X", "error", false));
+        assert!(str_op(StrOp::Contains, "run CARGO Test now", "cargo test", false));
+        assert!(!str_op(StrOp::Contains, "cargo tes", "cargo test", false));
+        assert!(str_op(StrOp::Contains, "x", "", false));
         assert!(!str_op(StrOp::Contains, "Error: X", "error", true));
     }
 
@@ -457,6 +499,8 @@ mod tests {
     fn json_values() {
         assert_eq!(Value::from_json(br#""a\nb\u00e9""#).as_str().unwrap(), "a\nb\u{e9}");
         assert!(matches!(Value::from_json(b"42"), Value::Int(42)));
+        assert_eq!(json_unescape(br#"a\"b\\c\ud83d\ude80d\ud83de"#), "a\"b\\c\u{1f680}d\u{fffd}e");
+        assert_eq!(json_unescape(br#"\u00e9t\u00e9"#), "\u{e9}t\u{e9}");
         assert!(matches!(Value::from_json(b"1.5e-3"), Value::Float(_)));
         assert_eq!(fmt_time(0), "1970-01-01T00:00:00.000Z");
         assert_eq!(fmt_time(951_868_801_500), "2000-03-01T00:00:01.500Z");

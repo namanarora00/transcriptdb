@@ -119,6 +119,61 @@ the stored messages, lists every root-to-leaf path of each session's turn tree a
 binding. Planted bugs in the matcher (exclusions ignored, `next` treated as `then`, repeats
 allowed to skip turns) each make it fail.
 
+## Head-to-head against PostgreSQL
+
+`scripts/h2h.sh` (needs Homebrew `postgresql@18`) builds a store from a sample of the local logs,
+loads the same data into a throwaway PostgreSQL 18 cluster, runs the same 16 queries and 3 read
+workloads on both, and compares answers. `src/h2h.rs` holds the queries; `src/pg.rs` is a small
+client (wire protocol, simple queries, `COPY`).
+
+PostgreSQL gets the usual tricks: every distinct message stored once by hash, requests as arrays of
+message ids, a step table with indexes and the two input fields the queries use pulled out as
+columns, and for patterns a materialized table of root-to-leaf turn paths, so window-function SQL
+gives exact answers on forked sessions. Pattern queries are compared on the set of sessions with a
+match (what SQL answers naturally; it equals "the engine reports at least one match"), aggregations
+on their rows, reads on the bytes returned. Settings: shared_buffers 256 MB, work_mem 32 MB, up to 4
+parallel workers, JIT off, C collation. PostgreSQL is reached over loopback TCP, so every query
+pays a client round trip (about 0.1 ms) that the in-process engine does not; that matters for the
+sub-millisecond rows below.
+
+Measured 2026-11-21 on 200 log files: 145 sessions, 14,967 requests, 17,576 steps, 123 MB of
+distinct message text. Every answer matched (16 of 16 queries, 600 of 600 reads).
+
+| | TranscriptDB | PostgreSQL |
+|---|---|---|
+| Disk (tables, indexes, TOAST) | 65.2 MB | 138.3 MB (2.1x) |
+
+| Query | TDB, 1 thread | TDB, 8 threads | PostgreSQL | PG / TDB (1 thread) |
+|---|---|---|---|---|
+| Bash, then Edit, then Bash; no Read between | 0.52 ms | 0.20 ms | 112 ms | 214x |
+| Bash fails, only test files edited, Bash passes | 0.69 ms | 0.37 ms | 227 ms | 329x |
+| 3 Read/Grep turns in a row, then Edit | 0.17 ms | 0.10 ms | 10.5 ms | 61x |
+| Bash fails, then passes the next turn | 0.37 ms | 0.16 ms | 9.2 ms | 25x |
+| Edit, then Bash within 3 turns | 0.24 ms | 0.12 ms | 7.3 ms | 30x |
+| Write a file, later Read the same file | 0.37 ms | 0.17 ms | 1.55 ms | 4.2x |
+| 3 failing turns in a row | 0.33 ms | 0.14 ms | 8.9 ms | 27x |
+| WebSearch, then WebFetch the next turn | 0.06 ms | 0.07 ms | 8.6 ms | 139x |
+| Steps per tool, top 10 | 0.41 ms | 0.42 ms | 0.64 ms | 1.6x |
+| Failure rate per tool | 0.49 ms | 0.51 ms | 1.51 ms | 3.1x |
+| Bash steps and failures per week | 0.34 ms | 0.35 ms | 1.41 ms | 4.1x |
+| Sessions with the most failed steps | 0.09 ms | 0.10 ms | 0.88 ms | 9.9x |
+| Most edited files | 0.73 ms | 0.68 ms | 0.49 ms | **0.7x (loss)** |
+| Average output size per tool | 0.46 ms | 0.49 ms | 1.59 ms | 3.5x |
+| Sessions using browser tools, per day | 0.09 ms | 0.12 ms | 2.17 ms | 24x |
+| Commands running `cargo test` | 19.9 ms | 5.8 ms | 16.6 ms | **0.8x (loss)**; 2.9x on 8 threads |
+
+| Read (median / p95 per item) | TranscriptDB | PostgreSQL |
+|---|---|---|
+| A request's messages in order | 1.00 / 3.1 ms | 1.29 / 4.1 ms |
+| 20 steps with their call and result messages | 0.13 / 1.6 ms | 0.47 / 1.2 ms |
+| A whole session's messages | 0.41 / 2.1 ms | 0.86 / 5.7 ms |
+
+The two losses: grouping by file path builds a hash map keyed through the dictionaries row by row,
+and `cargo test` evaluates a substring test over every distinct command (about 10k values, many
+several KB). The design's bar ("each query faster") is not met yet on one thread. The machine was
+under memory pressure during these runs (about 3 GB of swap in use), so absolute times are noisy
+between runs; the reads table moved by up to 2x at the median from run to run.
+
 ## Reading Claude Code's logs
 
 `src/claude.rs` turns `~/.claude/projects/**/*.jsonl` into request bodies. Newer Claude Code
@@ -142,6 +197,7 @@ our reconstruction. Real logs are only read at run time; tests use synthetic dat
 scripts/test.sh            # unit + end-to-end tests on synthetic sessions
 scripts/check-rebuild.sh   # ingest every local log, merge, rebuild every request, sizes, read times
 scripts/crash-test.sh 1000 # SIGKILL the writer 1000 times at random moments
+scripts/h2h.sh             # head-to-head against PostgreSQL (needs postgresql@18)
 ```
 
 `check-rebuild.sh` writes its store outside the repo (`$TMPDIR/transcriptdb-check`) and deletes it
@@ -198,6 +254,7 @@ tdb serve         --store DIR [--port 8377]
 tdb synth         --store DIR [--sessions 20 --per 40]
 tdb query         --store DIR --q 'QUERY' [--limit 30] [--threads N] [--repeat N]
 tdb check-queries --store DIR [--n 300] [--max-steps 400] [--seed S]
+tdb h2h           --store DIR [--pg 127.0.0.1:5455] [--no-load x] [--reps 5] [--reads 200]
 ```
 
 ## On disk
@@ -211,6 +268,6 @@ seg-NNNNNN.opq        opaque values, raw
 
 ## What's next
 
-1. The head-to-head against PostgreSQL on the same steps and messages (needs PostgreSQL
-   installed locally).
+1. Close the two head-to-head losses (grouping on raw dictionary codes; substring tests over long
+   values with a trigram or word index), and a bigger head-to-head once there is disk for it.
 2. Derived columns (rules at write time, backfilled on merge), then text search.

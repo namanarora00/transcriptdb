@@ -18,31 +18,44 @@ use std::collections::HashMap;
 
 /// An input value too long for the dictionary: queries must open the message.
 pub const LONG: u32 = u32::MAX - 1;
-/// Input values up to this many bytes (as JSON text) are dictionary-coded.
-pub const MAX_VALUE: usize = 256;
+/// Input values up to this many bytes (as JSON text) are dictionary-coded. 4 KB covers 98% of
+/// shell commands in the measured logs (half are over 256 bytes).
+pub const MAX_VALUE: usize = 4096;
 pub const SHAPE_OTHER: u8 = 127;
 
+/// Distinct values with dense codes. The index holds a 128-bit hash of each value, not a
+/// second copy; a (never yet seen) hash collision falls back to an exact side table.
 #[derive(Default, Debug, Clone)]
 pub struct Dict {
     vals: Vec<Box<[u8]>>,
-    ix: HashMap<Box<[u8]>, u32>,
+    ix: HashMap<u128, u32>,
+    clash: HashMap<Box<[u8]>, u32>,
 }
 
 impl Dict {
     pub fn intern(&mut self, v: &[u8]) -> u32 {
-        if let Some(&c) = self.ix.get(v) {
+        if let Some(c) = self.code(v) {
             return c;
         }
         let c = self.vals.len() as u32;
         self.vals.push(v.into());
-        self.ix.insert(v.into(), c);
+        let h = xxhash_rust::xxh3::xxh3_128(v);
+        if self.ix.contains_key(&h) {
+            self.clash.insert(v.into(), c);
+        } else {
+            self.ix.insert(h, c);
+        }
         c
     }
     pub fn get(&self, c: u32) -> &[u8] {
         &self.vals[c as usize]
     }
     pub fn code(&self, v: &[u8]) -> Option<u32> {
-        self.ix.get(v).copied()
+        match self.ix.get(&xxhash_rust::xxh3::xxh3_128(v)) {
+            Some(&c) if *self.vals[c as usize] == *v => Some(c),
+            Some(_) => self.clash.get(v).copied(),
+            None => None,
+        }
     }
     pub fn len(&self) -> usize {
         self.vals.len()

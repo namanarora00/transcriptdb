@@ -948,7 +948,7 @@ impl Db {
                 continue;
             }
             let order = layout::heavy_first(0, n, |id| sess.nodes[id as usize].parent, tips[s as usize].iter().copied());
-            let mut cache: HashMap<(u32, u32, usize), Vec<u8>> = HashMap::new();
+            let mut cache: HashMap<(u32, u32, usize), Arc<Vec<u8>>> = HashMap::new();
             let mut stream = Vec::new();
             let mut nodes = Vec::with_capacity(order.len());
             for id in order {
@@ -1008,7 +1008,7 @@ impl Db {
     // ------------------------------------------------------------------ reads
 
     /// Append a node's stored bytes (opaque values still cut out).
-    fn stored_bytes(&self, nm: &NodeMeta, cache: &mut HashMap<(u32, u32, usize), Vec<u8>>, out: &mut Vec<u8>) -> Result<()> {
+    fn stored_bytes(&self, nm: &NodeMeta, cache: &mut HashMap<(u32, u32, usize), Arc<Vec<u8>>>, out: &mut Vec<u8>) -> Result<()> {
         match nm.loc {
             Loc::Mem(mi) => out.extend_from_slice(&self.mem.nodes[mi as usize]),
             Loc::Seg { seg, chunk, off } => {
@@ -1080,7 +1080,7 @@ impl Db {
                 }
             }
         }
-        let mut cache: HashMap<(u32, u32, usize), Vec<u8>> = HashMap::with_capacity(need.len());
+        let mut cache: HashMap<(u32, u32, usize), Arc<Vec<u8>>> = HashMap::with_capacity(need.len());
         let v: Vec<_> = need.into_iter().collect();
         let mut i = 0;
         while i < v.len() {
@@ -1097,6 +1097,41 @@ impl Db {
             }
             i = j + 1;
         }
+        // opaque values: read the ones in segments with as few reads as possible (a
+        // session's values sit close together in its segment's opaque file)
+        let mut wanted: Vec<(u32, u64, u32, u64)> = Vec::new(); // (seg, off, len, id)
+        for &id in ids {
+            if let Some(h) = &s.nodes[id as usize].holes {
+                for &(_, oid) in h.iter() {
+                    if let Some(OLoc::Seg { seg, off, len }) = self.opaques.get(oid as usize).map(|o| o.loc) {
+                        wanted.push((seg, off, len, oid));
+                    }
+                }
+            }
+        }
+        let mut fetched: HashMap<u64, Vec<u8>> = HashMap::with_capacity(wanted.len());
+        if !wanted.is_empty() {
+            wanted.sort_unstable();
+            wanted.dedup();
+            const GAP: u64 = 64 * 1024;
+            let mut i = 0;
+            while i < wanted.len() {
+                let (seg, start, _, _) = wanted[i];
+                let mut end = start + wanted[i].2 as u64;
+                let mut j = i;
+                while j + 1 < wanted.len() && wanted[j + 1].0 == seg && wanted[j + 1].1 <= end + GAP {
+                    j += 1;
+                    end = end.max(wanted[j].1 + wanted[j].2 as u64);
+                }
+                let buf = self.segs[&seg].opaque(start, (end - start) as u32)?;
+                st.opaque_reads += 1;
+                for w in &wanted[i..=j] {
+                    let a = (w.1 - start) as usize;
+                    fetched.insert(w.3, buf[a..a + w.2 as usize].to_vec());
+                }
+                i = j + 1;
+            }
+        }
         let mut tmp = Vec::new();
         for &id in ids {
             let nm = &s.nodes[id as usize];
@@ -1109,7 +1144,16 @@ impl Db {
                     let mut pos = 0usize;
                     for &(o, oid) in holes.iter() {
                         out.extend_from_slice(&tmp[pos..o as usize]);
-                        self.opaque_into(oid, out, st)?;
+                        match fetched.get(&oid) {
+                            Some(p) => {
+                                let om = &self.opaques[oid as usize];
+                                if opaque_hash(om.enc, p) != om.hash {
+                                    return corrupt(format!("opaque value {oid} fails its checksum"));
+                                }
+                                split::opaque_text(if om.enc == 0 { OpaqueEnc::Base64 } else { OpaqueEnc::Text }, p, out);
+                            }
+                            None => self.opaque_into(oid, out, st)?,
+                        }
                         pos = o as usize;
                     }
                     out.extend_from_slice(&tmp[pos..]);
@@ -1359,6 +1403,15 @@ impl Db {
     /// Tool, field and value dictionaries, and the field index.
     pub fn step_dicts(&self) -> &StepDicts {
         &self.sd
+    }
+
+    /// One message as stored: opaque values (signatures, images) still cut out, with the
+    /// offsets where they belong. Cheaper than [`Db::message`] when they are not needed.
+    pub fn stored_message(&self, s: u32, node: u32) -> Result<(Vec<u8>, Vec<u32>)> {
+        let nm = &self.sessions[s as usize].nodes[node as usize];
+        let mut out = Vec::with_capacity(nm.len as usize);
+        self.stored_bytes(nm, &mut HashMap::new(), &mut out)?;
+        Ok((out, nm.holes.as_deref().map(|h| h.iter().map(|x| x.0).collect()).unwrap_or_default()))
     }
 
     /// One message (tree node) of a session, with opaque values put back.
