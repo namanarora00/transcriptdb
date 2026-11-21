@@ -202,3 +202,70 @@ fn steps_match_the_reference_and_survive_reopen_and_compact() {
     assert!(transcriptdb::check::check_steps(&db, 4).unwrap().ok());
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+fn values_not_kept_rebuild_blank_and_keep_their_sizes() {
+    use transcriptdb::split::{blank_dropped, Keep};
+    let keep = Keep::dropping("thinking,images").unwrap();
+    let reqs = traffic(23, 6, 30);
+    let (da, db_dir) = (tmpdir("keepall"), tmpdir("dropped"));
+    let mut all = Db::open(&da, opts(1 << 30)).unwrap();
+    let mut dr = Db::open(&db_dir, Options { keep, ..opts(128 << 10) }).unwrap();
+    for q in &reqs {
+        put(&mut all, q);
+        put(&mut dr, q);
+    }
+    all.commit().unwrap();
+    dr.commit().unwrap();
+    let check = |dr: &Db| {
+        let mut held = 0;
+        for q in &reqs {
+            let ri = dr.request_index(&q.id).unwrap();
+            let got = dr.rebuild(ri).unwrap();
+            assert_eq!(got, blank_dropped(&q.body, &keep).unwrap(), "{}", q.id);
+            if dr.request_has_dropped(ri).unwrap() {
+                held += 1;
+                assert!(dr.rebuild_checked(ri).is_err());
+                assert!(got.len() < q.body.len());
+            } else {
+                assert_eq!(got, q.body);
+            }
+        }
+        assert!(held > reqs.len() / 2, "most synthetic requests hold thinking or images ({held})");
+        // steps, and the sizes of results that held images, are the same as when kept
+        let decoded = |db: &Db, s: u32| -> Vec<(Vec<u8>, u32, u32, u32, bool, Vec<(Vec<u8>, Vec<u8>)>)> {
+            let (ss, sd) = (db.steps(s), db.step_dicts());
+            (0..ss.rows.len() as u32)
+                .map(|i| {
+                    let r = ss.rows[i as usize];
+                    let f = ss.fields_of(i).iter().map(|&(f, v)| (sd.fields.get(f).to_vec(), if transcriptdb::steps::is_long(v) { format!("{:?}", ss.long_at(v)).into_bytes() } else { sd.values[f as usize].get(v).to_vec() })).collect();
+                    (sd.tools.get(r.tool).to_vec(), r.call_node, r.prev, r.out_bytes, r.failed, f)
+                })
+                .collect()
+        };
+        for s in 0..all.session_count() as u32 {
+            assert_eq!(decoded(&all, s), decoded(dr, s));
+        }
+        let st = dr.stats();
+        assert!(st.opaques_dropped > 0 && st.opaque_bytes < all.stats().opaque_bytes / 4);
+    };
+    check(&dr);
+    drop(dr);
+    let mut dr = Db::open(&db_dir, Options { keep, ..opts(128 << 10) }).unwrap();
+    check(&dr);
+    dr.compact().unwrap();
+    check(&dr);
+    drop(dr);
+    // the same store opened keeping everything: new copies of values seen before are kept
+    let mut dr = Db::open(&db_dir, opts(128 << 10)).unwrap();
+    let more: Vec<SynthRequest> = reqs.iter().take(60).map(|q| SynthRequest { session: format!("copy-{}", q.session), id: format!("copy-{}", q.id), agent: q.agent.clone(), time: q.time.clone(), body: q.body.clone() }).collect();
+    for q in &more {
+        put(&mut dr, q);
+    }
+    dr.commit().unwrap();
+    for q in &more {
+        assert_eq!(dr.rebuild_checked(dr.request_index(&q.id).unwrap()).unwrap(), q.body);
+    }
+    std::fs::remove_dir_all(&da).unwrap();
+    std::fs::remove_dir_all(&db_dir).unwrap();
+}

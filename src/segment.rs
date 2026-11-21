@@ -17,7 +17,7 @@ use std::io::{BufWriter, Write};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 
-const SEG_MAGIC: &[u8; 8] = b"TDBSEG01";
+const SEG_MAGIC: &[u8; 8] = b"TDBSEG02";
 const OPQ_MAGIC: &[u8; 8] = b"TDBOPQ01";
 const FOOTER: usize = 8 + 8 + 4 + 8;
 
@@ -62,6 +62,9 @@ pub struct SegPiece {
 pub struct SegOpaque {
     pub id: u64,
     pub enc: u8,
+    pub kind: u8,
+    /// Not kept: no payload, and `len` is the length it had.
+    pub dropped: bool,
     pub hash: u128,
     pub off: u64,
     pub len: u32,
@@ -142,6 +145,7 @@ impl SegIndex {
         for o in &self.opaques {
             e.var(o.id);
             e.u8(o.enc);
+            e.u8(o.kind | if o.dropped { 0x80 } else { 0 });
             e.u128(o.hash);
             e.var(o.off);
             e.var(o.len as u64);
@@ -240,7 +244,8 @@ impl SegIndex {
         let no = d.var()? as usize;
         let mut opaques = Vec::with_capacity(no);
         for _ in 0..no {
-            opaques.push(SegOpaque { id: d.var()?, enc: d.u8()?, hash: d.u128()?, off: d.var()?, len: d.var32()? });
+            let (id, enc, k) = (d.var()?, d.u8()?, d.u8()?);
+            opaques.push(SegOpaque { id, enc, kind: k & 0x7f, dropped: k & 0x80 != 0, hash: d.u128()?, off: d.var()?, len: d.var32()? });
         }
         let nr = d.var()? as usize;
         let mut requests = Vec::with_capacity(nr);

@@ -126,19 +126,32 @@ pub struct NewNode {
     pub holes: Vec<(u32, u64)>,
 }
 
+/// An opaque value new to the store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewOpaque {
+    pub id: u64,
+    pub enc: u8,
+    pub kind: u8,
+    pub hash: u128,
+    /// The value; empty when it is not kept.
+    pub payload: Vec<u8>,
+    /// For a value not kept: the length its payload had.
+    pub dropped: Option<u32>,
+}
+
 /// One write-ahead log record: everything one request adds to the store.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Mutation {
     pub seq: u64,
     pub new_session: Option<(u32, String, String)>,
     pub pieces: Vec<(u32, u8, u128, Vec<u8>)>,
-    pub opaques: Vec<(u64, u8, u128, Vec<u8>)>,
+    pub opaques: Vec<NewOpaque>,
     pub session: u32,
     pub nodes: Vec<NewNode>,
     pub req: ReqRec,
 }
 
-const TAG_PUT: u8 = 1;
+const TAG_PUT: u8 = 2;
 
 impl Mutation {
     pub fn encode(&self) -> Vec<u8> {
@@ -162,11 +175,15 @@ impl Mutation {
             e.bytes(b);
         }
         e.var(self.opaques.len() as u64);
-        for (id, enc, h, b) in &self.opaques {
-            e.var(*id);
-            e.u8(*enc);
-            e.u128(*h);
-            e.bytes(b);
+        for o in &self.opaques {
+            e.var(o.id);
+            e.u8(o.enc);
+            e.u8(o.kind | if o.dropped.is_some() { 0x80 } else { 0 });
+            e.u128(o.hash);
+            match o.dropped {
+                Some(n) => e.var(n as u64),
+                None => e.bytes(&o.payload),
+            }
         }
         e.var(self.session as u64);
         e.var(self.nodes.len() as u64);
@@ -204,7 +221,9 @@ impl Mutation {
         let no = d.var()? as usize;
         let mut opaques = Vec::with_capacity(no);
         for _ in 0..no {
-            opaques.push((d.var()?, d.u8()?, d.u128()?, d.bytes()?.to_vec()));
+            let (id, enc, k, hash) = (d.var()?, d.u8()?, d.u8()?, d.u128()?);
+            let (payload, dropped) = if k & 0x80 != 0 { (Vec::new(), Some(d.var32()?)) } else { (d.bytes()?.to_vec(), None) };
+            opaques.push(NewOpaque { id, enc, kind: k & 0x7f, hash, payload, dropped });
         }
         let session = d.var32()?;
         let nn = d.var()? as usize;
@@ -239,7 +258,10 @@ mod tests {
             seq: 42,
             new_session: Some((3, "s".into(), "a".into())),
             pieces: vec![(1, PIECE_SKELETON, 99, b"sk".to_vec())],
-            opaques: vec![(7, 0, 5, vec![1, 2, 3])],
+            opaques: vec![
+                NewOpaque { id: 7, enc: 0, kind: 2, hash: 5, payload: vec![1, 2, 3], dropped: None },
+                NewOpaque { id: 8, enc: 1, kind: 1, hash: 6, payload: Vec::new(), dropped: Some(300) },
+            ],
             session: 3,
             nodes: vec![NewNode { id: 0, parent: NONE, hash: 1, bytes: b"{}".to_vec(), holes: vec![(1, 7)] }],
             req: ReqRec {

@@ -310,11 +310,98 @@ pub enum OpaqueEnc {
     Text = 1,
 }
 
+/// What an opaque value is, read from where it sits in its message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum OpaqueKind {
+    Other = 0,
+    /// `signature` of a thinking block: encrypted, only needed to send the conversation back.
+    Signature = 1,
+    /// `data` of an image source.
+    Image = 2,
+    /// `data` of any other media source (PDFs, text files).
+    Document = 3,
+    /// `data` of a `redacted_thinking` block.
+    RedactedThinking = 4,
+    /// The text of a thinking block; cut out only when thinking is not kept.
+    ThinkingText = 5,
+}
+
+impl OpaqueKind {
+    pub fn from_u8(v: u8) -> OpaqueKind {
+        match v {
+            1 => OpaqueKind::Signature,
+            2 => OpaqueKind::Image,
+            3 => OpaqueKind::Document,
+            4 => OpaqueKind::RedactedThinking,
+            5 => OpaqueKind::ThinkingText,
+            _ => OpaqueKind::Other,
+        }
+    }
+    pub fn name(self) -> &'static str {
+        match self {
+            OpaqueKind::Other => "other base64",
+            OpaqueKind::Signature => "thinking signatures",
+            OpaqueKind::Image => "images",
+            OpaqueKind::Document => "documents",
+            OpaqueKind::RedactedThinking => "redacted thinking",
+            OpaqueKind::ThinkingText => "thinking text",
+        }
+    }
+}
+
+/// Which opaque values the store keeps. A value that is not kept is stored as its kind,
+/// hash and size only; requests that held it rebuild with an empty string in its place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Keep {
+    /// Thinking signatures, redacted thinking and thinking text.
+    pub thinking: bool,
+    pub images: bool,
+    pub documents: bool,
+    /// Long base64 strings under `signature` or `data` that match none of the above.
+    pub other: bool,
+}
+
+impl Default for Keep {
+    fn default() -> Self {
+        Keep { thinking: true, images: true, documents: true, other: true }
+    }
+}
+
+impl Keep {
+    pub fn all(&self) -> bool {
+        self.thinking && self.images && self.documents && self.other
+    }
+    pub fn keeps(&self, k: OpaqueKind) -> bool {
+        match k {
+            OpaqueKind::Signature | OpaqueKind::RedactedThinking | OpaqueKind::ThinkingText => self.thinking,
+            OpaqueKind::Image => self.images,
+            OpaqueKind::Document => self.documents,
+            OpaqueKind::Other => self.other,
+        }
+    }
+    /// Parse a comma-separated list of what not to keep: `thinking`, `images`, `documents`, `other`.
+    pub fn dropping(list: &str) -> std::result::Result<Keep, String> {
+        let mut k = Keep::default();
+        for w in list.split(',').map(str::trim).filter(|w| !w.is_empty()) {
+            match w {
+                "thinking" => k.thinking = false,
+                "images" => k.images = false,
+                "documents" => k.documents = false,
+                "other" => k.other = false,
+                _ => return Err(format!("unknown kind '{w}' (thinking, images, documents, other)")),
+            }
+        }
+        Ok(k)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct OpaqueHole {
     /// Offset in the cut message where the string content goes (between the quotes).
     pub offset: u32,
     pub enc: OpaqueEnc,
+    pub kind: OpaqueKind,
     pub payload: Vec<u8>,
 }
 
@@ -324,60 +411,110 @@ fn is_b64(s: &[u8]) -> bool {
     s.iter().all(|&c| c.is_ascii_alphanumeric() || c == b'+' || c == b'/' || c == b'=')
 }
 
-fn walk_opaque(b: &[u8], n: &json::Node, out: &mut Vec<Span>) {
+/// Opaque strings under `n`: (content span, kind). Thinking text is included only when
+/// `thinking_text` is set.
+fn walk_opaque(b: &[u8], n: &json::Node, thinking_text: bool, out: &mut Vec<(Span, OpaqueKind)>) {
     match n {
         json::Node::Obj(ms) => {
+            let str_of = |name: &str| {
+                ms.iter().find(|(k, _)| json::key_is(b, k, name)).and_then(|(_, v)| match v {
+                    json::Node::Tok(s) if b[s.start] == b'"' => Some(json::inner(b, s)),
+                    _ => None,
+                })
+            };
             for (k, v) in ms {
                 if let json::Node::Tok(s) = v
                     && b[s.start] == b'"'
-                        && s.len() - 2 >= MIN_OPAQUE
-                        && (json::key_is(b, k, "signature") || json::key_is(b, k, "data"))
-                        && is_b64(json::inner(b, s))
-                    {
-                        out.push(s.start + 1..s.end - 1);
+                {
+                    let content = s.start + 1..s.end - 1;
+                    let long_b64 = s.len() - 2 >= MIN_OPAQUE && is_b64(json::inner(b, s));
+                    let kind = if long_b64 && json::key_is(b, k, "signature") {
+                        Some(OpaqueKind::Signature)
+                    } else if long_b64 && json::key_is(b, k, "data") {
+                        let media = str_of("media_type").unwrap_or(b"");
+                        Some(if media.starts_with(b"image/") {
+                            OpaqueKind::Image
+                        } else if !media.is_empty() {
+                            OpaqueKind::Document
+                        } else if str_of("type") == Some(b"redacted_thinking") {
+                            OpaqueKind::RedactedThinking
+                        } else {
+                            OpaqueKind::Other
+                        })
+                    } else if thinking_text && s.len() > 2 && json::key_is(b, k, "thinking") && str_of("type") == Some(b"thinking") {
+                        Some(OpaqueKind::ThinkingText)
+                    } else {
+                        None
+                    };
+                    if let Some(kind) = kind {
+                        out.push((content, kind));
                         continue;
                     }
-                walk_opaque(b, v, out);
+                }
+                walk_opaque(b, v, thinking_text, out);
             }
         }
         json::Node::Arr(items) => {
             for it in items {
-                walk_opaque(b, it, out);
+                walk_opaque(b, it, thinking_text, out);
             }
         }
         json::Node::Tok(_) => {}
     }
 }
 
-/// Cut thinking signatures and base64 images out of a message.
-pub fn cut_opaque(m: &[u8]) -> Result<(Vec<u8>, Vec<OpaqueHole>)> {
+fn opaque_spans(m: &[u8], thinking_text: bool) -> Result<Vec<(Span, OpaqueKind)>> {
     let f = memchr::memmem::find;
-    if f(m, b"\"signature\"").is_none() && f(m, b"\"data\"").is_none() {
-        return Ok((m.to_vec(), Vec::new()));
+    if f(m, b"\"signature\"").is_none() && f(m, b"\"data\"").is_none() && !(thinking_text && f(m, b"\"thinking\"").is_some()) {
+        return Ok(Vec::new());
     }
     let node = json::parse_all(m)?;
     let mut spans = Vec::new();
-    walk_opaque(m, &node, &mut spans);
+    walk_opaque(m, &node, thinking_text, &mut spans);
+    spans.sort_by_key(|s| s.0.start);
+    Ok(spans)
+}
+
+/// Cut thinking signatures, base64 images and other opaque values out of a message (and
+/// thinking text, when `keep` drops thinking).
+pub fn cut_opaque(m: &[u8], keep: &Keep) -> Result<(Vec<u8>, Vec<OpaqueHole>)> {
+    let spans = opaque_spans(m, !keep.thinking)?;
     if spans.is_empty() {
         return Ok((m.to_vec(), Vec::new()));
     }
-    spans.sort_by_key(|s| s.start);
     let eng = base64::engine::general_purpose::STANDARD;
     let mut bytes = Vec::with_capacity(m.len());
     let mut holes = Vec::with_capacity(spans.len());
     let mut pos = 0;
-    for s in spans {
+    for (s, kind) in spans {
         bytes.extend_from_slice(&m[pos..s.start]);
         let text = &m[s.clone()];
         let (enc, payload) = match eng.decode(text) {
-            Ok(raw) if eng.encode(&raw).as_bytes() == text => (OpaqueEnc::Base64, raw),
+            Ok(raw) if kind != OpaqueKind::ThinkingText && eng.encode(&raw).as_bytes() == text => (OpaqueEnc::Base64, raw),
             _ => (OpaqueEnc::Text, text.to_vec()),
         };
-        holes.push(OpaqueHole { offset: bytes.len() as u32, enc, payload });
+        holes.push(OpaqueHole { offset: bytes.len() as u32, enc, kind, payload });
         pos = s.end;
     }
     bytes.extend_from_slice(&m[pos..]);
     Ok((bytes, holes))
+}
+
+/// A whole request body with every value `keep` drops replaced by an empty string: what
+/// the store gives back for a request that held such values. Used to check rebuilds.
+pub fn blank_dropped(body: &[u8], keep: &Keep) -> Result<Vec<u8>> {
+    let spans = opaque_spans(body, !keep.thinking)?;
+    let mut out = Vec::with_capacity(body.len());
+    let mut pos = 0;
+    for (s, kind) in spans {
+        if keep.keeps(kind) {
+            continue;
+        }
+        out.extend_from_slice(&body[pos..s.start]);
+        pos = s.end;
+    }
+    out.extend_from_slice(&body[pos..]);
+    Ok(out)
 }
 
 /// Write an opaque value back as the text it came from.
@@ -430,8 +567,9 @@ mod tests {
         let sig = "QUJD".repeat(40);
         let img = "iVBORw0KGgo".repeat(10) + "=";
         let m = format!(r#"{{"content":[{{"signature":"{sig}","thinking":"x","type":"thinking"}},{{"source":{{"data":"{img}","media_type":"image/png","type":"base64"}},"type":"image"}},{{"data":"short","type":"t"}}],"role":"assistant"}}"#);
-        let (cut, holes) = cut_opaque(m.as_bytes()).unwrap();
+        let (cut, holes) = cut_opaque(m.as_bytes(), &Keep::default()).unwrap();
         assert_eq!(holes.len(), 2);
+        assert_eq!((holes[0].kind, holes[1].kind), (OpaqueKind::Signature, OpaqueKind::Image));
         assert_eq!(holes[0].enc, OpaqueEnc::Base64);
         assert_eq!(holes[1].enc, OpaqueEnc::Text); // not canonical base64 (bad padding)
         let mut out = Vec::new();
@@ -443,5 +581,30 @@ mod tests {
         }
         out.extend_from_slice(&cut[pos..]);
         assert_eq!(out, m.as_bytes());
+    }
+
+    #[test]
+    fn kinds_and_blanking() {
+        let sig = "QUJD".repeat(40);
+        let pdf = "JVBERi0x".repeat(12);
+        let red = "UkVE".repeat(20);
+        let other = "T1RI".repeat(20);
+        let m = format!(
+            r#"{{"messages":[{{"role":"assistant","content":[{{"type":"thinking","thinking":"plan \"it\"","signature":"{sig}"}},{{"type":"redacted_thinking","data":"{red}"}},{{"type":"document","source":{{"type":"base64","media_type":"application/pdf","data":"{pdf}"}}}},{{"type":"x","data":"{other}"}}]}}]}}"#
+        );
+        let kinds = |k: &Keep| opaque_spans(m.as_bytes(), !k.thinking).unwrap().into_iter().map(|x| x.1).collect::<Vec<_>>();
+        use OpaqueKind::*;
+        assert_eq!(kinds(&Keep::default()), vec![Signature, RedactedThinking, Document, Other]);
+        let no_thinking = Keep::dropping("thinking").unwrap();
+        assert_eq!(kinds(&no_thinking), vec![ThinkingText, Signature, RedactedThinking, Document, Other]);
+        let blank = String::from_utf8(blank_dropped(m.as_bytes(), &no_thinking).unwrap()).unwrap();
+        assert!(blank.contains(r#""thinking":"","signature":"""#) && blank.contains(r#""data":"""#) && blank.contains(&pdf) && blank.contains(&other));
+        let (_, holes) = cut_opaque(m.as_bytes(), &no_thinking).unwrap();
+        assert_eq!(holes[0].kind, ThinkingText);
+        assert_eq!(holes[0].enc, OpaqueEnc::Text);
+        assert_eq!(holes[0].payload, br#"plan \"it\""#.to_vec());
+        assert_eq!(blank_dropped(m.as_bytes(), &Keep::default()).unwrap(), m.as_bytes());
+        assert!(Keep::dropping("pictures").is_err());
+        assert_eq!(Keep::dropping("images, documents").unwrap(), Keep { images: false, documents: false, ..Keep::default() });
     }
 }

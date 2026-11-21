@@ -1,7 +1,8 @@
 //! `tdb`: command-line tool for the TranscriptDB storage core.
 //!
 //!   tdb ingest-claude --store DIR [--logs DIR] [--max-files N] [--seed S] [--threads N] [--sync full|fsync|os]
-//!   tdb check-claude  --store DIR [--logs DIR] [--threads N]
+//!                     [--drop thinking,images,documents,other]
+//!   tdb check-claude  --store DIR [--logs DIR] [--threads N] [--drop ...as at ingest]
 //!   tdb stats         --store DIR
 //!   tdb compact       --store DIR
 //!   tdb bench         --store DIR [--n 300] [--seed S]
@@ -19,6 +20,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 use transcriptdb::claude::{self, LogFile, LogRequest, Problem};
 use transcriptdb::db::sha256;
+use transcriptdb::split::{self, Keep};
 use transcriptdb::synth::{self, Rng};
 use transcriptdb::{Db, Options, Put, PutOutcome, ReadStats, SyncMode};
 
@@ -65,8 +67,22 @@ impl Args {
     fn threads(&self) -> usize {
         self.num("threads", std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4) as u64) as usize
     }
+    /// `--drop thinking,images,documents,other`: opaque values not to keep.
+    fn keep(&self) -> Keep {
+        match self.get("drop") {
+            None => Keep::default(),
+            Some(l) => Keep::dropping(l).unwrap_or_else(|e| panic!("--drop: {e}")),
+        }
+    }
     fn opts(&self) -> Options {
-        Options { sync: self.sync(), flush_bytes: (self.num("flush-mb", 64) as usize) << 20, ..Options::default() }
+        Options {
+            sync: self.sync(),
+            flush_bytes: (self.num("flush-mb", 64) as usize) << 20,
+            level: self.num("level", 3) as i32,
+            frame_size: (self.num("frame-kb", 64) as usize) << 10,
+            keep: self.keep(),
+            ..Options::default()
+        }
     }
 }
 
@@ -230,6 +246,7 @@ fn check_claude(a: &Args) {
     let errors = AtomicUsize::new(0);
     let bytes = AtomicUsize::new(0);
     let missing: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+    let dropped: Mutex<Vec<usize>> = Mutex::new(Vec::new());
     let failures: Mutex<Vec<String>> = Mutex::new(Vec::new());
     let next = AtomicUsize::new(0);
     let t1 = Instant::now();
@@ -247,6 +264,11 @@ fn check_claude(a: &Args) {
                         missing.lock().unwrap().push(i);
                         continue;
                     };
+                    if db.request_has_dropped(ri).unwrap_or(false) {
+                        // checked below against the log's body with those values blanked
+                        dropped.lock().unwrap().push(i);
+                        continue;
+                    }
                     out.clear();
                     if let Err(e) = db.rebuild_into(ri, &mut out, &mut ReadStats::default()) {
                         errors.fetch_add(1, Ordering::Relaxed);
@@ -274,12 +296,68 @@ fn check_claude(a: &Args) {
     });
     let secs = t1.elapsed().as_secs_f64();
     let missing = missing.into_inner().unwrap();
+    let dropped = dropped.into_inner().unwrap();
+    // requests that held values the store did not keep: build each body from the log
+    // again, blank the values `--drop` names, and compare with the rebuild
+    let keep = a.keep();
+    let blank_ok = AtomicUsize::new(0);
+    let blank_bad = AtomicUsize::new(0);
+    let t2 = Instant::now();
+    if !dropped.is_empty() {
+        let want: HashMap<&str, usize> = dropped.iter().map(|&i| (list[i].0.as_str(), i)).collect();
+        let mut fset: Vec<usize> = dropped.iter().map(|&i| list[i].2).collect();
+        fset.sort_unstable();
+        fset.dedup();
+        let next = AtomicUsize::new(0);
+        let done: Mutex<HashSet<usize>> = Mutex::new(HashSet::new());
+        std::thread::scope(|s| {
+            for _ in 0..a.threads() {
+                s.spawn(|| {
+                    loop {
+                        let k = next.fetch_add(1, Ordering::Relaxed);
+                        if k >= fset.len() {
+                            break;
+                        }
+                        let Ok(lf) = LogFile::read(&files[fset[k]]) else { continue };
+                        lf.requests(|r| {
+                            let Some(&i) = want.get(r.id.as_str()) else { return };
+                            let Ok(body) = &r.body else { return };
+                            if !done.lock().unwrap().insert(i) {
+                                return;
+                            }
+                            let ri = db.request_index(&list[i].0).unwrap();
+                            let good = match (split::blank_dropped(body, &keep), db.rebuild(ri)) {
+                                (Ok(want), Ok(got)) => sha256(body) == db.request(ri).digest && want == got,
+                                _ => false,
+                            };
+                            if good {
+                                blank_ok.fetch_add(1, Ordering::Relaxed);
+                            } else {
+                                blank_bad.fetch_add(1, Ordering::Relaxed);
+                                failures.lock().unwrap().push(format!("{}: rebuild differs from the log's body with dropped values blanked", r.id));
+                            }
+                        });
+                    }
+                });
+            }
+        });
+        let unseen = dropped.len() - done.into_inner().unwrap().len();
+        blank_bad.fetch_add(unseen, Ordering::Relaxed);
+    }
     let stored_in_logs = list.len() - missing.len();
     println!("requests recorded in the logs now: {} distinct ids ({raw_lines} request lines; read in {t_read:.1}s)", list.len());
     println!("  in the store: {stored_in_logs}");
     println!("    rebuilt byte for byte (sha256 equal to Claude Code's requestDigest and to the digest taken at ingest): {}", ok.load(Ordering::Relaxed));
     println!("    rebuilt but different from requestDigest: {}", bad_log.load(Ordering::Relaxed));
     println!("    rebuilt but different from the ingest digest: {}", bad_stored.load(Ordering::Relaxed));
+    if !dropped.is_empty() {
+        println!(
+            "    held values not kept (--drop), so checked against the log's body with those values blanked: {} equal, {} different ({:.1}s)",
+            blank_ok.load(Ordering::Relaxed),
+            blank_bad.load(Ordering::Relaxed),
+            t2.elapsed().as_secs_f64()
+        );
+    }
     println!("    read errors: {}", errors.load(Ordering::Relaxed));
     println!(
         "    {} rebuilt in {secs:.1}s on {} threads ({:.0} MB/s, {:.0} requests/s)",
@@ -291,7 +369,7 @@ fn check_claude(a: &Args) {
     for f in failures.lock().unwrap().iter().take(20) {
         println!("    FAIL {f}");
     }
-    let failed = bad_log.load(Ordering::Relaxed) + bad_stored.load(Ordering::Relaxed) + errors.load(Ordering::Relaxed);
+    let failed = bad_log.load(Ordering::Relaxed) + bad_stored.load(Ordering::Relaxed) + errors.load(Ordering::Relaxed) + blank_bad.load(Ordering::Relaxed);
     println!("  not in the store: {}", missing.len());
     if !missing.is_empty() {
         // explain each one by building it from the log again
@@ -340,10 +418,17 @@ fn stats(a: &Args) {
     println!("distinct message text: {} ({} message bytes + about {} of base64 opaque values)", mb(st.node_bytes + opaque_text), mb(st.node_bytes), mb(opaque_text));
     println!("on disk: segments {} + opaque {} = {} across {} segment(s); log {}", mb(st.seg_file_bytes), mb(st.opq_file_bytes), mb(st.seg_file_bytes + st.opq_file_bytes), st.segments, mb(st.wal_bytes));
     println!("  message frames {}  ({:.2}x smaller than the {} they hold)", mb(st.frame_bytes), st.node_bytes as f64 / st.frame_bytes.max(1) as f64, mb(st.node_bytes));
-    println!("  opaque values {} raw ({} values)", mb(st.opq_file_bytes), st.opaques);
+    println!("  opaque values {} raw ({} values kept, {} not kept)", mb(st.opq_file_bytes), st.opaques - st.opaques_dropped, st.opaques_dropped);
     println!("  shared pieces {} compressed from {} ({} pieces: skeletons, system, tools, markers)", mb(st.piece_bytes), mb(st.piece_raw_bytes), st.pieces);
     println!("  index {}", mb(st.index_bytes));
     println!("  all data files: {} for {} of distinct text ({:.3} bytes per byte)", mb(data), mb(st.node_bytes + opaque_text), data as f64 / (st.node_bytes + opaque_text).max(1) as f64);
+    if a.get("opaque").is_some() {
+        let total = data.max(1) as f64;
+        println!("  opaque values by kind (kept: values, size, share of all data files; not kept: values, size they had):");
+        for (kind, n, bytes, nd, dbytes) in db.opaque_kinds() {
+            println!("    {:<20} {:>8}  {:>10}  {:>5.1}%    {:>8}  {:>10}", kind, n, mb(bytes), bytes as f64 * 100.0 / total, nd, mb(dbytes));
+        }
+    }
     let mut rv: Vec<_> = runs.into_iter().collect();
     rv.sort();
     let tot = n.max(1) as f64;
