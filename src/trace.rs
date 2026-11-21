@@ -185,7 +185,7 @@ pub fn session_page(db: &Db, s: u32) -> String {
         };
         let mut inputs = String::new();
         for &(f, v) in ss.fields_of(i32_) {
-            let val = if v == steps::LONG { "<i>long</i>".to_string() } else { esc(&cut(&lossy(sd.values[f as usize].get(v)), 90)) };
+            let val = if steps::is_long(v) { "<i>long</i>".to_string() } else { esc(&cut(&lossy(sd.values[f as usize].get(v)), 90)) };
             let _ = write!(inputs, "<div class=\"kv\">{}: <b>{}</b></div>", esc(&lossy(sd.fields.get(f))), val);
         }
         let _ = write!(

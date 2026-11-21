@@ -15,7 +15,7 @@ use crate::layout;
 use crate::manifest::Manifest;
 use crate::record::*;
 use crate::segment::{opq_path, seg_path, SegChunk, SegIndex, SegNode, SegOpaque, SegPiece, SegSteps, SegWriter, Segment};
-use crate::steps::{self, SessionSteps, StepDicts, StepRow};
+use crate::steps::{self, FieldVal, SessionSteps, StepDicts, StepRow};
 use crate::split::{self, HoleKind, OpaqueEnc, Skeleton};
 use crate::wal::{self, SyncMode, WalWriter};
 use sha2::{Digest, Sha256};
@@ -391,7 +391,12 @@ impl Db {
                 fs.clear();
                 for (f, v) in rf {
                     let gf = *fields.get(f as usize).ok_or_else(|| Error::Corrupt("step names a missing field".into()))?;
-                    let gv = if v == steps::LONG { steps::LONG } else { *values.get(v as usize).ok_or_else(|| Error::Corrupt("step names a missing value".into()))? };
+                    let gv = if steps::is_long(v) {
+                        let (off, len) = *c.longs.get((v - steps::LONG_BASE) as usize).ok_or_else(|| Error::Corrupt("step names a missing long value".into()))?;
+                        FieldVal::Long { off, len }
+                    } else {
+                        FieldVal::Code(*values.get(v as usize).ok_or_else(|| Error::Corrupt("step names a missing value".into()))?)
+                    };
                     fs.push((gf, gv));
                 }
                 self.sd.push(c.session, ss, r, &fs);
@@ -677,7 +682,7 @@ impl Db {
 
     /// Walk up from `from` looking for the message that holds tool call `id`.
     #[allow(clippy::type_complexity)]
-    fn find_call(&self, si: u32, mut from: u32, id: &[u8]) -> Result<Option<(u32, u16, Vec<u8>, Vec<(Vec<u8>, Vec<u8>)>)>> {
+    fn find_call(&self, si: u32, mut from: u32, id: &[u8]) -> Result<Option<(u32, u16, Vec<u8>, Vec<steps::RawField>)>> {
         let s = &self.sessions[si as usize];
         let mut cache = HashMap::new();
         let mut buf = Vec::new();
@@ -756,6 +761,7 @@ impl Db {
             }
             let mut rows = Vec::with_capacity(ss.rows.len() - first as usize);
             let mut fields = Vec::with_capacity(rows.capacity());
+            let mut longs = Vec::new();
             for pos in first..ss.rows.len() as u32 {
                 let mut r = ss.rows[pos as usize];
                 r.tool = *tl.entry(r.tool).or_insert_with(|| {
@@ -768,8 +774,9 @@ impl Db {
                         ix.step_fields.push(self.sd.fields.get(f).to_vec());
                         ix.step_fields.len() as u32 - 1
                     });
-                    let lv = if v == steps::LONG {
-                        steps::LONG
+                    let lv = if steps::is_long(v) {
+                        longs.push(ss.long_at(v));
+                        steps::LONG_BASE + longs.len() as u32 - 1
                     } else {
                         *vl.entry((f, v)).or_insert_with(|| {
                             ix.step_values.push((lf, self.sd.values[f as usize].get(v).to_vec()));
@@ -781,7 +788,7 @@ impl Db {
                 rows.push(r);
                 fields.push(fs);
             }
-            ix.steps.push(SegSteps { session: s, first, rows, fields });
+            ix.steps.push(SegSteps { session: s, first, rows, fields, longs });
         }
     }
 
@@ -1412,6 +1419,40 @@ impl Db {
         let mut out = Vec::with_capacity(nm.len as usize);
         self.stored_bytes(nm, &mut HashMap::new(), &mut out)?;
         Ok((out, nm.holes.as_deref().map(|h| h.iter().map(|x| x.0).collect()).unwrap_or_default()))
+    }
+
+    /// Bytes `off..off + len` of a node's stored form, reading only the frames that hold
+    /// them; `None` if an opaque value sits inside that range (then read the message).
+    pub fn stored_range(&self, s: u32, node: u32, off: u32, len: u32) -> Result<Option<Vec<u8>>> {
+        let nm = &self.sessions[s as usize].nodes[node as usize];
+        let (a, b) = (off as usize, off as usize + len as usize);
+        if b > nm.len as usize {
+            return corrupt("range past the end of a message");
+        }
+        if nm.holes.as_deref().is_some_and(|h| h.iter().any(|&(o, _)| (o as usize) >= a && (o as usize) <= b)) {
+            return Ok(None);
+        }
+        match nm.loc {
+            Loc::Mem(mi) => Ok(Some(self.mem.nodes[mi as usize][a..b].to_vec())),
+            Loc::Seg { seg, chunk, off: base } => {
+                if len == 0 {
+                    return Ok(Some(Vec::new()));
+                }
+                let sg = &self.segs[&seg];
+                let fs = sg.frame_size as usize;
+                let (ga, gb) = (base as usize + a, base as usize + b);
+                let (f0, f1) = (ga / fs, (gb - 1) / fs);
+                let frames = sg.frames(chunk, f0, f1)?;
+                let mut out = Vec::with_capacity(len as usize);
+                for (i, fr) in frames.iter().enumerate() {
+                    let k = f0 + i;
+                    let s0 = ga.max(k * fs) - k * fs;
+                    let e0 = gb.min((k + 1) * fs) - k * fs;
+                    out.extend_from_slice(&fr[s0..e0]);
+                }
+                Ok(Some(out))
+            }
+        }
     }
 
     /// One message (tree node) of a session, with opaque values put back.

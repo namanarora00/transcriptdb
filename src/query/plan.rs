@@ -11,6 +11,7 @@ use super::QError;
 use crate::db::Db;
 use crate::record::NONE;
 use crate::steps::{self, SessionSteps};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 
 /// A column of a step.
@@ -69,6 +70,17 @@ pub fn read_input(db: &Db, s: u32, ss: &SessionSteps, pos: u32, name: &str) -> R
     }
 }
 
+/// The raw JSON text of long value `v` (a `LONG_BASE` code) of input field `name`: only its
+/// bytes are read, unless an opaque value sits inside (then the whole message).
+pub fn long_value(db: &Db, s: u32, ss: &SessionSteps, pos: u32, v: u32, name: &str) -> Result<Option<Vec<u8>>, QError> {
+    let (off, len) = ss.long_at(v);
+    let r = ss.rows[pos as usize];
+    match db.stored_range(s, r.call_node, off, len).map_err(|e| QError::new(e.to_string()))? {
+        Some(b) => Ok(Some(b)),
+        None => read_input(db, s, ss, pos, name),
+    }
+}
+
 /// The value of one step column.
 pub fn step_value(db: &Db, s: u32, pos: u32, col: &StepCol) -> Result<Value, QError> {
     let ss = db.steps(s);
@@ -87,7 +99,7 @@ pub fn step_value(db: &Db, s: u32, pos: u32, col: &StepCol) -> Result<Value, QEr
             let Some(f) = sd.fields.code(name.as_bytes()) else { return Ok(Value::Null) };
             match ss.fields_of(pos).iter().find(|x| x.0 == f) {
                 None => Value::Null,
-                Some(&(_, v)) if v == steps::LONG => match read_input(db, s, ss, pos, name)? {
+                Some(&(_, v)) if steps::is_long(v) => match long_value(db, s, ss, pos, v, name)? {
                     Some(t) => Value::from_json(&t),
                     None => Value::Null,
                 },
@@ -157,9 +169,12 @@ pub enum Sp {
     Const(bool),
     /// By tool code.
     Tool(Arc<[bool]>),
-    /// By value code of input field `f`; `missing` when the step lacks the field; long values
-    /// are read from the message and tested with `expr`.
-    Field { name: String, f: Option<u32>, table: Arc<[bool]>, missing: bool, expr: Arc<Expr> },
+    /// By value code of input field `f`, worked out the first time a step has that value
+    /// (0 = not yet, 1 = false, 2 = true); `missing` when the step lacks the field; long values
+    /// are read (just their bytes) and tested with `expr`.
+    Field { name: String, f: Option<u32>, table: Arc<[AtomicU8]>, missing: bool, expr: Arc<Expr> },
+    /// `isnotnull(field)` (`want`) or `isnull(field)`; `null` is the code of a JSON null.
+    Present { f: Option<u32>, null: Option<u32>, want: bool },
     /// By session index.
     Session(Arc<[bool]>),
     /// Evaluated per step.
@@ -194,14 +209,6 @@ pub fn clear_cache() {
     ATOMS.with(|c| c.borrow_mut().clear());
 }
 
-thread_local! {
-    static THREADS: std::cell::Cell<u32> = const { std::cell::Cell::new(1) };
-}
-
-/// How many threads planning may use (set per query).
-pub fn set_threads(n: usize) {
-    THREADS.with(|t| t.set(n.max(1) as u32));
-}
 
 pub fn compile(db: &Db, e: &Expr, now: i64) -> Result<Sp, QError> {
     Ok(match e {
@@ -248,32 +255,16 @@ fn compile_atom(db: &Db, e: &Expr, now: i64) -> Result<Sp, QError> {
             Some(StepCol::Field(name)) => {
                 let col = StepCol::Field(name.clone());
                 let f = sd.fields.code(name.as_bytes());
-                let table: Vec<bool> = match f {
-                    Some(f) => {
-                        let d = &sd.values[f as usize];
-                        let one = |c: u32| eval(e, &OneCol { col: &col, v: Value::from_json(d.get(c)), now }).map(|v| v.truthy());
-                        let n = d.len() as u32;
-                        let threads = THREADS.with(|t| t.get());
-                        if n < 4096 || threads == 1 {
-                            (0..n).map(one).collect::<Result<_, _>>()?
-                        } else {
-                            // large dictionaries (long text values): evaluate in parallel
-                            let per = n.div_ceil(threads);
-                            let parts: Vec<Result<Vec<bool>, QError>> = std::thread::scope(|sc| {
-                                let hs: Vec<_> = (0..threads).map(|t| sc.spawn(move || (t * per..((t + 1) * per).min(n)).map(one).collect::<Result<Vec<bool>, QError>>())).collect();
-                                hs.into_iter().map(|h| h.join().unwrap()).collect()
-                            });
-                            let mut all = Vec::with_capacity(n as usize);
-                            for p in parts {
-                                all.extend(p?);
-                            }
-                            all
-                        }
+                // isnull / isnotnull need no value at all
+                if let Expr::Call(fun, args) = e
+                    && (fun == "isnull" || fun == "isnotnull") && args.len() == 1 && matches!(args[0], Expr::Ref(_)) {
+                        let null = f.and_then(|f| sd.values[f as usize].code(b"null"));
+                        return Ok(Sp::Present { f, null, want: fun == "isnotnull" });
                     }
-                    None => Vec::new(),
-                };
+                let n = f.map(|f| sd.values[f as usize].len()).unwrap_or(0);
+                let table: Arc<[AtomicU8]> = (0..n).map(|_| AtomicU8::new(0)).collect();
                 let missing = eval(e, &OneCol { col: &col, v: Value::Null, now })?.truthy();
-                Sp::Field { name, f, table: table.into(), missing, expr: Arc::new(e.clone()) }
+                Sp::Field { name, f, table, missing, expr: Arc::new(e.clone()) }
             }
             Some(c @ (StepCol::Session | StepCol::Agent)) => {
                 let t: Vec<bool> = (0..db.session_count() as u32)
@@ -290,6 +281,41 @@ fn compile_atom(db: &Db, e: &Expr, now: i64) -> Result<Sp, QError> {
     })
 }
 
+/// Test one dictionary value (raw JSON text) against a one-column expression. String tests
+/// with a literal pattern run on the text itself, decoded only if it has escapes.
+fn test_raw(e: &Expr, name: &str, raw: &[u8], now: i64) -> Result<bool, QError> {
+    if let Expr::Str { op, e: inner, pat, neg, cs } = e
+        && let (Expr::Ref(_), Expr::Lit(Value::Str(p))) = (inner.as_ref(), pat.as_ref())
+            && raw.len() >= 2 && raw[0] == b'"' {
+                let body = &raw[1..raw.len() - 1];
+                // Without \u escapes, a pattern free of characters JSON escapes (quote,
+                // backslash, control) can only occur in the decoded text where it also occurs
+                // in the raw text. So a raw miss is a real miss; raw hits are confirmed on the
+                // decoded text (an escape like \t could fake one). ASCII only, so case folding
+                // agrees with the general path.
+                if *op == super::parse::StrOp::Contains
+                    && !*cs
+                    && p.bytes().all(|c| c.is_ascii() && c >= 0x20 && c != b'"' && c != b'\\')
+                    && body.is_ascii()
+                    && memchr::memmem::find(body, b"\\u").is_none()
+                    && !super::value::str_op(super::parse::StrOp::Contains, std::str::from_utf8(body).unwrap(), p, false)
+                {
+                    return Ok(*neg);
+                }
+                let hit = if body.contains(&b'\\') {
+                    super::value::str_op(*op, &super::value::json_unescape(body), p, *cs)
+                } else {
+                    match std::str::from_utf8(body) {
+                        Ok(t) => super::value::str_op(*op, t, p, *cs),
+                        Err(_) => super::value::str_op(*op, &String::from_utf8_lossy(body), p, *cs),
+                    }
+                };
+                return Ok(hit != *neg);
+            }
+    let col = StepCol::Field(name.to_string());
+    Ok(eval(e, &OneCol { col: &col, v: Value::from_json(raw), now })?.truthy())
+}
+
 impl Sp {
     pub fn test(&self, db: &Db, s: u32, ss: &SessionSteps, pos: u32, now: i64) -> Result<bool, QError> {
         Ok(match self {
@@ -299,16 +325,28 @@ impl Sp {
                 let Some(f) = f else { return Ok(*missing) };
                 match ss.fields_of(pos).iter().find(|x| x.0 == *f) {
                     None => *missing,
-                    Some(&(_, v)) if v == steps::LONG => {
+                    Some(&(_, v)) if steps::is_long(v) => {
                         let col = StepCol::Field(name.clone());
-                        let val = match read_input(db, s, ss, pos, name)? {
+                        let val = match long_value(db, s, ss, pos, v, name)? {
                             Some(t) => Value::from_json(&t),
                             None => Value::Null,
                         };
                         eval(expr, &OneCol { col: &col, v: val, now })?.truthy()
                     }
-                    Some(&(_, v)) => table[v as usize],
+                    Some(&(_, v)) => match table[v as usize].load(Ordering::Relaxed) {
+                        1 => false,
+                        2 => true,
+                        _ => {
+                            let b = test_raw(expr, name, db.step_dicts().values[*f as usize].get(v), now)?;
+                            table[v as usize].store(if b { 2 } else { 1 }, Ordering::Relaxed);
+                            b
+                        }
+                    },
                 }
+            }
+            Sp::Present { f, null, want } => {
+                let present = f.is_some_and(|f| ss.fields_of(pos).iter().any(|x| x.0 == f && Some(x.1) != *null));
+                present == *want
             }
             Sp::Session(t) => t[s as usize],
             Sp::Generic(e) => eval(e, &StepCtx { db, s, pos, now })?.truthy(),
@@ -356,7 +394,7 @@ impl Sp {
                 r
             }
             Sp::Not(x) => !x.shape_eval(db, tool, failed, now)?,
-            Sp::Field { .. } | Sp::Session(_) => return None,
+            Sp::Field { .. } | Sp::Present { .. } | Sp::Session(_) => return None,
         })
     }
 
@@ -462,3 +500,33 @@ pub fn and(a: &Sp, b: &Sp) -> Sp {
 }
 
 pub const NO_STEP: u32 = NONE;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::query::parse::parse;
+
+    fn atom(q: &str) -> Expr {
+        let Some(crate::query::parse::Stage::Where(e)) = parse(q).unwrap().stages.into_iter().next() else { panic!() };
+        e
+    }
+
+    #[test]
+    fn raw_string_tests_agree_with_decoding() {
+        let e = atom(r#"where command contains "test""#);
+        let t = |raw: &[u8]| test_raw(&e, "command", raw, 0).unwrap();
+        assert!(t(br#""cargo test --all""#));
+        assert!(t(br#""cargo TEST""#));
+        assert!(!t(br#""cargo tes""#));
+        // the escape \t is not the letter t: no match after decoding
+        assert!(!t(br#""run \test""#));
+        // a \u escape can hide a match from the raw text
+        assert!(t(br#""test""#));
+        // non-ASCII text takes the decoding path
+        assert!(t("\"\u{dc}nit test\"".as_bytes()));
+        assert!(t(br#""line one\nthen test""#));
+        let n = atom(r#"where not (command contains "test")"#);
+        let Expr::Not(inner) = n else { panic!() };
+        assert!(!test_raw(&inner, "command", br#""x""#, 0).unwrap());
+    }
+}

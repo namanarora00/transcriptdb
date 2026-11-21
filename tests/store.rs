@@ -171,7 +171,7 @@ fn steps_match_the_reference_and_survive_reopen_and_compact() {
                         let f = ss
                             .fields_of(i as u32)
                             .iter()
-                            .map(|&(f, v)| (sd.fields.get(f).to_vec(), if v == transcriptdb::steps::LONG { b"LONG".to_vec() } else { sd.values[f as usize].get(v).to_vec() }))
+                            .map(|&(f, v)| (sd.fields.get(f).to_vec(), if transcriptdb::steps::is_long(v) { format!("LONG {:?}", ss.long_at(v)).into_bytes() } else { sd.values[f as usize].get(v).to_vec() }))
                             .collect();
                         (r.call_node, r.result_node, r.prev, sd.tools.get(r.tool).to_vec(), r.time_ms, r.out_bytes, r.call_block, r.result_block, r.failed, f)
                     })

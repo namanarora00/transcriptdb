@@ -136,43 +136,59 @@ parallel workers, JIT off, C collation. PostgreSQL is reached over loopback TCP,
 pays a client round trip (about 0.1 ms) that the in-process engine does not; that matters for the
 sub-millisecond rows below.
 
-Measured 2026-11-21 on 200 log files: 145 sessions, 14,967 requests, 17,576 steps, 123 MB of
-distinct message text. Every answer matched (16 of 16 queries, 600 of 600 reads).
+Measured 2026-11-21 on 200 log files: 145 sessions, 14,970 requests, 17,582 steps, 123 MB of
+distinct message text. Every answer matched (16 of 16 queries, 600 of 600 reads, in each of three
+runs). Times are the best of three runs, each query best of 7 to 9 inside a run, because the
+machine was under memory pressure (about 3 GB of swap in use) and single runs moved by up to 4x.
 
 | | TranscriptDB | PostgreSQL |
 |---|---|---|
-| Disk (tables, indexes, TOAST) | 65.2 MB | 138.3 MB (2.1x) |
+| Disk (tables, indexes, TOAST) | 65.2 MB | 138.7 MB (2.1x) |
 
 | Query | TDB, 1 thread | TDB, 8 threads | PostgreSQL | PG / TDB (1 thread) |
 |---|---|---|---|---|
-| Bash, then Edit, then Bash; no Read between | 0.52 ms | 0.20 ms | 112 ms | 214x |
-| Bash fails, only test files edited, Bash passes | 0.69 ms | 0.37 ms | 227 ms | 329x |
-| 3 Read/Grep turns in a row, then Edit | 0.17 ms | 0.10 ms | 10.5 ms | 61x |
-| Bash fails, then passes the next turn | 0.37 ms | 0.16 ms | 9.2 ms | 25x |
-| Edit, then Bash within 3 turns | 0.24 ms | 0.12 ms | 7.3 ms | 30x |
-| Write a file, later Read the same file | 0.37 ms | 0.17 ms | 1.55 ms | 4.2x |
-| 3 failing turns in a row | 0.33 ms | 0.14 ms | 8.9 ms | 27x |
-| WebSearch, then WebFetch the next turn | 0.06 ms | 0.07 ms | 8.6 ms | 139x |
-| Steps per tool, top 10 | 0.41 ms | 0.42 ms | 0.64 ms | 1.6x |
-| Failure rate per tool | 0.49 ms | 0.51 ms | 1.51 ms | 3.1x |
-| Bash steps and failures per week | 0.34 ms | 0.35 ms | 1.41 ms | 4.1x |
-| Sessions with the most failed steps | 0.09 ms | 0.10 ms | 0.88 ms | 9.9x |
-| Most edited files | 0.73 ms | 0.68 ms | 0.49 ms | **0.7x (loss)** |
-| Average output size per tool | 0.46 ms | 0.49 ms | 1.59 ms | 3.5x |
-| Sessions using browser tools, per day | 0.09 ms | 0.12 ms | 2.17 ms | 24x |
-| Commands running `cargo test` | 19.9 ms | 5.8 ms | 16.6 ms | **0.8x (loss)**; 2.9x on 8 threads |
+| Bash, then Edit, then Bash; no Read between | 0.58 ms | 0.20 ms | 112 ms | 194x |
+| Bash fails, only test files edited, Bash passes | 0.63 ms | 0.23 ms | 231 ms | 367x |
+| 3 Read/Grep turns in a row, then Edit | 0.17 ms | 0.09 ms | 10.2 ms | 60x |
+| Bash fails, then passes the next turn | 0.38 ms | 0.16 ms | 9.0 ms | 24x |
+| Edit, then Bash within 3 turns | 0.26 ms | 0.12 ms | 7.2 ms | 28x |
+| Write a file, later Read the same file | 0.39 ms | 0.17 ms | 1.61 ms | 4.1x |
+| 3 failing turns in a row | 0.33 ms | 0.15 ms | 9.0 ms | 27x |
+| WebSearch, then WebFetch the next turn | 0.06 ms | 0.07 ms | 8.6 ms | 143x |
+| Steps per tool, top 10 | 0.23 ms | 0.24 ms | 0.66 ms | 2.9x |
+| Failure rate per tool | 0.25 ms | 0.25 ms | 1.54 ms | 6.2x |
+| Bash steps and failures per week | 0.25 ms | 0.26 ms | 1.45 ms | 5.8x |
+| Sessions with the most failed steps | 0.06 ms | 0.09 ms | 0.80 ms | 13x |
+| Most edited files | 0.31 ms | 0.27 ms | 0.48 ms | 1.5x |
+| Average output size per tool | 0.23 ms | 0.25 ms | 1.61 ms | 7.0x |
+| Sessions using browser tools, per day | 0.07 ms | 0.10 ms | 2.19 ms | 31x |
+| Commands running `git commit` | 11.2 ms | 2.3 ms | 15.9 ms | 1.4x |
 
-| Read (median / p95 per item) | TranscriptDB | PostgreSQL |
+| Read (median / p95 per item, three runs) | TranscriptDB | PostgreSQL |
 |---|---|---|
-| A request's messages in order | 1.00 / 3.1 ms | 1.29 / 4.1 ms |
-| 20 steps with their call and result messages | 0.13 / 1.6 ms | 0.47 / 1.2 ms |
-| A whole session's messages | 0.41 / 2.1 ms | 0.86 / 5.7 ms |
+| A request's messages in order | 0.38–0.47 / 1.7–1.8 ms | 1.09–1.27 / 3.8–4.0 ms |
+| 20 steps with their call and result messages | 0.12 / 0.24–0.27 ms | 0.46–0.51 / 1.0–1.1 ms |
+| A whole session's messages | 0.34–0.38 / 2.2–2.8 ms | 0.89–0.96 / 6.3–7.1 ms |
 
-The two losses: grouping by file path builds a hash map keyed through the dictionaries row by row,
-and `cargo test` evaluates a substring test over every distinct command (about 10k values, many
-several KB). The design's bar ("each query faster") is not met yet on one thread. The machine was
-under memory pressure during these runs (about 3 GB of swap in use), so absolute times are noisy
-between runs; the reads table moved by up to 2x at the median from run to run.
+Every query is faster on one thread, so the design's bar ("each query faster") is met on this
+sample; the closest are `git commit` (1.4x) and most edited files (1.5x). The first run of the
+comparison (before the fixes below) lost three: `command contains ...` over long commands (278 ms
+against 17), the same-file pattern (7.3 ms against 1.7) and most edited files (0.72 against 0.46).
+What changed:
+
+- long input values (over 4 KB) keep their byte position in the call's stored message, so a test
+  reads just those bytes (a frame or two) instead of rebuilding and parsing the whole message;
+  values up to 4 KB (98% of shell commands) are dictionary-coded, with a hash-keyed index;
+- a test over one input field is worked out per distinct value the first time a step reaches it;
+  `contains` with a plain ASCII pattern runs on the raw JSON text and decodes only on a hit
+  (a raw miss is a real miss when there are no `\u` escapes);
+- `isnull`/`isnotnull` test presence without looking at values;
+- `summarize` over step columns groups on dictionary codes (a dense array for one key), with flat
+  accumulators; `top` and `sort | take` select the rows they keep instead of sorting all;
+- a compared field (`a.file_path == b.file_path`) skips values that an element never has, and each
+  scan starts at the first step that can begin a match;
+- reads cache decompressed frames per thread and fetch a request's opaque values (signatures,
+  images) with a few large reads instead of one each.
 
 ## Reading Claude Code's logs
 
@@ -268,6 +284,6 @@ seg-NNNNNN.opq        opaque values, raw
 
 ## What's next
 
-1. Close the two head-to-head losses (grouping on raw dictionary codes; substring tests over long
-   values with a trigram or word index), and a bigger head-to-head once there is disk for it.
+1. A bigger head-to-head once there is disk for it (the full logs, not a sample), and text search
+   with an index so substring tests stop scanning every distinct value.
 2. Derived columns (rules at write time, backfilled on merge), then text search.

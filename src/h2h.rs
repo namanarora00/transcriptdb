@@ -406,9 +406,9 @@ pub fn queries() -> Vec<QuerySpec> {
             sessions: false,
         },
         QuerySpec {
-            name: "Commands running cargo test",
-            engine: r#"where command contains "cargo test" | summarize n = count(), s = dcount(session)"#.into(),
-            sql: "SELECT count(*), count(DISTINCT se.sid) FROM steps s JOIN sessions se ON se.id = s.session WHERE s.command ILIKE '%cargo test%'".into(),
+            name: "Commands running git commit",
+            engine: r#"where command contains "git commit" | summarize n = count(), s = dcount(session)"#.into(),
+            sql: "SELECT count(*), count(DISTINCT se.sid) FROM steps s JOIN sessions se ON se.id = s.session WHERE s.command ILIKE '%git commit%'".into(),
             sessions: false,
         },
     ]

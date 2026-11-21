@@ -73,8 +73,10 @@ pub struct SegSteps {
     pub session: u32,
     pub first: u32,
     pub rows: Vec<StepRow>,
-    /// Per row: (local field, local value or `steps::LONG`).
+    /// Per row: (local field, local value, or `steps::LONG_BASE + i` for `longs[i]`).
     pub fields: Vec<Vec<(u32, u32)>>,
+    /// (offset, length) of long values in their call's stored message.
+    pub longs: Vec<(u32, u32)>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -179,7 +181,14 @@ impl SegIndex {
                 e.var(fs.len() as u64);
                 for &(f, v) in fs {
                     e.var(f as u64);
-                    e.var(if v == crate::steps::LONG { 0 } else { v as u64 + 1 });
+                    if crate::steps::is_long(v) {
+                        let (off, len) = c.longs[(v - crate::steps::LONG_BASE) as usize];
+                        e.var(0);
+                        e.var(off as u64);
+                        e.var(len as u64);
+                    } else {
+                        e.var(v as u64 + 1);
+                    }
                 }
             }
         }
@@ -261,6 +270,7 @@ impl SegIndex {
             let nrow = d.var()? as usize;
             let mut rows = Vec::with_capacity(nrow);
             let mut fields = Vec::with_capacity(nrow);
+            let mut longs = Vec::new();
             for _ in 0..nrow {
                 let call_node = d.var32()?;
                 let call_block = d.var32()? as u16;
@@ -277,12 +287,17 @@ impl SegIndex {
                 for _ in 0..nf {
                     let f = d.var32()?;
                     let v = d.var()?;
-                    fs.push((f, if v == 0 { crate::steps::LONG } else { (v - 1) as u32 }));
+                    if v == 0 {
+                        longs.push((d.var32()?, d.var32()?));
+                        fs.push((f, crate::steps::LONG_BASE + longs.len() as u32 - 1));
+                    } else {
+                        fs.push((f, (v - 1) as u32));
+                    }
                 }
                 rows.push(StepRow { call_node, result_node, prev, tool, time_ms, out_bytes, call_block, result_block, failed });
                 fields.push(fs);
             }
-            steps.push(SegSteps { session, first, rows, fields });
+            steps.push(SegSteps { session, first, rows, fields, longs });
         }
         if !d.done() {
             return corrupt("trailing bytes in segment index");

@@ -16,8 +16,15 @@
 use crate::json;
 use std::collections::HashMap;
 
-/// An input value too long for the dictionary: queries must open the message.
-pub const LONG: u32 = u32::MAX - 1;
+/// Value codes at or above this mark a value too long for the dictionary: the code points
+/// at an (offset, length) in [`SessionSteps::longs`], the value's place in the call's
+/// stored message, so reading it touches only those bytes.
+pub const LONG_BASE: u32 = 1 << 31;
+
+#[inline]
+pub fn is_long(v: u32) -> bool {
+    v >= LONG_BASE
+}
 /// Input values up to this many bytes (as JSON text) are dictionary-coded. 4 KB covers 98% of
 /// shell commands in the measured logs (half are over 256 bytes).
 pub const MAX_VALUE: usize = 4096;
@@ -175,13 +182,30 @@ pub fn parse_time_ms(s: &str) -> i64 {
     ((days * 24 + h) * 60 + mi) * 60_000 + se * 1000 + ms
 }
 
+/// An input field's value: a dictionary code, or where a long value sits in the call's
+/// stored message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FieldVal {
+    Code(u32),
+    Long { off: u32, len: u32 },
+}
+
 /// A call remembered until its result arrives (or found again by walking up the tree).
 #[derive(Debug, Clone)]
 pub struct CallInfo {
     pub node: u32,
     pub block: u16,
     pub tool: u32,
-    pub fields: Vec<(u32, u32)>,
+    pub fields: Vec<(u32, FieldVal)>,
+}
+
+/// An input field as found in a stored message: `val` is empty for long values.
+#[derive(Debug, Clone)]
+pub struct RawField {
+    pub key: Vec<u8>,
+    pub val: Vec<u8>,
+    pub off: u32,
+    pub len: u32,
 }
 
 /// One session's steps as columns.
@@ -190,8 +214,10 @@ pub struct SessionSteps {
     pub rows: Vec<StepRow>,
     /// Fields of step `i` are `fields[fstart[i]..fstart[i + 1]]`.
     pub fstart: Vec<u32>,
-    /// (field id, value code or `LONG`)
+    /// (field id, value code, or `LONG_BASE + i` for `longs[i]`)
     pub fields: Vec<(u32, u32)>,
+    /// (offset, length) of long values in their call's stored message.
+    pub longs: Vec<(u32, u32)>,
     /// One shape code per step.
     pub shape: Vec<u8>,
     /// Per tree node: the last step completed at or above it on its path (`NONE` if none).
@@ -205,6 +231,11 @@ pub struct SessionSteps {
 }
 
 impl SessionSteps {
+    /// Where long value `v` sits in its call's stored message.
+    pub fn long_at(&self, v: u32) -> (u32, u32) {
+        self.longs[(v - LONG_BASE) as usize]
+    }
+
     pub fn has_tool(&self, t: u32) -> bool {
         self.tool_set.get((t / 64) as usize).is_some_and(|w| w >> (t % 64) & 1 == 1)
     }
@@ -240,17 +271,19 @@ impl StepDicts {
         f
     }
 
+    /// Intern a (short) value of a field.
     pub fn value(&mut self, field: u32, v: &[u8]) -> u32 {
-        if v.len() > MAX_VALUE { LONG } else { self.values[field as usize].intern(v) }
+        self.values[field as usize].intern(v)
     }
 
-    pub fn call_info(&mut self, node: u32, block: u16, name: &[u8], fields: &[(Vec<u8>, Vec<u8>)]) -> CallInfo {
+    pub fn call_info(&mut self, node: u32, block: u16, name: &[u8], fields: &[RawField]) -> CallInfo {
         let tool = self.tools.intern(name);
         let fields = fields
             .iter()
-            .map(|(k, v)| {
-                let f = self.field(k);
-                (f, self.value(f, v))
+            .map(|r| {
+                let f = self.field(&r.key);
+                let v = if r.len as usize > MAX_VALUE { FieldVal::Long { off: r.off, len: r.len } } else { FieldVal::Code(self.values[f as usize].intern(&r.val)) };
+                (f, v)
             })
             .collect();
         CallInfo { node, block, tool, fields }
@@ -262,13 +295,22 @@ impl StepDicts {
     }
 
     /// Append a step to a session, keeping shape and postings in step.
-    pub fn push(&mut self, session: u32, ss: &mut SessionSteps, row: StepRow, fields: &[(u32, u32)]) -> u32 {
+    pub fn push(&mut self, session: u32, ss: &mut SessionSteps, row: StepRow, fields: &[(u32, FieldVal)]) -> u32 {
         let pos = ss.rows.len() as u32;
         if ss.fstart.is_empty() {
             ss.fstart.push(0);
         }
         ss.rows.push(row);
-        ss.fields.extend_from_slice(fields);
+        for &(f, v) in fields {
+            let code = match v {
+                FieldVal::Code(c) => c,
+                FieldVal::Long { off, len } => {
+                    ss.longs.push((off, len));
+                    LONG_BASE + ss.longs.len() as u32 - 1
+                }
+            };
+            ss.fields.push((f, code));
+        }
         ss.fstart.push(ss.fields.len() as u32);
         ss.shape.push(Self::shape_code(row.tool, row.failed));
         let w = (row.tool / 64) as usize;
@@ -283,8 +325,8 @@ impl StepDicts {
         }
         self.tool_post[t].push(key);
         for &(f, v) in fields {
-            if v != LONG {
-                self.value_post[f as usize].entry(v).or_default().push(key);
+            if let FieldVal::Code(c) = v {
+                self.value_post[f as usize].entry(c).or_default().push(key);
             }
         }
         pos
@@ -293,16 +335,29 @@ impl StepDicts {
 
 /// An owned copy of what [`scan_message`] finds, so the caller can drop the borrow.
 pub struct Extracted {
-    pub calls: Vec<(Vec<u8>, u16, Vec<u8>, Vec<(Vec<u8>, Vec<u8>)>)>,
+    pub calls: Vec<(Vec<u8>, u16, Vec<u8>, Vec<RawField>)>,
     pub results: Vec<(u16, Vec<u8>, bool, json::Span)>,
 }
 
 pub fn extract(b: &[u8]) -> Extracted {
     let (c, r) = scan_message(b);
+    let base = b.as_ptr() as usize;
     Extracted {
         calls: c
             .into_iter()
-            .map(|c| (c.id.to_vec(), c.block, c.name.to_vec(), c.fields.into_iter().map(|(k, v)| (k.to_vec(), v.to_vec())).collect()))
+            .map(|c| {
+                let fields = c
+                    .fields
+                    .into_iter()
+                    .map(|(k, v)| RawField {
+                        key: k.to_vec(),
+                        val: if v.len() > MAX_VALUE { Vec::new() } else { v.to_vec() },
+                        off: (v.as_ptr() as usize - base) as u32,
+                        len: v.len() as u32,
+                    })
+                    .collect();
+                (c.id.to_vec(), c.block, c.name.to_vec(), fields)
+            })
             .collect(),
         results: r.into_iter().map(|r| (r.block, r.tool_use_id.to_vec(), r.is_error, r.content)).collect(),
     }

@@ -50,7 +50,7 @@ fn engine_keys(db: &Db, s: u32) -> Result<(HashSet<RefStep>, usize, usize)> {
         let mut fields: Vec<(Vec<u8>, Option<Vec<u8>>)> = ss
             .fields_of(pos as u32)
             .iter()
-            .map(|&(f, v)| (sd.fields.get(f).to_vec(), if v == steps::LONG { None } else { Some(sd.values[f as usize].get(v).to_vec()) }))
+            .map(|&(f, v)| (sd.fields.get(f).to_vec(), if steps::is_long(v) { None } else { Some(sd.values[f as usize].get(v).to_vec()) }))
             .collect();
         fields.sort();
         keys.insert(RefStep { tool_use_id: id, tool: sd.tools.get(r.tool).to_vec(), failed: r.failed, out_bytes: r.out_bytes, fields });
