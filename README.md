@@ -265,7 +265,7 @@ at the end unless `KEEP=1`. Both it and the crash test exit non-zero on any fail
 | Store size with `--drop thinking,images` | 240.2 MB; 124,444 requests equal the log's body with those values blanked, the rest byte for byte |
 | Open | 10–17 ms; 0.4 MB of catalogs for 17–20 files is all that is read |
 | Storage runs per request | as ingested (with automatic merges): 95.7% one, max 4; after `compact`: 98.8% one, max 3 |
-| Rebuild check | 126,866 of 126,866 byte for byte (126,890 on a later ingest); 157 GB rebuilt on 10 threads at 6.1–6.9 GB/s with other load on the machine (9.3 GB/s on a quieter run of the previous file format) |
+| Rebuild check | 126,866 of 126,866 byte for byte (126,938 on a later ingest); 157 GB rebuilt on 10 threads at 9.2 GB/s (median of 3 on a quiet machine, alternating with the previous blob format, which gave 9.3; 6.1–7.5 GB/s while other work kept the load at 7–9) |
 | Rebuild one request (mean 1.23 MB), warm | median 0.43 ms, p95 1.9 ms, p99 3.5 ms |
 | 40 messages in a row / whole session | median 0.11 ms / 0.31 ms |
 | Steps | every step of 1,063 sessions; engine and reference agree on every distinct step; 0 wrong `prev`, 0 results without a call |
