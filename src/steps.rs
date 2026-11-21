@@ -40,10 +40,10 @@ impl Dict {
         let c = self.vals.len() as u32;
         self.vals.push(v.into());
         let h = xxhash_rust::xxh3::xxh3_128(v);
-        if self.ix.contains_key(&h) {
-            self.clash.insert(v.into(), c);
+        if let std::collections::hash_map::Entry::Vacant(e) = self.ix.entry(h) {
+            e.insert(c);
         } else {
-            self.ix.insert(h, c);
+            self.clash.insert(v.into(), c);
         }
         c
     }

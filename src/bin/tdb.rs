@@ -500,7 +500,7 @@ fn head_to_head(a: &Args) {
     let reps = a.num("reps", 5) as usize;
     let out = h2h::run_queries(&db, &mut pg, reps).expect("queries");
     println!("\n== queries over {} steps in {} sessions (best of {reps}; TranscriptDB on 1 thread and on 8)", (0..db.session_count() as u32).map(|s| db.steps(s).rows.len()).sum::<usize>(), db.session_count());
-    println!("  {:<48} {:>6} {:>12} {:>9} {:>12} {:>9}  {}", "query", "same", "TDB 1 thread", "TDB 8", "PostgreSQL", "speedup", "answer");
+    println!("  {:<48} {:>6} {:>12} {:>9} {:>12} {:>9}  answer", "query", "same", "TDB 1 thread", "TDB 8", "PostgreSQL", "speedup");
     let mut all_same = true;
     for o in &out {
         all_same &= o.same;
