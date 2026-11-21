@@ -4,8 +4,9 @@ A storage and query engine for agent transcripts: Kusto for agent traces. This r
 the **storage core**, written in Rust: each session is stored once as an ordered tree of
 messages, any request can be rebuilt byte for byte, and a crash loses nothing acknowledged.
 
-The query side (step columns, shape codes, the pipe language with `match`) is next; see
-[What's next](#whats-next).
+On top of the stored messages it keeps **steps**: each tool call paired with its result, as
+dictionary-coded columns with a one-byte shape code per step. The pipe language with `match` is
+next; see [What's next](#whats-next).
 
 ## What the storage core does
 
@@ -45,6 +46,35 @@ plus a session id, an agent id (empty for the main agent) and a request id.
 "Main line first" weighs each node by the number of requests that pass through it and writes
 the tree depth first, heaviest child first. The main line is then one run, and each side branch
 is one more run right after the subtree it hangs from.
+
+## Steps
+
+`src/steps.rs`. A step is a tool call paired with its result. Pairing happens inside `apply`, the
+same code path that log replay uses, so recovery rebuilds exactly the same steps:
+
+- when a message is added, its `tool_use` blocks are remembered by id, and each `tool_result`
+  block is paired with the call it answers, found on the result's own path through the tree (a
+  cached call is only used if it sits on that path; otherwise the path is walked upwards);
+- each session's steps are numbered in arrival order, and each step records `prev`, the last step
+  before its turn on its own path. Calls made in one model turn share a `prev`, so "then" never
+  orders them. Walking steps in number order and following `prev` visits every path of a forked
+  session, with the shared start walked once: the shape the `match` stage needs;
+- columns per step: tool, outcome, result size (opaque values counted at their text size), the
+  time of the request that carried the result, call and result positions, and the call's
+  top-level input fields. Values up to 256 bytes are dictionary-coded; longer ones are marked
+  `LONG` (open the message);
+- the shape code is `tool << 1 | failed`, tool codes 0..126 for the first 127 tools seen and 127
+  for the rest; postings per tool and per field value form the field index.
+
+Segments store steps with their own dictionaries; codes in memory are per process.
+
+`tdb check-steps` compares the engine's steps with a slow reference that rebuilds every stored
+request, parses the whole JSON and pairs results with calls inside that request, and checks every
+`prev` by brute force.
+
+`tdb serve --store DIR` serves local pages on 127.0.0.1: the sessions with their step strips, one
+session as a timeline (tool, inputs, output size, failures, forks and same-turn calls), and one
+step's call and result.
 
 ## Reading Claude Code's logs
 
@@ -88,6 +118,8 @@ at the end unless `KEEP=1`. Both it and the crash test exit non-zero on any fail
 | Rebuild one request (mean 1.28 MB), warm | median 0.41 ms, p95 1.9 ms, p99 6.0 ms |
 | 40 messages in a row / whole session | median 0.11 ms / 0.29 ms |
 | Crash test | 1,000 SIGKILLs, 13,059 acknowledged, 0 lost, 0 wrong bytes |
+| Steps (2026-11-21, 125,905 requests) | 146,175 steps in 1,062 sessions; engine and reference agree on all 141,513 distinct steps; 0 wrong `prev`, 0 results without a call |
+| Step columns | 134 tools, 192 input fields, 108,605 distinct short values; shape strings 146 KB; index +5 MB |
 
 Against the Python proof of concept (48-session sample): size per byte of distinct text 0.50 vs
 0.51; rebuild median 0.41 vs 0.85 ms; replay 0.29 vs 0.41 ms. The proof of concept's
@@ -107,6 +139,10 @@ tdb stats         --store DIR
 tdb compact       --store DIR
 tdb bench         --store DIR [--n 300]
 tdb crash-test    --store DIR [--kills 1000] [--sync full|fsync|os]
+tdb check-steps   --store DIR
+tdb steps         --store DIR [--top 15]
+tdb serve         --store DIR [--port 8377]
+tdb synth         --store DIR [--sessions 20 --per 40]
 ```
 
 ## On disk
@@ -120,7 +156,6 @@ seg-NNNNNN.opq        opaque values, raw
 
 ## What's next
 
-1. Step columns and shape codes: pair tool calls with results, dictionary-coded columns, one
-   byte per step for tool and outcome, a trace view of one session.
-2. The query language: parser, checker, planner and the one-pass matcher over dictionary codes,
-   then the head-to-head against PostgreSQL.
+1. The query language: parser, checker, planner and the one-pass matcher over dictionary codes
+   and shape strings, walking `prev` across forks; then the head-to-head against PostgreSQL.
+2. Derived columns (rules at write time, backfilled on merge), then text search.

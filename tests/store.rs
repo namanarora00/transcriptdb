@@ -152,3 +152,53 @@ fn messages_are_stored_once_per_position() {
     assert!((st.nodes as u64) * 5 < total_msgs);
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+fn steps_match_the_reference_and_survive_reopen_and_compact() {
+    let dir = tmpdir("steps");
+    let reqs = traffic(17, 10, 40);
+    // dictionary codes are per process; compare steps decoded
+    type Decoded = (u32, u32, u32, Vec<u8>, i64, u32, u16, u16, bool, Vec<(Vec<u8>, Vec<u8>)>);
+    let snapshot = |db: &Db| -> Vec<Vec<Decoded>> {
+        let sd = db.step_dicts();
+        (0..db.session_count() as u32)
+            .map(|s| {
+                let ss = db.steps(s);
+                ss.rows
+                    .iter()
+                    .enumerate()
+                    .map(|(i, r)| {
+                        let f = ss
+                            .fields_of(i as u32)
+                            .iter()
+                            .map(|&(f, v)| (sd.fields.get(f).to_vec(), if v == transcriptdb::steps::LONG { b"LONG".to_vec() } else { sd.values[f as usize].get(v).to_vec() }))
+                            .collect();
+                        (r.call_node, r.result_node, r.prev, sd.tools.get(r.tool).to_vec(), r.time_ms, r.out_bytes, r.call_block, r.result_block, r.failed, f)
+                    })
+                    .collect()
+            })
+            .collect()
+    };
+    let before;
+    {
+        let mut db = Db::open(&dir, opts(200 << 10)).unwrap();
+        for q in &reqs {
+            put(&mut db, q);
+        }
+        db.commit().unwrap();
+        let c = transcriptdb::check::check_steps(&db, 4).unwrap();
+        eprintln!("{c:?}");
+        assert!(c.engine_steps > 100);
+        assert!(c.ok(), "{c:?}");
+        before = snapshot(&db);
+    }
+    let mut db = Db::open(&dir, opts(200 << 10)).unwrap();
+    assert_eq!(snapshot(&db), before, "steps differ after reopen");
+    assert!(transcriptdb::check::check_steps(&db, 4).unwrap().ok());
+    db.compact().unwrap();
+    drop(db);
+    let db = Db::open(&dir, opts(200 << 10)).unwrap();
+    assert_eq!(snapshot(&db), before, "steps differ after compact");
+    assert!(transcriptdb::check::check_steps(&db, 4).unwrap().ok());
+    std::fs::remove_dir_all(&dir).unwrap();
+}

@@ -14,7 +14,8 @@ use crate::codec::{corrupt, Error, Result};
 use crate::layout;
 use crate::manifest::Manifest;
 use crate::record::*;
-use crate::segment::{opq_path, seg_path, SegChunk, SegIndex, SegNode, SegOpaque, SegPiece, SegWriter, Segment};
+use crate::segment::{opq_path, seg_path, SegChunk, SegIndex, SegNode, SegOpaque, SegPiece, SegSteps, SegWriter, Segment};
+use crate::steps::{self, SessionSteps, StepDicts, StepRow};
 use crate::split::{self, HoleKind, OpaqueEnc, Skeleton};
 use crate::wal::{self, SyncMode, WalWriter};
 use sha2::{Digest, Sha256};
@@ -88,6 +89,7 @@ struct Session {
     children: HashMap<(u32, u128), u32>,
     /// Nodes `0..flushed` are in segments.
     flushed: u32,
+    steps: SessionSteps,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -168,6 +170,11 @@ pub struct Stats {
     pub opq_file_bytes: u64,
     pub wal_bytes: u64,
     pub mem_bytes: usize,
+    pub steps: usize,
+    pub tools: usize,
+    pub step_fields: usize,
+    pub step_values: usize,
+    pub orphan_results: usize,
 }
 
 pub struct Db {
@@ -188,6 +195,9 @@ pub struct Db {
     seq: u64,
     piece_cache: Mutex<HashMap<u32, Arc<[u8]>>>,
     skel_cache: Mutex<HashMap<u32, Arc<Skeleton>>>,
+    sd: StepDicts,
+    /// Tool results whose call could not be found on their path.
+    orphan_results: usize,
     pub recovery: RecoveryReport,
 }
 
@@ -262,6 +272,8 @@ impl Db {
             seq: 0,
             piece_cache: Mutex::new(HashMap::new()),
             skel_cache: Mutex::new(HashMap::new()),
+            sd: StepDicts::default(),
+            orphan_results: 0,
             recovery: RecoveryReport::default(),
         };
 
@@ -359,6 +371,32 @@ impl Db {
             }
             self.requests.push(r);
         }
+        // steps: map the segment's own codes to this store's dictionaries
+        let tools: Vec<u32> = ix.step_tools.iter().map(|t| self.sd.tools.intern(t)).collect();
+        let fields: Vec<u32> = ix.step_fields.iter().map(|f| self.sd.field(f)).collect();
+        let mut values = Vec::with_capacity(ix.step_values.len());
+        for (f, v) in &ix.step_values {
+            let gf = *fields.get(*f as usize).ok_or_else(|| Error::Corrupt("step value names a missing field".into()))?;
+            values.push(self.sd.value(gf, v));
+        }
+        for c in ix.steps {
+            self.session_slot(c.session);
+            let ss = &mut self.sessions[c.session as usize].steps;
+            if c.first as usize != ss.rows.len() {
+                return corrupt("steps out of order across segments");
+            }
+            let mut fs = Vec::new();
+            for (mut r, rf) in c.rows.into_iter().zip(c.fields) {
+                r.tool = *tools.get(r.tool as usize).ok_or_else(|| Error::Corrupt("step names a missing tool".into()))?;
+                fs.clear();
+                for (f, v) in rf {
+                    let gf = *fields.get(f as usize).ok_or_else(|| Error::Corrupt("step names a missing field".into()))?;
+                    let gv = if v == steps::LONG { steps::LONG } else { *values.get(v as usize).ok_or_else(|| Error::Corrupt("step names a missing value".into()))? };
+                    fs.push((gf, gv));
+                }
+                self.sd.push(c.session, ss, r, &fs);
+            }
+        }
         Ok(())
     }
 
@@ -376,6 +414,27 @@ impl Db {
             }
             s.flushed = s.nodes.len() as u32;
             self.session_ix.insert(s.key.clone(), si as u32);
+            // per node: last step at or above it on its path
+            let mut last_at = vec![NONE; s.nodes.len()];
+            for (pos, r) in s.steps.rows.iter().enumerate() {
+                let n = r.result_node as usize;
+                if n >= s.nodes.len() || r.call_node as usize >= s.nodes.len() {
+                    return corrupt(format!("session {si} has a step past its nodes"));
+                }
+                last_at[n] = pos as u32;
+            }
+            s.steps.tail = Vec::with_capacity(s.nodes.len());
+            for (i, n) in s.nodes.iter().enumerate() {
+                let t = if last_at[i] != NONE {
+                    last_at[i]
+                } else if n.parent == NONE {
+                    NONE
+                } else {
+                    s.steps.tail[n.parent as usize]
+                };
+                s.steps.tail.push(t);
+            }
+            s.steps.flushed = s.steps.rows.len() as u32;
         }
         for (i, p) in self.pieces.iter().enumerate() {
             if matches!(p.loc, PLoc::Mem(u32::MAX)) {
@@ -558,8 +617,13 @@ impl Db {
             self.mem.opaques.push(b.into_boxed_slice());
             self.opaque_ix.insert(h, id);
         }
-        let sess = self.sessions.get_mut(m.session as usize).ok_or_else(|| Error::Corrupt("record names a missing session".into()))?;
+        let time_ms = steps::parse_time_ms(&m.req.time);
+        if m.session as usize >= self.sessions.len() {
+            return corrupt("record names a missing session");
+        }
         for n in m.nodes {
+            let id = n.id;
+            let sess = &mut self.sessions[m.session as usize];
             if n.id as usize != sess.nodes.len() {
                 return corrupt("node out of order");
             }
@@ -576,7 +640,9 @@ impl Db {
                 holes: if n.holes.is_empty() { None } else { Some(n.holes.into_boxed_slice()) },
             });
             self.mem.nodes.push(n.bytes.into_boxed_slice());
+            self.add_node_steps(m.session, id, time_ms)?;
         }
+        let sess = &self.sessions[m.session as usize];
         if m.req.tip != NONE && m.req.tip as usize >= sess.nodes.len() {
             return corrupt("request tip past the session");
         }
@@ -587,6 +653,136 @@ impl Db {
         self.requests.push(m.req);
         self.seq = m.seq;
         Ok(())
+    }
+
+    fn opaque_text_len(&self, id: u64) -> u64 {
+        let Some(om) = self.opaques.get(id as usize) else { return 0 };
+        let n = match om.loc {
+            OLoc::Seg { len, .. } => len as u64,
+            OLoc::Mem(mi) => self.mem.opaques[mi as usize].len() as u64,
+        };
+        if om.enc == 0 { n.div_ceil(3) * 4 } else { n }
+    }
+
+    /// Whether `anc` is on the path from the root to `from` (inclusive).
+    fn on_path(&self, s: &Session, anc: u32, mut from: u32) -> bool {
+        while from != NONE && from >= anc {
+            if from == anc {
+                return true;
+            }
+            from = s.nodes[from as usize].parent;
+        }
+        false
+    }
+
+    /// Walk up from `from` looking for the message that holds tool call `id`.
+    #[allow(clippy::type_complexity)]
+    fn find_call(&self, si: u32, mut from: u32, id: &[u8]) -> Result<Option<(u32, u16, Vec<u8>, Vec<(Vec<u8>, Vec<u8>)>)>> {
+        let s = &self.sessions[si as usize];
+        let mut cache = HashMap::new();
+        let mut buf = Vec::new();
+        let mut hops = 0;
+        while from != NONE && hops < 4096 {
+            let nm = &s.nodes[from as usize];
+            buf.clear();
+            self.stored_bytes(nm, &mut cache, &mut buf)?;
+            let ex = steps::extract(&buf);
+            if let Some(c) = ex.calls.into_iter().find(|c| c.0 == id) {
+                return Ok(Some((from, c.1, c.2, c.3)));
+            }
+            from = nm.parent;
+            hops += 1;
+        }
+        Ok(None)
+    }
+
+    /// Pair the tool results in node `id` with their calls, and remember its calls.
+    fn add_node_steps(&mut self, si: u32, id: u32, time_ms: i64) -> Result<()> {
+        let s = &self.sessions[si as usize];
+        let nm = &s.nodes[id as usize];
+        let Loc::Mem(mi) = nm.loc else { return corrupt("new node is not in memory") };
+        let ex = steps::extract(&self.mem.nodes[mi as usize]);
+        let parent = nm.parent;
+        let holes: Vec<(u32, u64)> = nm.holes.as_deref().map(|h| h.to_vec()).unwrap_or_default();
+        let mut found = Vec::with_capacity(ex.results.len());
+        for (block, tuid, failed, span) in ex.results {
+            let s = &self.sessions[si as usize];
+            let cached = s.steps.calls.get(&tuid[..]).filter(|c| self.on_path(s, c.node, parent)).cloned();
+            let call = match cached {
+                Some(c) => Some(c),
+                None => match self.find_call(si, parent, &tuid)? {
+                    Some((n, b, name, fields)) => {
+                        let ci = self.sd.call_info(n, b, &name, &fields);
+                        self.sessions[si as usize].steps.calls.insert(tuid.clone().into(), ci.clone());
+                        Some(ci)
+                    }
+                    None => None,
+                },
+            };
+            let Some(call) = call else {
+                self.orphan_results += 1;
+                continue;
+            };
+            let extra: u64 = holes.iter().filter(|h| (h.0 as usize) >= span.start && (h.0 as usize) <= span.end).map(|h| self.opaque_text_len(h.1)).sum();
+            found.push((call, block, failed, (span.len() as u64 + extra).min(u32::MAX as u64) as u32));
+        }
+        for (tid, block, name, fields) in ex.calls {
+            let ci = self.sd.call_info(id, block, &name, &fields);
+            self.sessions[si as usize].steps.calls.insert(tid.into(), ci);
+        }
+        let sess = &mut self.sessions[si as usize];
+        if sess.steps.tail.len() != id as usize {
+            return corrupt("step tails out of step with nodes");
+        }
+        let mut tail = if parent == NONE { NONE } else { sess.steps.tail[parent as usize] };
+        for (call, block, failed, out_bytes) in found {
+            let prev = sess.steps.tail[call.node as usize];
+            let row = StepRow { call_node: call.node, result_node: id, prev, tool: call.tool, time_ms, out_bytes, call_block: call.block, result_block: block, failed };
+            tail = self.sd.push(si, &mut sess.steps, row, &call.fields);
+        }
+        sess.steps.tail.push(tail);
+        Ok(())
+    }
+
+    /// The steps of sessions `which` from their given first step, with codes local to one segment.
+    fn steps_for_segment(&self, which: &[(u32, u32)], ix: &mut SegIndex) {
+        let mut tl: HashMap<u32, u32> = HashMap::new();
+        let mut fl: HashMap<u32, u32> = HashMap::new();
+        let mut vl: HashMap<(u32, u32), u32> = HashMap::new();
+        for &(s, first) in which {
+            let ss = &self.sessions[s as usize].steps;
+            if first as usize >= ss.rows.len() {
+                continue;
+            }
+            let mut rows = Vec::with_capacity(ss.rows.len() - first as usize);
+            let mut fields = Vec::with_capacity(rows.capacity());
+            for pos in first..ss.rows.len() as u32 {
+                let mut r = ss.rows[pos as usize];
+                r.tool = *tl.entry(r.tool).or_insert_with(|| {
+                    ix.step_tools.push(self.sd.tools.get(r.tool).to_vec());
+                    ix.step_tools.len() as u32 - 1
+                });
+                let mut fs = Vec::new();
+                for &(f, v) in ss.fields_of(pos) {
+                    let lf = *fl.entry(f).or_insert_with(|| {
+                        ix.step_fields.push(self.sd.fields.get(f).to_vec());
+                        ix.step_fields.len() as u32 - 1
+                    });
+                    let lv = if v == steps::LONG {
+                        steps::LONG
+                    } else {
+                        *vl.entry((f, v)).or_insert_with(|| {
+                            ix.step_values.push((lf, self.sd.values[f as usize].get(v).to_vec()));
+                            ix.step_values.len() as u32 - 1
+                        })
+                    };
+                    fs.push((lf, lv));
+                }
+                rows.push(r);
+                fields.push(fs);
+            }
+            ix.steps.push(SegSteps { session: s, first, rows, fields });
+        }
     }
 
     /// Make every `put` so far durable. After this returns they count as saved.
@@ -674,6 +870,8 @@ impl Db {
             ix.opaques.push(SegOpaque { id: id as u64, enc: om.enc, hash: om.hash, off, len });
         }
         ix.requests = self.requests[self.mem.first_request..].to_vec();
+        let which: Vec<(u32, u32)> = self.sorted_sessions(self.mem.touched.iter().copied()).into_iter().map(|s| (s, self.sessions[s as usize].steps.flushed)).collect();
+        self.steps_for_segment(&which, &mut ix);
         w.finish(&ix, self.opts.sync)?;
 
         let mut man = self.manifest.clone();
@@ -690,6 +888,7 @@ impl Db {
         for &s in &self.mem.touched {
             let sess = &mut self.sessions[s as usize];
             sess.flushed = sess.nodes.len() as u32;
+            sess.steps.flushed = sess.steps.rows.len() as u32;
         }
         self.segs.insert(num, seg);
         self.mem = Mem {
@@ -783,6 +982,8 @@ impl Db {
             ix.opaques.push(SegOpaque { id: id as u64, enc: om.enc, hash: om.hash, off, len });
         }
         ix.requests = self.requests.clone();
+        let which: Vec<(u32, u32)> = self.sorted_sessions(0..self.sessions.len() as u32).into_iter().map(|s| (s, 0)).collect();
+        self.steps_for_segment(&which, &mut ix);
         w.finish(&ix, self.opts.sync)?;
 
         let old: Vec<u32> = self.manifest.segs.clone();
@@ -1117,7 +1318,12 @@ impl Db {
             mem_bytes: self.mem.bytes,
             ..Stats::default()
         };
+        st.tools = self.sd.tools.len();
+        st.step_fields = self.sd.fields.len();
+        st.step_values = self.sd.values.iter().map(|d| d.len()).sum();
+        st.orphan_results = self.orphan_results;
         for s in &self.sessions {
+            st.steps += s.steps.rows.len();
             st.nodes += s.nodes.len();
             st.node_bytes += s.nodes.iter().map(|n| n.len as u64).sum::<u64>();
         }
@@ -1143,6 +1349,31 @@ impl Db {
             st.opq_file_bytes += sg.opq_bytes;
         }
         st
+    }
+
+    /// A session's steps as columns.
+    pub fn steps(&self, s: u32) -> &SessionSteps {
+        &self.sessions[s as usize].steps
+    }
+
+    /// Tool, field and value dictionaries, and the field index.
+    pub fn step_dicts(&self) -> &StepDicts {
+        &self.sd
+    }
+
+    /// One message (tree node) of a session, with opaque values put back.
+    pub fn message(&self, s: u32, node: u32) -> Result<Vec<u8>> {
+        Ok(self.read_messages(s, &[node], &mut ReadStats::default())?.pop().unwrap_or_default())
+    }
+
+    /// Parent of every node of a session (`NONE` for roots).
+    pub fn node_parents(&self, s: u32) -> Vec<u32> {
+        self.sessions[s as usize].nodes.iter().map(|n| n.parent).collect()
+    }
+
+    /// Requests of one session, by index.
+    pub fn session_requests(&self, s: u32) -> Vec<u32> {
+        (0..self.requests.len() as u32).filter(|&i| self.requests[i as usize].session == s).collect()
     }
 
     pub fn segment_count(&self) -> usize {

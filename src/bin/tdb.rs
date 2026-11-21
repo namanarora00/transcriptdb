@@ -414,6 +414,101 @@ fn bench(a: &Args) {
     }
 }
 
+fn check_steps(a: &Args) {
+    let db = Db::open(a.store(), a.opts()).expect("open store");
+    let t = Instant::now();
+    let c = transcriptdb::check::check_steps(&db, a.threads()).expect("check steps");
+    println!("sessions {}  engine steps {}  distinct (engine {} / reference {})", c.sessions, c.engine_steps, c.engine_keys, c.reference_keys);
+    println!("  reference steps the engine lacks: {}", c.missing);
+    println!("  engine steps the reference lacks: {}", c.extra);
+    println!("  steps with a wrong prev: {}   wrong shape codes: {}", c.prev_wrong, c.shape_wrong);
+    println!("  tool results with no call on their path: {}", db.stats().orphan_results);
+    println!("  checked in {:.1}s", t.elapsed().as_secs_f64());
+    if !c.ok() {
+        println!("FAILED in {} session(s), first: {:?}", c.bad_sessions.len(), &c.bad_sessions[..c.bad_sessions.len().min(10)]);
+        std::process::exit(1);
+    }
+}
+
+/// Step counts per tool and outcome (tool names only; no inputs or outputs).
+fn steps_summary(a: &Args) {
+    let db = Db::open(a.store(), a.opts()).expect("open store");
+    let sd = db.step_dicts();
+    let mut per_tool: HashMap<u32, (usize, usize)> = HashMap::new();
+    let mut total = 0usize;
+    let mut forked = 0usize;
+    for s in 0..db.session_count() as u32 {
+        let ss = db.steps(s);
+        total += ss.rows.len();
+        for (i, r) in ss.rows.iter().enumerate() {
+            let e = per_tool.entry(r.tool).or_default();
+            e.0 += 1;
+            e.1 += r.failed as usize;
+            // a step whose prev is not simply an earlier turn's last step sits on a fork
+            if i > 0 && r.prev != i as u32 - 1 && r.prev != ss.rows[i - 1].prev {
+                forked += 1;
+            }
+        }
+    }
+    let shape_bytes: usize = (0..db.session_count() as u32).map(|s| db.steps(s).shape.len()).sum();
+    println!("steps {total} in {} sessions; {} tools, {} input fields, {} distinct short values", db.session_count(), sd.tools.len(), sd.fields.len(), sd.values.iter().map(|d| d.len()).sum::<usize>());
+    println!("shape strings: {} bytes in all; steps whose prev is not the step before (forks, parallel calls): {forked}", shape_bytes);
+    let mut v: Vec<_> = per_tool.into_iter().collect();
+    v.sort_by_key(|x| std::cmp::Reverse(x.1 .0));
+    for (t, (n, f)) in v.iter().take(a.num("top", 15) as usize) {
+        println!("  {:<28} {:>7} steps  {:>6} failed", String::from_utf8_lossy(sd.tools.get(*t)), n, f);
+    }
+}
+
+/// A store of synthetic sessions (for trying things without real data).
+fn synth_store(a: &Args) {
+    let mut db = Db::open(a.store(), a.opts()).expect("open store");
+    let seed = a.num("seed", 1);
+    let mut n = 0;
+    for s in 0..a.num("sessions", 20) {
+        for q in synth::session(seed, s, a.num("per", 40) as usize) {
+            db.put(&Put { session: &q.session, agent: &q.agent, id: &q.id, time: &q.time, meta: b"", body: &q.body, digest: None }).expect("put");
+            n += 1;
+        }
+        db.commit().expect("commit");
+    }
+    db.flush().expect("flush");
+    println!("{n} synthetic requests in {} sessions", db.session_count());
+}
+
+/// Local web pages: sessions, a session's timeline, one step. Listens on 127.0.0.1 only.
+fn serve(a: &Args) {
+    use std::io::Read;
+    use std::net::TcpListener;
+    let db = Db::open(a.store(), a.opts()).expect("open store");
+    let port = a.num("port", 8377);
+    let l = TcpListener::bind(("127.0.0.1", port as u16)).expect("bind");
+    println!("serving {} on http://127.0.0.1:{port}/", a.store().display());
+    for conn in l.incoming() {
+        let Ok(mut c) = conn else { continue };
+        let mut buf = [0u8; 4096];
+        let n = c.read(&mut buf).unwrap_or(0);
+        let req = String::from_utf8_lossy(&buf[..n]);
+        let path = req.split_whitespace().nth(1).unwrap_or("/").to_string();
+        let parts: Vec<&str> = path.trim_matches('/').split('/').filter(|p| !p.is_empty()).collect();
+        let nums: Vec<Option<u32>> = parts.iter().skip(1).map(|p| p.parse().ok()).collect();
+        let (status, body) = match (parts.first().copied(), nums.as_slice()) {
+            (None, _) => ("200 OK", transcriptdb::trace::index_page(&db)),
+            (Some("s"), [Some(s)]) if (*s as usize) < db.session_count() => ("200 OK", transcriptdb::trace::session_page(&db, *s)),
+            (Some("s"), [Some(s), Some(i)]) if (*s as usize) < db.session_count() && (*i as usize) < db.steps(*s).rows.len() => {
+                match transcriptdb::trace::step_page(&db, *s, *i) {
+                    Ok(p) => ("200 OK", p),
+                    Err(e) => ("500 Internal Server Error", format!("error: {e}")),
+                }
+            }
+            _ => ("404 Not Found", "not found".to_string()),
+        };
+        let head = format!("HTTP/1.1 {status}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+        let _ = c.write_all(head.as_bytes());
+        let _ = c.write_all(body.as_bytes());
+    }
+}
+
 // ---------------------------------------------------------------------- crash test
 
 const CRASH_SESSIONS: u64 = 6;
@@ -576,6 +671,7 @@ fn crash_test(a: &Args) {
             stored_wrong += 1;
         }
     }
+    let sc = transcriptdb::check::check_steps(&db, 4).expect("step check");
     let ack_set: HashSet<&String> = acked.iter().collect();
     let missing_final = ack_set.iter().filter(|id| db.request_index(id).is_none()).count();
     println!(
@@ -586,9 +682,10 @@ fn crash_test(a: &Args) {
     );
     println!("  lost after any kill: {lost}; wrong bytes after any kill: {wrong}");
     println!("  final check: acknowledged but missing {missing_final}; stored requests that rebuild wrong {stored_wrong}");
+    println!("  steps after all kills: {} engine steps; missing {}, extra {}, wrong prev {}, wrong shape {}", sc.engine_steps, sc.missing, sc.extra, sc.prev_wrong, sc.shape_wrong);
     println!("  recovery saw: {torn} torn log bytes cut, {replayed} log records replayed, {orphans} orphan files removed");
     println!("  {:.0}s", t0.elapsed().as_secs_f64());
-    if lost + wrong + missing_final + stored_wrong > 0 {
+    if lost + wrong + missing_final + stored_wrong > 0 || !sc.ok() {
         std::process::exit(1);
     }
 }
@@ -600,6 +697,10 @@ fn main() {
         "check-claude" => check_claude(&a),
         "stats" => stats(&a),
         "compact" => compact(&a),
+        "check-steps" => check_steps(&a),
+        "serve" => serve(&a),
+        "synth" => synth_store(&a),
+        "steps" => steps_summary(&a),
         "bench" => bench(&a),
         "crash-child" => crash_child(&a),
         "crash-test" => crash_test(&a),

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Ingest every Claude Code log on this machine, then check that every recorded
 # request rebuilds byte for byte from the store (sha256 equal to Claude Code's own
-# requestDigest), and print sizes, storage runs and read times.
+# requestDigest), that every step matches a slow reference, and print sizes,
+# storage runs and read times.
 #
 # Real logs are read at run time from ~/.claude/projects (or $LOGS). The store is
 # written outside the repo ($STORE, default under $TMPDIR) and removed at the end
@@ -24,6 +25,8 @@ $TDB compact --store "$STORE"
 $TDB stats --store "$STORE"
 echo "== check every recorded request against the store"
 $TDB check-claude --store "$STORE" --logs "$LOGS"   # exits non-zero if any stored request rebuilds wrong
+echo "== steps against the slow reference"
+$TDB check-steps --store "$STORE"   # exits non-zero on any difference
 echo "== reads"
 $TDB bench --store "$STORE"
 [ "${KEEP:-0}" = 1 ] || rm -rf "$STORE" "$STORE.check.txt"

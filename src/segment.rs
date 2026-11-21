@@ -8,6 +8,7 @@
 
 use crate::codec::{corrupt, Dec, Enc, Result};
 use crate::record::ReqRec;
+use crate::steps::StepRow;
 use crate::wal::{sync_file, SyncMode};
 use std::cell::RefCell;
 use std::fs::{File, OpenOptions};
@@ -65,6 +66,16 @@ pub struct SegOpaque {
     pub len: u32,
 }
 
+/// One session's steps in a segment. `tool` and field/value codes are local to the segment.
+#[derive(Debug, Clone)]
+pub struct SegSteps {
+    pub session: u32,
+    pub first: u32,
+    pub rows: Vec<StepRow>,
+    /// Per row: (local field, local value or `steps::LONG`).
+    pub fields: Vec<Vec<(u32, u32)>>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct SegIndex {
     pub max_seq: u64,
@@ -74,6 +85,11 @@ pub struct SegIndex {
     pub pieces: Vec<SegPiece>,
     pub opaques: Vec<SegOpaque>,
     pub requests: Vec<ReqRec>,
+    pub step_tools: Vec<Vec<u8>>,
+    pub step_fields: Vec<Vec<u8>>,
+    /// (local field, value text)
+    pub step_values: Vec<(u32, Vec<u8>)>,
+    pub steps: Vec<SegSteps>,
 }
 
 impl SegIndex {
@@ -131,6 +147,41 @@ impl SegIndex {
         for r in &self.requests {
             r.encode(&mut e);
         }
+        e.var(self.step_tools.len() as u64);
+        for t in &self.step_tools {
+            e.bytes(t);
+        }
+        e.var(self.step_fields.len() as u64);
+        for f in &self.step_fields {
+            e.bytes(f);
+        }
+        e.var(self.step_values.len() as u64);
+        for (f, v) in &self.step_values {
+            e.var(*f as u64);
+            e.bytes(v);
+        }
+        e.var(self.steps.len() as u64);
+        for c in &self.steps {
+            e.var(c.session as u64);
+            e.var(c.first as u64);
+            e.var(c.rows.len() as u64);
+            for (r, fs) in c.rows.iter().zip(&c.fields) {
+                e.var(r.call_node as u64);
+                e.var(r.call_block as u64);
+                e.var(r.result_node as u64);
+                e.var(r.result_block as u64);
+                e.var(if r.prev == u32::MAX { 0 } else { r.prev as u64 + 1 });
+                e.var(r.tool as u64);
+                e.u8(r.failed as u8);
+                e.var(r.out_bytes as u64);
+                e.var(r.time_ms.max(0) as u64);
+                e.var(fs.len() as u64);
+                for &(f, v) in fs {
+                    e.var(f as u64);
+                    e.var(if v == crate::steps::LONG { 0 } else { v as u64 + 1 });
+                }
+            }
+        }
         e.buf
     }
 
@@ -186,10 +237,56 @@ impl SegIndex {
         for _ in 0..nr {
             requests.push(ReqRec::decode(&mut d)?);
         }
+        let n = d.var()? as usize;
+        let mut step_tools = Vec::with_capacity(n);
+        for _ in 0..n {
+            step_tools.push(d.bytes()?.to_vec());
+        }
+        let n = d.var()? as usize;
+        let mut step_fields = Vec::with_capacity(n);
+        for _ in 0..n {
+            step_fields.push(d.bytes()?.to_vec());
+        }
+        let n = d.var()? as usize;
+        let mut step_values = Vec::with_capacity(n);
+        for _ in 0..n {
+            step_values.push((d.var32()?, d.bytes()?.to_vec()));
+        }
+        let n = d.var()? as usize;
+        let mut steps = Vec::with_capacity(n);
+        for _ in 0..n {
+            let session = d.var32()?;
+            let first = d.var32()?;
+            let nrow = d.var()? as usize;
+            let mut rows = Vec::with_capacity(nrow);
+            let mut fields = Vec::with_capacity(nrow);
+            for _ in 0..nrow {
+                let call_node = d.var32()?;
+                let call_block = d.var32()? as u16;
+                let result_node = d.var32()?;
+                let result_block = d.var32()? as u16;
+                let p = d.var()?;
+                let prev = if p == 0 { u32::MAX } else { (p - 1) as u32 };
+                let tool = d.var32()?;
+                let failed = d.u8()? != 0;
+                let out_bytes = d.var32()?;
+                let time_ms = d.var()? as i64;
+                let nf = d.var()? as usize;
+                let mut fs = Vec::with_capacity(nf);
+                for _ in 0..nf {
+                    let f = d.var32()?;
+                    let v = d.var()?;
+                    fs.push((f, if v == 0 { crate::steps::LONG } else { (v - 1) as u32 }));
+                }
+                rows.push(StepRow { call_node, result_node, prev, tool, time_ms, out_bytes, call_block, result_block, failed });
+                fields.push(fs);
+            }
+            steps.push(SegSteps { session, first, rows, fields });
+        }
         if !d.done() {
             return corrupt("trailing bytes in segment index");
         }
-        Ok(SegIndex { max_seq, frame_size, sessions, chunks, pieces, opaques, requests })
+        Ok(SegIndex { max_seq, frame_size, sessions, chunks, pieces, opaques, requests, step_tools, step_fields, step_values, steps })
     }
 }
 
