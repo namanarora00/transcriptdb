@@ -17,7 +17,10 @@
 //! demand. Shared pieces and opaque values are appended to blob files. The index finds a
 //! piece or opaque value by hash or by id, a request by its id and a session by its key;
 //! each flush adds an index run and runs merge by size tiers, so a lookup reads a few runs.
-//! Flushes write level-0 segments; merges combine segments by size tiers up to a cap.
+//! Flushes write level-0 segments; merges combine segments by size tiers up to a cap. A
+//! session that takes writes again after its data reached the cap is folded back into one
+//! part by a later merge into full-size segments (`Db::merge`); the parts it replaces
+//! stay in their segments, unread, until half of a segment is such parts and it is rewritten.
 
 use crate::blob::{self, blob_path, BlobAppend};
 use crate::block::BlockRef;
@@ -25,7 +28,7 @@ use crate::cache::{Cache, CacheStats};
 use crate::index::{self, IxBlock, OpaqueEnt, PieceEnt, Run, RunWriter, IDS, K_OPAQUES, K_PIECES, NS_OPAQUE, NS_PIECE, NS_REQUEST, NS_SESSION};
 use crate::codec::{corrupt, Error, Result};
 use crate::layout;
-use crate::manifest::Manifest;
+use crate::manifest::{Dead, Manifest};
 use crate::record::*;
 use crate::segment::{decode_core, decode_steps, key_bytes, seg_path, CorePart, DirEnt, SegNode, SegWriter, Segment, StepPart};
 use crate::split::{self, HoleKind, Keep, OpaqueEnc, OpaqueHole, OpaqueKind, Skeleton};
@@ -65,6 +68,9 @@ pub struct Options {
     pub blob_bytes: u64,
     /// Index runs this big are not merged again.
     pub run_bytes: u64,
+    /// A merge into full-size segments folds a session into one part when it has gone quiet
+    /// or would otherwise be left in more parts than this; 0 turns folding off.
+    pub max_parts: usize,
 }
 
 impl Default for Options {
@@ -83,6 +89,7 @@ impl Default for Options {
             open_files: 128,
             blob_bytes: 1 << 30,
             run_bytes: 1 << 30,
+            max_parts: 4,
         }
     }
 }
@@ -233,6 +240,9 @@ pub struct MergeStats {
     pub bytes_out: u64,
     /// File bytes written by flushes.
     pub flushed: u64,
+    /// Sessions folded into one part, and segments rewritten to drop the parts folds replaced.
+    pub folded: u64,
+    pub reclaims: u64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -268,6 +278,8 @@ pub struct Stats {
     pub orphan_results: usize,
     /// Memory held by file catalogs (always loaded), and by sessions taking writes.
     pub catalog_bytes: usize,
+    /// File bytes of session parts that folds replaced, not yet dropped by a rewrite.
+    pub dead_bytes: u64,
     pub active_sessions: usize,
     pub active_bytes: usize,
     pub caches: Vec<(&'static str, CacheStats)>,
@@ -311,6 +323,9 @@ pub struct Db {
     pieces: Cache<u32, Vec<u8>>,
     skels: Cache<u32, Skeleton>,
     active: HashMap<u32, Active>,
+    /// Sessions that took writes in the last `idle_flushes` flushes, as of the last flush
+    /// (merges after it drop them from `active`).
+    busy: BTreeSet<u32>,
     key_ix: HashMap<(String, String), u32>,
     next_session: u32,
     mem: Mem,
@@ -338,6 +353,26 @@ fn request_hash(id: &str) -> u128 {
 
 fn session_hash(key: &(String, String)) -> u128 {
     xxh3_128_with_seed(&key_bytes(&key.0, &key.1), 0x7365_7300)
+}
+
+/// Whether part `k` covers every request, node and step row of part `p`.
+fn covers(k: &DirEnt, p: &DirEnt) -> bool {
+    let within = |a: u32, n: u32, b: u32, m: u32| a <= b && b + m <= a + n;
+    within(k.first_req, k.n_reqs, p.first_req, p.n_reqs) && within(k.first_node, k.n_nodes, p.first_node, p.n_nodes) && within(k.first_row, k.n_rows, p.first_row, p.n_rows)
+}
+
+/// What a part counts for in its segment, for a fold that replaces it.
+fn part_dead(d: &DirEnt, core: &SessionCore) -> Dead {
+    let share = |r: &(BlockRef, u32, u32)| r.2 as u64 * r.0.clen as u64 / r.0.rawlen.max(1) as u64;
+    let nodes = d.first_node as usize..(d.first_node + d.n_nodes) as usize;
+    Dead {
+        bytes: d.frame_bytes + share(&d.core) + share(&d.steps),
+        requests: d.n_reqs as u64,
+        nodes: d.n_nodes as u64,
+        steps: d.n_rows as u64,
+        node_bytes: core.nodes.get(nodes).map_or(0, |ns| ns.iter().map(|n| n.len as u64).sum()),
+        frame_bytes: d.frame_bytes,
+    }
 }
 
 /// Size tier: 0 under 4 << `shift` bytes, then one more for every factor of 4.
@@ -420,6 +455,7 @@ impl Db {
             pieces: Cache::sharded(cb / 16, 16),
             skels: Cache::sharded(cb / 32, 16),
             active: HashMap::new(),
+            busy: BTreeSet::new(),
             key_ix: HashMap::new(),
             next_session: 0,
             mem: Mem::default(),
@@ -446,6 +482,9 @@ impl Db {
             db.runs.push(Arc::new(Run::open(&db.dir, n)?));
         }
         db.check_run_ranges()?;
+        if let Some((n, _)) = db.manifest.dead.iter().find(|(n, _)| !db.segs.contains_key(n)) {
+            return corrupt(format!("MANIFEST counts replaced parts in segment {n}, which is not live"));
+        }
         db.next_session = db.manifest.sessions;
         db.seq = db.manifest.checkpoint;
 
@@ -539,7 +578,13 @@ impl Db {
         Ok(self.ix.insert(k, Arc::new(t), n))
     }
 
-    /// Every part of session `s`, in order.
+    /// Every live part of session `s`, in order.
+    ///
+    /// A part covers a range of the session's requests, nodes and step rows. Merges and folds
+    /// only ever write a part that joins live parts that follow each other, so two parts
+    /// either do not overlap or one covers the other; a covered part was replaced by a fold
+    /// and still sits in an older segment until that segment is rewritten. Sorting by start,
+    /// longest first, puts each covering part before the parts it replaced.
     fn parts(&self, s: u32) -> Result<Vec<(Arc<Segment>, DirEnt)>> {
         let mut out = Vec::new();
         for seg in self.segs.values() {
@@ -554,8 +599,26 @@ impl Db {
                 }
             }
         }
-        out.sort_by_key(|p| (p.1.first_req, p.1.first_node, p.1.first_row));
-        Ok(out)
+        let start = |d: &DirEnt| (d.first_req, d.first_node, d.first_row);
+        let end = |d: &DirEnt| (d.first_req + d.n_reqs, d.first_node + d.n_nodes, d.first_row + d.n_rows);
+        out.sort_by(|a, b| start(&a.1).cmp(&start(&b.1)).then(end(&b.1).cmp(&end(&a.1))).then(b.0.num.cmp(&a.0.num)));
+        let mut live: Vec<(Arc<Segment>, DirEnt)> = Vec::with_capacity(out.len());
+        for p in out {
+            if live.last().is_some_and(|k| covers(&k.1, &p.1)) {
+                continue;
+            }
+            live.push(p);
+        }
+        Ok(live)
+    }
+
+    /// Replaced parts counted over every live segment.
+    fn dead_total(&self) -> Dead {
+        let mut t = Dead::default();
+        for (_, d) in &self.manifest.dead {
+            t.add(d);
+        }
+        t
     }
 
     /// The newest value stored under (`ns`, `h`) in the index runs.
@@ -1291,12 +1354,14 @@ impl Db {
             }
         }
         self.remove_old_wal(new_wal)?;
+        self.busy = self.active.keys().copied().collect();
         self.merge_policy()
     }
 
     /// Once `merge_at` flushed segments wait, merge them; then merge any `merge_at` merged
     /// segments of one size tier (sizes in powers of 4 from 1 MB) under the size cap. Each
     /// byte is rewritten about once per tier, and finished data stops moving at the cap.
+    /// A segment whose parts were mostly replaced by folds is rewritten on its own.
     /// Index runs merge the same way, `merge_at` neighbours of one tier at a time.
     fn merge_policy(&mut self) -> Result<()> {
         // index runs first: they are small, and every lookup reads each one
@@ -1313,15 +1378,22 @@ impl Db {
         }
         let l0: BTreeSet<u32> = self.segs.values().filter(|s| s.cat.level == 0).map(|s| s.num).collect();
         if l0.len() >= self.opts.merge_at {
-            self.merge(l0)?;
+            self.merge(l0, true)?;
         }
         loop {
             let mut tiers: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
             for sg in self.segs.values().filter(|s| s.cat.level > 0 && s.file_bytes < self.opts.seg_bytes) {
                 tiers.entry(tier(sg.file_bytes, 20)).or_default().push(sg.num);
             }
-            let Some((_, group)) = tiers.into_iter().find(|(_, v)| v.len() >= self.opts.merge_at) else { break };
-            self.merge(group.into_iter().take(self.opts.merge_at).collect())?;
+            if let Some((_, group)) = tiers.into_iter().find(|(_, v)| v.len() >= self.opts.merge_at) {
+                self.merge(group.into_iter().take(self.opts.merge_at).collect(), true)?;
+                continue;
+            }
+            // half or more of the segment is parts that folds replaced: rewrite it without them
+            let gc = self.manifest.dead.iter().find(|(n, d)| self.segs.get(n).is_some_and(|sg| sg.cat.level > 0 && d.bytes.saturating_mul(2) >= sg.file_bytes)).map(|x| x.0);
+            let Some(n) = gc else { break };
+            self.merge(BTreeSet::from([n]), false)?;
+            self.merge_stats.reclaims += 1;
         }
         Ok(())
     }
@@ -1366,9 +1438,18 @@ impl Db {
     }
 
     /// Rewrite segments `inputs` into merged segments split by size. For each session, each
-    /// run of its consecutive parts that all sit in `inputs` becomes one part, main line
-    /// first; parts elsewhere (a session that woke up after its data was merged) stay put.
-    fn merge(&mut self, inputs: BTreeSet<u32>) -> Result<()> {
+    /// run of its consecutive live parts that all sit in `inputs` becomes one part, main line
+    /// first; parts replaced by a fold are dropped.
+    ///
+    /// Parts elsewhere (a session that took writes again after its data was merged) stay put,
+    /// except in a merge whose output reaches the size cap (the last time this data moves),
+    /// when `fold` is set: a session there is folded into one part, all of it read from every
+    /// segment, when it has gone quiet (its newest part is in `inputs` and it takes no writes)
+    /// or would otherwise be left in more than `max_parts` parts. The parts outside `inputs`
+    /// that it replaces are counted as dead in their segments, which are rewritten once
+    /// half dead. Folding only there means a folded session is written once at full size
+    /// rather than climbing the size tiers again, and a session still taking writes waits.
+    fn merge(&mut self, inputs: BTreeSet<u32>, fold: bool) -> Result<()> {
         if inputs.is_empty() {
             return Ok(());
         }
@@ -1383,9 +1464,12 @@ impl Db {
                 }
             }
         }
+        let fold = fold && bytes_in >= self.opts.seg_bytes;
         let mut man = self.manifest.clone();
         let mut outputs: Vec<u32> = Vec::new();
         let mut w: Option<SegWriter> = None;
+        let mut dead: BTreeMap<u32, Dead> = BTreeMap::new();
+        let (mut folded, mut fold_read) = (0u64, 0u64);
         for &s in &sessions {
             let parts = self.parts(s)?;
             let mut runs = Vec::new();
@@ -1405,6 +1489,10 @@ impl Db {
             if runs.is_empty() {
                 continue;
             }
+            let inside: usize = runs.iter().map(|(a, b)| b - a).sum();
+            let outside = parts.len() - inside;
+            let quiet = inputs.contains(&parts[parts.len() - 1].0.num) && !self.busy.contains(&s);
+            let fold_s = fold && self.opts.max_parts > 0 && outside > 0 && (quiet || outside + runs.len() > self.opts.max_parts);
             if w.as_ref().is_some_and(|w| w.sessions() > 0 && w.written() >= self.opts.seg_bytes) {
                 w.take().unwrap().finish(self.opts.sync)?;
             }
@@ -1416,6 +1504,15 @@ impl Db {
             }
             let core = self.load_core(s)?;
             let ss = self.load_steps(s)?;
+            if fold_s {
+                for (seg, d) in parts.iter().filter(|p| !inputs.contains(&p.0.num)) {
+                    let x = part_dead(d, &core);
+                    fold_read += x.bytes;
+                    dead.entry(seg.num).or_default().add(&x);
+                }
+                runs = vec![(0, parts.len())];
+                folded += 1;
+            }
             let wr = w.as_mut().unwrap();
             for (a, b) in runs {
                 let (pa, pb) = (&parts[a].1, &parts[b - 1].1);
@@ -1430,6 +1527,11 @@ impl Db {
         man.generation += 1;
         man.segs.retain(|n| !inputs.contains(n));
         man.segs.extend(&outputs);
+        let mut all_dead: BTreeMap<u32, Dead> = man.dead.iter().filter(|(n, _)| !inputs.contains(n)).copied().collect();
+        for (n, x) in dead {
+            all_dead.entry(n).or_default().add(&x);
+        }
+        man.dead = all_dead.into_iter().collect();
         man.store(&self.dir, self.opts.sync)?;
         self.manifest = man;
         // sessions that point at the old files are read again from the new ones
@@ -1455,8 +1557,9 @@ impl Db {
             let _ = fs::remove_file(p);
         }
         self.merge_stats.merges += 1;
-        self.merge_stats.bytes_in += bytes_in;
+        self.merge_stats.bytes_in += bytes_in + fold_read;
         self.merge_stats.bytes_out += bytes_out;
+        self.merge_stats.folded += folded;
         Ok(())
     }
 
@@ -1464,7 +1567,7 @@ impl Db {
     pub fn compact(&mut self) -> Result<()> {
         self.flush()?;
         let all: BTreeSet<u32> = self.segs.keys().copied().collect();
-        self.merge(all)
+        self.merge(all, false)
     }
 
     // ------------------------------------------------------------------ reads
@@ -1795,7 +1898,7 @@ impl Db {
     }
 
     pub fn request_count(&self) -> usize {
-        self.segs.values().map(|s| s.cat.requests as usize).sum::<usize>() + self.mem.req_ix.len()
+        (self.segs.values().map(|s| s.cat.requests).sum::<u64>() - self.dead_total().requests) as usize + self.mem.req_ix.len()
     }
 
     /// Every stored request, session by session (reads every session's metadata).
@@ -1905,7 +2008,14 @@ impl Db {
             st.seg_file_bytes += sg.file_bytes;
             st.catalog_bytes += c.bytes();
         }
-        st.index_bytes = st.seg_file_bytes - st.frame_bytes;
+        let dead = self.dead_total();
+        st.nodes -= dead.nodes as usize;
+        st.steps -= dead.steps as usize;
+        st.node_bytes -= dead.node_bytes;
+        st.frame_bytes -= dead.frame_bytes;
+        st.dead_bytes = dead.bytes;
+        st.catalog_bytes += self.manifest.dead.len() * 56;
+        st.index_bytes = st.seg_file_bytes.saturating_sub(st.frame_bytes + dead.bytes);
         for r in &self.runs {
             st.index_file_bytes += r.file_bytes;
             st.opaque_bytes += r.cat.opaque_bytes;

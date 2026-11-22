@@ -1,5 +1,6 @@
 //! The manifest: which segment, index and blob files are live (and how long each blob
-//! file is), the id counters they cover, and where log replay starts.
+//! file is), what each segment still holds that a fold replaced, the id counters the
+//! files cover, and where log replay starts.
 //!
 //! It is replaced atomically: written to `MANIFEST.tmp`, made durable, renamed over
 //! `MANIFEST`, and the directory made durable. Readers see the old list or the new
@@ -11,7 +12,31 @@ use std::fs::{self, File};
 use std::io::Write;
 use std::path::Path;
 
-const MAGIC: &[u8; 8] = b"TDBMAN03";
+const MAGIC: &[u8; 8] = b"TDBMAN04";
+
+/// Session parts in a segment that a fold replaced: they stay in the file, unread, until
+/// the segment is rewritten. Counted so the store's totals leave them out.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Dead {
+    /// File bytes the parts take, roughly (their frames and their share of blocks).
+    pub bytes: u64,
+    pub requests: u64,
+    pub nodes: u64,
+    pub steps: u64,
+    pub node_bytes: u64,
+    pub frame_bytes: u64,
+}
+
+impl Dead {
+    pub fn add(&mut self, o: &Dead) {
+        self.bytes += o.bytes;
+        self.requests += o.requests;
+        self.nodes += o.nodes;
+        self.steps += o.steps;
+        self.node_bytes += o.node_bytes;
+        self.frame_bytes += o.frame_bytes;
+    }
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Manifest {
@@ -23,6 +48,8 @@ pub struct Manifest {
     /// Number for the next segment, index or blob file.
     pub next_file: u32,
     pub segs: Vec<u32>,
+    /// Live segments holding replaced parts, by segment number.
+    pub dead: Vec<(u32, Dead)>,
     /// Index runs in id order (oldest first).
     pub runs: Vec<u32>,
     /// Blob files in order, with the length each has been made durable at.
@@ -57,6 +84,11 @@ impl Manifest {
         for _ in 0..d.var()? {
             segs.push(d.var32()?);
         }
+        let mut dead = Vec::new();
+        for _ in 0..d.var()? {
+            let n = d.var32()?;
+            dead.push((n, Dead { bytes: d.var()?, requests: d.var()?, nodes: d.var()?, steps: d.var()?, node_bytes: d.var()?, frame_bytes: d.var()? }));
+        }
         let mut runs = Vec::new();
         for _ in 0..d.var()? {
             runs.push(d.var32()?);
@@ -69,7 +101,7 @@ impl Manifest {
         if !d.done() {
             return corrupt("MANIFEST has trailing bytes");
         }
-        Ok(Some(Manifest { generation, checkpoint, wal_start, next_file, segs, runs, blobs, sessions, pieces, opaques }))
+        Ok(Some(Manifest { generation, checkpoint, wal_start, next_file, segs, dead, runs, blobs, sessions, pieces, opaques }))
     }
 
     pub fn store(&self, dir: &Path, mode: SyncMode) -> Result<()> {
@@ -82,6 +114,13 @@ impl Manifest {
         e.var(self.segs.len() as u64);
         for &s in &self.segs {
             e.var(s as u64);
+        }
+        e.var(self.dead.len() as u64);
+        for (n, x) in &self.dead {
+            e.var(*n as u64);
+            for v in [x.bytes, x.requests, x.nodes, x.steps, x.node_bytes, x.frame_bytes] {
+                e.var(v);
+            }
         }
         e.var(self.runs.len() as u64);
         for &r in &self.runs {

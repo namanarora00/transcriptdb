@@ -280,7 +280,8 @@ fn values_not_kept_rebuild_blank_and_keep_their_sizes() {
 #[test]
 fn merges_wakeups_and_small_caches_keep_everything_exact() {
     let dir = tmpdir("merges");
-    let o = Options { flush_bytes: 48 << 10, sync: SyncMode::Os, merge_at: 3, seg_bytes: 160 << 10, idle_flushes: 1, cache_bytes: 192 << 10, ..Options::default() };
+    // folding off, so woken sessions stay in several parts and reads join them
+    let o = Options { flush_bytes: 48 << 10, sync: SyncMode::Os, merge_at: 3, seg_bytes: 160 << 10, idle_flushes: 1, cache_bytes: 192 << 10, max_parts: 0, ..Options::default() };
     let early: Vec<Vec<SynthRequest>> = (0..10).map(|s| synth::session(41, s, 36)).collect();
     let mut order: Vec<&SynthRequest> = Vec::new();
     for s in &early {
@@ -425,5 +426,67 @@ fn index_runs_stay_few_through_many_small_flushes() {
     drop(db);
     let db = Db::open(&dir, o).unwrap();
     check_all(&db, &reqs);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// Sessions that take writes again and again while other traffic pushes their data into
+/// full-size segments: merges into full-size segments fold them back into one part, and
+/// segments mostly made of replaced parts are rewritten without them.
+#[test]
+fn woken_sessions_fold_back_into_one_part() {
+    let dir = tmpdir("fold");
+    let o = Options { flush_bytes: 24 << 10, sync: SyncMode::Os, merge_at: 3, seg_bytes: 96 << 10, idle_flushes: 1, cache_bytes: 256 << 10, max_parts: 3, ..Options::default() };
+    let wakers: Vec<Vec<SynthRequest>> = (0..10).map(|s| synth::session(61, s, 40)).collect();
+    // filler sessions from another seed: their ids repeat ("synth-<n>-<k>"), so keep them apart
+    let filler: Vec<SynthRequest> = traffic(67, 60, 24).into_iter().map(|q| SynthRequest { id: format!("fill-{}", q.id), ..q }).collect();
+    let mut order: Vec<&SynthRequest> = Vec::new();
+    let mut fill = filler.chunks(filler.len() / 6);
+    for round in 0..5 {
+        for w in &wakers {
+            order.extend(w[round * 8..round * 8 + 8].iter());
+        }
+        order.extend(fill.next().unwrap());
+    }
+    order.extend(fill.flatten());
+    let all: Vec<&SynthRequest> = order.clone();
+    let mut db = Db::open(&dir, o.clone()).unwrap();
+    for (i, q) in order.iter().enumerate() {
+        put(&mut db, q);
+        if i % 4 == 0 {
+            db.commit().unwrap();
+        }
+    }
+    db.flush().unwrap();
+    let check = |db: &Db| {
+        for q in &all {
+            let ri = db.request_index(&q.id).unwrap_or_else(|| panic!("{} missing", q.id));
+            assert_eq!(db.rebuild_checked(ri).unwrap(), q.body, "{}", q.id);
+        }
+        assert_eq!(db.request_count(), all.len(), "requests in replaced parts are not counted");
+        let c = transcriptdb::check::check_steps(db, 2).unwrap();
+        assert!(c.ok(), "{c:?}");
+    };
+    let st = db.stats();
+    let parts: Vec<usize> = (0..10).map(|s| db.part_count(s).unwrap()).collect();
+    eprintln!("merges {:?}; waker parts {parts:?}; dead {} of {} segment bytes; segments {:?}", st.merges, st.dead_bytes, st.seg_file_bytes, db.segments());
+    assert!(st.merges.folded >= 10, "{:?}", st.merges);
+    assert!(st.merges.reclaims >= 1, "{:?}", st.merges);
+    assert!(parts.iter().all(|&n| n <= 3), "a session left in more parts than max_parts: {parts:?}");
+    assert!(parts.iter().filter(|&&n| n == 1).count() >= 8, "quiet sessions not folded back: {parts:?}");
+    assert!(st.dead_bytes * 2 < st.seg_file_bytes);
+    check(&db);
+    drop(db);
+    let mut db = Db::open(&dir, o.clone()).unwrap();
+    let again = db.stats();
+    assert_eq!((again.dead_bytes, again.nodes, again.steps, again.node_bytes), (st.dead_bytes, st.nodes, st.steps, st.node_bytes));
+    check(&db);
+    db.clear_caches();
+    check(&db);
+    db.compact().unwrap();
+    let done = db.stats();
+    assert_eq!(done.dead_bytes, 0);
+    assert_eq!((done.nodes, done.steps, done.node_bytes), (st.nodes, st.steps, st.node_bytes), "totals with replaced parts left out match the totals after they are dropped");
+    assert!((0..db.session_count() as u32).all(|s| db.part_count(s).unwrap() == 1));
+    check(&db);
     std::fs::remove_dir_all(&dir).unwrap();
 }

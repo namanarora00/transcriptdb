@@ -7,7 +7,7 @@
 //!   tdb compact       --store DIR
 //!   tdb bench         --store DIR [--n 300] [--seed S]
 //!   tdb crash-test    --store DIR [--kills 1000] [--seed S] [--sync full|fsync|os]
-//!   tdb growth        --store DIR [--rounds 5] [--base 300] [--wake 0.1] [--cache-mb 256] [--flush-mb 64]
+//!   tdb growth        --store DIR [--rounds 5] [--base 300] [--wake 0.1] [--cache-mb 256] [--flush-mb 64] [--seg-mb 256] [--max-parts 4]
 //!
 //! Real logs are read from `--logs` (default `~/.claude/projects`) at run time only.
 //! Output is counts, sizes and times; no log content is printed.
@@ -83,6 +83,8 @@ impl Args {
             frame_size: (self.num("frame-kb", 64) as usize) << 10,
             keep: self.keep(),
             cache_bytes: (self.num("cache-mb", 256) as usize) << 20,
+            max_parts: self.num("max-parts", 4) as usize,
+            seg_bytes: self.num("seg-mb", 256) << 20,
             ..Options::default()
         }
     }
@@ -223,6 +225,15 @@ fn ingest_claude(a: &Args) {
         mb(body_bytes),
         body_bytes as f64 / 1e6 / put_time.as_secs_f64().max(1e-9),
         stored as f64 / put_time.as_secs_f64().max(1e-9)
+    );
+    let ms = &db.merge_stats;
+    println!(
+        "merges during ingest: {}, writing {} for {} written by flushes; sessions folded {}, segments rewritten to drop replaced parts {}",
+        ms.merges,
+        mb(ms.bytes_out),
+        mb(ms.flushed),
+        ms.folded,
+        ms.reclaims
     );
 }
 
@@ -445,6 +456,14 @@ fn stats(a: &Args) {
     println!("  opaque values {} raw ({} values kept, {} not kept)", mb(st.opaque_bytes), st.opaques - st.opaques_dropped, st.opaques_dropped);
     println!("  shared pieces {} compressed from {} ({} pieces: skeletons, system, tools, markers)", mb(st.piece_bytes), mb(st.piece_raw_bytes), st.pieces);
     println!("  segment blocks, directories and catalogs {}; index runs {}", mb(st.index_bytes), mb(st.index_file_bytes));
+    let mut sizes: Vec<u64> = db.segments().iter().map(|s| s.4).collect();
+    sizes.sort_unstable();
+    println!("  segments: {} from flushes, {} merged; sizes median {}, largest {}", st.level0, st.segments - st.level0, mb(sizes.get(sizes.len() / 2).copied().unwrap_or(0)), mb(sizes.last().copied().unwrap_or(0)));
+    if st.dead_bytes > 0 {
+        println!("  session parts that folds replaced, left in their segments until those are rewritten: {}", mb(st.dead_bytes));
+    }
+    let parts: Vec<usize> = (0..st.sessions as u32).map(|s| db.part_count(s).expect("session parts")).collect();
+    println!("  sessions in more than one part: {} of {} (most parts {})", parts.iter().filter(|&&p| p > 1).count(), st.sessions, parts.iter().max().unwrap_or(&0));
     println!("  all data files: {} for {} of distinct text ({:.3} bytes per byte)", mb(data), mb(st.node_bytes + opaque_text), data as f64 / (st.node_bytes + opaque_text).max(1) as f64);
     if a.get("opaque").is_some() {
         let total = data.max(1) as f64;
@@ -784,7 +803,7 @@ fn crash_child(a: &Args) {
     let run = a.num("run", 0);
     // small flushes, frequent merges into small segments, sessions leaving memory after one
     // idle flush and tiny caches: kills land in every part of the write path
-    let opts = Options { sync: a.sync(), flush_bytes: 384 << 10, merge_at: 3, seg_bytes: 1 << 20, idle_flushes: 1, cache_bytes: 4 << 20, blob_bytes: 512 << 10, run_bytes: 256 << 10, ..Options::default() };
+    let opts = Options { sync: a.sync(), flush_bytes: 384 << 10, merge_at: 3, seg_bytes: 128 << 10, idle_flushes: 1, cache_bytes: 4 << 20, blob_bytes: 512 << 10, run_bytes: 256 << 10, ..Options::default() };
     let mut db = Db::open(a.store(), opts).expect("open store");
     {
         let mut l = std::io::stdout().lock();
@@ -815,12 +834,16 @@ fn crash_child(a: &Args) {
             }
         }
         db.commit().expect("commit");
+        let ms = &db.merge_stats;
+        let mut l = out.lock();
         if !batch.is_empty() {
-            let mut l = out.lock();
             writeln!(l, "ACK {}", batch.join(" ")).unwrap();
-            l.flush().unwrap();
         }
-        if db.segment_count() >= 6 && r.chance(0.5) {
+        // folds and rewrites that finished in this process so far
+        writeln!(l, "MERGES {} {}", ms.folded, ms.reclaims).unwrap();
+        l.flush().unwrap();
+        drop(l);
+        if db.segment_count() >= 6 && r.chance(0.03) {
             db.compact().expect("compact");
         }
     }
@@ -847,6 +870,7 @@ fn crash_test(a: &Args) {
         expected[id]
     };
     let (mut torn, mut replayed, mut orphans, mut lost, mut wrong, mut finished) = (0u64, 0usize, 0usize, 0usize, 0usize, 0u64);
+    let (mut folded, mut reclaims) = (0u64, 0u64);
     let t0 = Instant::now();
     for k in 0..kills {
         let mut child = Command::new(&exe)
@@ -889,11 +913,17 @@ fn crash_test(a: &Args) {
         child.wait().unwrap();
         reader.join().unwrap();
         lines.extend(lrx.try_iter());
+        let mut last_merges = (0, 0);
         for l in lines {
             if let Some(rest) = l.strip_prefix("ACK ") {
                 acked.extend(rest.split(' ').map(|s| s.to_string()));
+            } else if let Some(rest) = l.strip_prefix("MERGES ") {
+                let v: Vec<u64> = rest.split(' ').map(|x| x.parse().unwrap()).collect();
+                last_merges = (v[0], v[1]);
             }
         }
+        folded += last_merges.0;
+        reclaims += last_merges.1;
 
         // reopen (recovery) and check
         let db = Db::open(&dir, Options { sync: SyncMode::Os, ..Options::default() }).expect("recovery failed");
@@ -931,7 +961,12 @@ fn crash_test(a: &Args) {
     // final full check: every acknowledged request, and every stored request against the generator
     let db = Db::open(&dir, Options { sync: SyncMode::Os, ..Options::default() }).expect("recovery failed");
     let mut stored_wrong = 0;
-    for i in db.all_requests().expect("list requests") {
+    let all = db.all_requests().expect("list requests");
+    if all.len() != db.request_count() {
+        eprintln!("request count {} but {} requests listed", db.request_count(), all.len());
+        stored_wrong += 1;
+    }
+    for i in all {
         let id = db.request(i).expect("read request").id.to_string();
         let want = expect(&id, &mut expected);
         if db.rebuild(i).map(|b| sha256(&b) != want).unwrap_or(true) {
@@ -951,6 +986,7 @@ fn crash_test(a: &Args) {
     println!("  final check: acknowledged but missing {missing_final}; stored requests that rebuild wrong {stored_wrong}");
     println!("  steps after all kills: {} engine steps; missing {}, extra {}, wrong prev {}, wrong shape {}", sc.engine_steps, sc.missing, sc.extra, sc.prev_wrong, sc.shape_wrong);
     println!("  recovery saw: {torn} torn log bytes cut, {replayed} log records replayed, {orphans} orphan files removed");
+    println!("  merges seen to finish before a kill: at least {folded} sessions folded, {reclaims} segments rewritten to drop replaced parts; replaced parts left {}", mb(db.stats().dead_bytes));
     println!("  {:.0}s", t0.elapsed().as_secs_f64());
     if lost + wrong + missing_final + stored_wrong > 0 || !sc.ok() {
         std::process::exit(1);
@@ -1052,7 +1088,7 @@ fn growth(a: &Args) {
     let (mut raw, mut woken) = (0u64, 0u64);
     let mut acc = transcriptdb::db::MergeStats::default();
     let exe = std::env::current_exe().expect("own path");
-    println!("round  sessions  requests   raw in    store  | open s  catalogs  RSS open  RSS reads | cold med   p99 | warm med   p99 ms | query s  RSS query | segs (L0) runs blobs | rewritten | ingest MB/s");
+    println!("round  sessions  requests   raw in    store  | open s  catalogs  RSS open  RSS reads | cold med   p99 | warm med   p99 ms | query s  RSS query | segs (L0) runs blobs | split (max) | rewritten | ingest MB/s");
     for round in 0..rounds {
         let target = base << round;
         let t = Instant::now();
@@ -1105,6 +1141,11 @@ fn growth(a: &Args) {
         acc.merges += st.merges.merges;
         acc.flushed += st.merges.flushed;
         acc.bytes_out += st.merges.bytes_out;
+        acc.folded += st.merges.folded;
+        acc.reclaims += st.merges.reclaims;
+        let parts: Vec<usize> = (0..st.sessions as u32).map(|s| db.part_count(s).expect("session parts")).collect();
+        let split = parts.iter().filter(|&&p| p > 1).count();
+        let most = parts.iter().max().copied().unwrap_or(0);
         // the probe opens the store in its own process; one process at a time
         drop(db);
         let out = Command::new(&exe).args(["probe", "--store", dir.to_str().unwrap(), "--cache-mb", &a.num("cache-mb", 256).to_string()]).output().expect("run probe");
@@ -1116,7 +1157,7 @@ fn growth(a: &Args) {
         let rewritten = (acc.flushed + acc.bytes_out) as f64 / store.max(1) as f64;
         let n = |i: usize| -> f64 { f[i].parse().unwrap_or(0.0) };
         println!(
-            "{round:>5}  {:>8}  {:>8}  {:>8}  {:>7}  | {:>6.3}  {:>8}  {:>8}  {:>9} | {:>8.3} {:>5.3} | {:>8.3} {:>5.3}    | {:>7.3}  {:>9} | {:>4} ({}) {:>4} {:>5} | {:>8.2}x | {:>6.0}",
+            "{round:>5}  {:>8}  {:>8}  {:>8}  {:>7}  | {:>6.3}  {:>8}  {:>8}  {:>9} | {:>8.3} {:>5.3} | {:>8.3} {:>5.3}    | {:>7.3}  {:>9} | {:>4} ({}) {:>4} {:>5} | {:>5} ({:>2})  | {:>8.2}x | {:>6.0}",
             st.sessions,
             st.requests,
             mb(raw),
@@ -1135,10 +1176,21 @@ fn growth(a: &Args) {
             f[9],
             f[14],
             f[10],
+            split,
+            most,
             rewritten,
             round_raw as f64 / 1e6 / ingest_s
         );
     }
     let st = db.stats();
-    println!("sessions woken after their data was flushed and merged: {woken}; merges {}; bytes written by flushes {} and merges {} for a store of {}", acc.merges, mb(acc.flushed), mb(acc.bytes_out), mb(st.store_bytes()));
+    println!(
+        "sessions woken after their data was flushed and merged: {woken}; merges {}; bytes written by flushes {} and merges {} for a store of {}; sessions folded {}, segments rewritten to drop replaced parts {}, replaced parts left {}",
+        acc.merges,
+        mb(acc.flushed),
+        mb(acc.bytes_out),
+        mb(st.store_bytes()),
+        acc.folded,
+        acc.reclaims,
+        mb(st.dead_bytes)
+    );
 }

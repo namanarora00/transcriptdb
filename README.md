@@ -52,6 +52,16 @@ plus a session id, an agent id (empty for the main agent) and a request id.
    main line first over that part of its tree, into level-1 segments split by size. Merged
    segments merge again four of one size tier at a time, up to 256 MB, so each byte is rewritten
    about once per tier. Blob files are never rewritten. `Db::compact` merges every segment.
+   A session that takes writes again after its data reached full-size segments (a resumed
+   conversation, or a long one between turns) would stay in parts spread over segments that
+   never merge again. So a merge whose output reaches 256 MB, the last time that data moves,
+   *folds* a session into one part, reading its other parts from wherever they are, once it has
+   gone quiet (its newest part is in the merge and it took no writes in the last two flushes) or
+   when it would otherwise be left in more than four parts (`max_parts`). Folding there writes a
+   folded session once, at full size, instead of sending it up the size tiers again. The parts
+   a fold replaces stay in their segments and are never read: on read, a part covered by
+   another part is skipped. The manifest counts each segment's replaced parts, and a segment
+   that is half replaced parts is rewritten without them.
 9. **Recovery** (`Db::open`). Reads the manifest, deletes files it does not list (a crash during
    a flush or merge), cuts blob files back to the length the manifest gives them (a flush that
    appended and did not finish), reads each segment's and index run's catalog, replays the log
@@ -64,7 +74,8 @@ nothing per key or per block in it.
 
 - **Catalogs.** Per segment: its session id range, counts, time range, the tool and field names
   its steps use, a Bloom filter of the sessions it holds (14 bits per session part), and the
-  first session of each 64 KB directory block. Per index run: counts, offsets, its piece and
+  first session of each 64 KB directory block, plus, in the manifest, what folds replaced in
+  it (six numbers, only for segments holding such parts). Per index run: counts, offsets, its piece and
   opaque id ranges, and the first key of each fence page (one per two million keys). Per blob
   file: its length. Opening a store reads the manifest and these catalogs, nothing else: 17.8 KB
   for the 9 files of every Claude Code log on this Mac, and 67 KB at 1.4 million synthetic
@@ -277,8 +288,9 @@ at the end unless `KEEP=1`. Both it and the crash test exit non-zero on any fail
 | Rebuild check | 127,013 of 127,013 byte for byte; 157 GB rebuilt on 10 threads at 9.6 GB/s (the previous layout: 9.2–9.3 GB/s on a quiet machine, 6.1–7.5 GB/s while other work kept the load at 7–9) |
 | Rebuild one request (mean 1.24 MB), warm | median 0.40 ms, p95 1.8 ms, p99 2.6 ms |
 | 40 messages in a row / whole session | median 0.10 ms / 0.27 ms |
+| Recheck with folding (2026-11-23) | the logs have grown to 127,477 requests: all byte for byte, steps match the reference in all 1,066 sessions; ingest 1.01 GB/s through the write path; store 575.4 MB; 7 merges during ingest, none reaching 256 MB, so nothing folded; rebuild 8.7 GB/s on 10 threads (load 3.5), one request median 0.39 ms |
 | Steps | every step of 1,063 sessions; engine and reference agree on every distinct step; 0 wrong `prev`, 0 results without a call |
-| Crash test | 1,000 SIGKILLs during writes, flushes, appends to blob files and merges of segments and index runs: 11,496 acknowledged, 0 lost, 0 wrong bytes, steps all match; recovery removed 1,023 files left by interrupted flushes and merges |
+| Crash test (2026-11-23) | 1,000 SIGKILLs during writes, flushes, appends to blob files, merges of segments and index runs, folds and rewrites of half-replaced segments: 26,170 acknowledged, 0 lost, 0 wrong bytes, steps all match, request count equal to the requests listed; at least 77 folds and 2 rewrites finished between kills; recovery removed 1,108 files left by interrupted flushes and merges. (The writer now uses 128 KB segments and compacts on 3% of commits, where it used 1 MB and 50%: with those, nearly every child was killed mid-compaction and no merge reached full size, so nothing folded.) |
 | Queries vs reference (2026-11-21) | 100 generated queries, 758 real sessions up to 120 steps: engine = brute force in every session (337,573 matches); 300 on synthetic: same |
 
 ### Growth (synthetic sessions, 1x to 16x)
@@ -289,13 +301,13 @@ of sessions pause after 30 requests and take the rest a round later, after their
 and merged. After each round a fresh process opens the store, does 2,000 random request rebuilds
 (cold: the first 200; warm: the last 1,000) and one query over every step. Cache budget 256 MB.
 
-| Sessions | Requests | Store | Open | Catalogs | Memory after open | Random read, cold / warm (median) | Query over all steps | Memory after the query | Index runs | Bytes written / store | Ingest |
-|---|---|---|---|---|---|---|---|---|---|---|---|
-| 2,000 | 87 k | 112 MB | 19 ms | 6.8 KB | 2.4 MB | 0.15 / 0.07 ms | 0.03 s | 101 MB | 3 | 1.90x | 488 MB/s |
-| 4,000 | 177 k | 228 MB | 12 ms | 11.3 KB | 2.5 MB | 0.15 / 0.09 ms | 0.06 s | 163 MB | 6 | 1.91x | 479 MB/s |
-| 8,000 | 354 k | 457 MB | 9 ms | 18.9 KB | 2.5 MB | 0.22 / 0.19 ms | 0.18 s | 235 MB | 9 | 2.30x | 438 MB/s |
-| 16,000 | 708 k | 915 MB | 18 ms | 39.0 KB | 2.7 MB | 0.32 / 0.27 ms | 0.52 s | 259 MB | 14 | 2.32x | 427 MB/s |
-| 32,000 | 1.42 M | 1.83 GB | 11 ms | 67.4 KB | 2.7 MB | 0.50 / 0.36 ms | 1.03 s | 278 MB | 20 | 2.75x | 388 MB/s |
+| Sessions | Requests | Store | Open | Catalogs | Memory after open | Random read, cold / warm (median) | Query over all steps | Memory after the query | Index runs | Sessions in more than one part | Bytes written / store | Ingest |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 2,000 | 87 k | 112 MB | 19 ms | 6.8 KB | 2.4 MB | 0.15 / 0.07 ms | 0.03 s | 101 MB | 3 | 125 | 1.90x | 488 MB/s |
+| 4,000 | 177 k | 228 MB | 12 ms | 11.3 KB | 2.5 MB | 0.15 / 0.09 ms | 0.06 s | 163 MB | 6 | 297 | 1.91x | 479 MB/s |
+| 8,000 | 354 k | 457 MB | 9 ms | 18.9 KB | 2.5 MB | 0.22 / 0.19 ms | 0.18 s | 235 MB | 9 | 122 | 2.30x | 438 MB/s |
+| 16,000 | 708 k | 915 MB | 18 ms | 39.0 KB | 2.7 MB | 0.32 / 0.27 ms | 0.52 s | 259 MB | 14 | 743 | 2.32x | 427 MB/s |
+| 32,000 | 1.42 M | 1.83 GB | 11 ms | 67.4 KB | 2.7 MB | 0.50 / 0.36 ms | 1.03 s | 278 MB | 20 | 180 | 2.75x | 388 MB/s |
 
 Open time and memory after open stay flat (2.4–2.7 MB), memory with a query running stays near
 the cache budget, ingest holds, and merges wrote 2.75 bytes for every byte stored (flushes
@@ -312,6 +324,32 @@ Read times move with whatever else the machine is doing (this run had a load of 
 work): the old and new layouts run back to back on the first three rounds gave warm medians of
 0.057 / 0.074 / 0.140 ms (old) and 0.056 / 0.059 / 0.091 ms (new). The query reads every session,
 so it grows with the data.
+
+**Folding (2026-11-23).** The table is from 2026-11-22; rerun with folding on, it gives the same
+sizes, merges and bytes written, because at 256 MB segments this 1.83 GB store has only one or two
+merges that reach full size and no session folds by the end. The sessions in more than one part are
+the ones that woke in the latest rounds; their new parts have not reached a full-size merge yet. The
+same run with 64 MB segments (`--seg-mb 64`) is in the state a store a few times bigger would be
+in at 256 MB:
+
+| 64 MB segments, 32,000 sessions | Folding off (`--max-parts 0`) | Folding on (default) |
+|---|---|---|
+| Sessions folded into one part | 0 | 401 |
+| Sessions in more than one part at the end | 593 | 180 |
+| Bytes written by merges | 2,645 MB | 2,667 MB (+0.8%) |
+| Replaced parts left in segments | 0 | 6.6 MB (0.4% of the store) |
+| Segments rewritten to drop them | 0 | 0 (none was close to half replaced) |
+
+The 180 left in two parts with folding on are again sessions that woke in the last round, waiting
+for their newest part to reach a full-size merge: folding waits on purpose, so a session still
+taking writes is not rewritten over and over. Read times in the two runs are within the machine's
+noise (warm medians at 32,000 sessions 0.34 and 0.37 ms, load 3–5). The worst case is the unit
+test's tiny setup (96 KB segments, where nearly every merge reaches full size and sessions go quiet
+after one flush): folding raised merge writes by 70% (10.8 to 18.3 MB), and sessions woken five
+times ended in one part instead of five or six. Two costs remain: a replaced part still costs its
+session a directory lookup on read (not a block read) until its segment is rewritten, and a session
+whose newest part lands in a full-size merge while it is still taking writes (possible when a merge
+of fresh data reaches full size) is not folded as quiet, so it keeps up to four parts.
 
 Against the Python proof of concept (48-session sample): size per byte of distinct text 0.50 vs
 0.51; rebuild median 0.41 vs 0.85 ms; replay 0.29 vs 0.41 ms. The proof of concept's
@@ -348,8 +386,9 @@ tdb h2h           --store DIR [--pg 127.0.0.1:5455] [--no-load x] [--reps 5] [--
 ## On disk
 
 ```
-MANIFEST              live segments, index runs (in id order) and blob files (with the length each
-                      is durable at), id counters, checkpoint, first live log (crc32c)
+MANIFEST              live segments (with what folds replaced in each), index runs (in id order)
+                      and blob files (with the length each is durable at), id counters,
+                      checkpoint, first live log (crc32c)
 wal-NNNNNN.log        [len][crc32c][record]...
 seg-NNNNNN.tdb        frames per session part | blocks: groups of parts (messages + requests,
                       steps) | session directory in 64 KB blocks, each entry saying where its
@@ -367,10 +406,8 @@ LOCK                  held with flock while a process has the store open
    search with an index so substring tests stop scanning every distinct value.
 2. Queries that skip whole segments from their catalogs (time range, tool names) before reading
    any session.
-3. Sessions that woke up keep extra parts until a merge reaches their segments; segments at the
-   size cap are never merged again, so a periodic pass should fold those parts back.
-4. Merges run inside the flush that triggers them; a background thread would keep writes going
+3. Merges run inside the flush that triggers them; a background thread would keep writes going
    while a big merge runs (index merges are capped at 1 GB and segment merges at 256 MB).
-5. A bigger head-to-head on the full logs, and a multi-terabyte run on an external disk (the
+4. A bigger head-to-head on the full logs, and a multi-terabyte run on an external disk (the
    index's filters are about 1.8 bytes per key and are read through the cache, so at that size
    ingest speed depends on how much of them the cache holds).
