@@ -455,7 +455,7 @@ fn stats(a: &Args) {
     println!("  message frames {}  ({:.2}x smaller than the {} they hold)", mb(st.frame_bytes), st.node_bytes as f64 / st.frame_bytes.max(1) as f64, mb(st.node_bytes));
     println!("  opaque values {} raw ({} values kept, {} not kept)", mb(st.opaque_bytes), st.opaques - st.opaques_dropped, st.opaques_dropped);
     println!("  shared pieces {} compressed from {} ({} pieces: skeletons, system, tools, markers)", mb(st.piece_bytes), mb(st.piece_raw_bytes), st.pieces);
-    println!("  segment blocks, directories and catalogs {}; index runs {}", mb(st.index_bytes), mb(st.index_file_bytes));
+    println!("  segment blocks, directories and catalogs {} (of which step summaries {}); index runs {}", mb(st.index_bytes), mb(st.summary_bytes), mb(st.index_file_bytes));
     let mut sizes: Vec<u64> = db.segments().iter().map(|s| s.4).collect();
     sizes.sort_unstable();
     println!("  segments: {} from flushes, {} merged; sizes median {}, largest {}", st.level0, st.segments - st.level0, mb(sizes.get(sizes.len() / 2).copied().unwrap_or(0)), mb(sizes.last().copied().unwrap_or(0)));
@@ -642,7 +642,8 @@ fn head_to_head(a: &Args) {
         all_same &= o.same;
         let ratio = o.pg_ms / o.engine_ms.max(1e-6);
         let sp = if ratio >= 10.0 { format!("{ratio:.0}x") } else { format!("{ratio:.1}x") };
-        println!("  {:<48} {:>6} {:>9.2} ms {:>6.2} ms {:>9.2} ms {:>9}  {}", o.name, if o.same { "yes" } else { "NO" }, o.engine_ms, o.engine_ms_par, o.pg_ms, sp, o.detail);
+        let ms = |x: f64| if x < 1.0 { format!("{x:.3}") } else { format!("{x:.2}") };
+        println!("  {:<48} {:>6} {:>9} ms {:>6} ms {:>9} ms {:>9}  {}", o.name, if o.same { "yes" } else { "NO" }, ms(o.engine_ms), ms(o.engine_ms_par), ms(o.pg_ms), sp, o.detail);
     }
     let reads = h2h::run_reads(&db, &mut pg, a.num("reads", 200) as usize, a.num("seed", 5)).expect("reads");
     println!("\n== reads (median / p95 ms per item; PostgreSQL over loopback TCP)");
@@ -666,8 +667,9 @@ fn check_queries(a: &Args) {
     let t = Instant::now();
     let (mut total, mut failed, mut with_matches) = (0usize, 0usize, 0usize);
     let checked_sessions = (0..db.session_count() as u32).filter(|&s| db.steps(s).rows.len() <= max_steps).count();
-    for _ in 0..n {
-        let q = reference::random_query(&db, &mut r);
+    let neq = a.num("eq", 150);
+    for k in 0..n + neq {
+        let q = if k < n { reference::random_query(&db, &mut r) } else { reference::random_eq_query(&db, &mut r) };
         match reference::compare(&db, &q, max_steps) {
             Ok((m, bad)) => {
                 total += m;
@@ -686,11 +688,35 @@ fn check_queries(a: &Args) {
         }
     }
     println!(
-        "{n} generated queries over {checked_sessions} sessions (of {}; sessions over {max_steps} steps left out): {failed} differ; {with_matches} queries had matches, {total} matches in all; {:.1}s",
+        "{n} generated patterns and {neq} with a compared field over {checked_sessions} sessions (of {}; sessions over {max_steps} steps left out): {failed} differ; {with_matches} queries had matches, {total} matches in all; {:.1}s",
         db.session_count(),
         t.elapsed().as_secs_f64()
     );
-    if failed > 0 {
+    // aggregations: from the summaries, by scanning steps, and by brute force from the messages
+    let t = Instant::now();
+    let na = a.num("agg", 300);
+    let raw = reference::raw_store(&db).expect("read every step from its messages");
+    let (mut used, mut agg_failed) = (0usize, 0usize);
+    for _ in 0..na {
+        let q = reference::random_summarize(&db, &mut r);
+        match reference::compare_summarize(&db, &raw, &q) {
+            Ok((u, same)) => {
+                used += u as usize;
+                if !same {
+                    agg_failed += 1;
+                    if agg_failed <= 10 {
+                        println!("DIFF: {q}");
+                    }
+                }
+            }
+            Err(e) => {
+                agg_failed += 1;
+                println!("ERROR {e}: {q}");
+            }
+        }
+    }
+    println!("{na} generated aggregations over all {} sessions: {agg_failed} differ; {used} answered from step summaries; {:.1}s", db.session_count(), t.elapsed().as_secs_f64());
+    if failed > 0 || agg_failed > 0 {
         std::process::exit(1);
     }
 }
@@ -708,6 +734,7 @@ fn query(a: &Args) {
     let db = Db::open(a.store(), a.opts()).expect("open store");
     let open_s = t0.elapsed().as_secs_f64();
     let reps = a.num("repeat", 1).max(1);
+    transcriptdb::query::exec::set_summaries(a.get("summaries") != Some("off"));
     let mut best = f64::MAX;
     let mut run = None;
     for _ in 0..reps {
@@ -729,7 +756,7 @@ fn query(a: &Args) {
     print_table(&heads, &cells);
     let st = &r.stats;
     println!(
-        "\n{} rows{}  |  {:.2} ms (best of {reps}): plan {:.2}, scan {:.2}, rest {:.2}  |  {} sessions, {} skipped, {} steps scanned, {} matches  |  store opened in {:.1}s",
+        "\n{} rows{}  |  {:.3} ms (best of {reps}): plan {:.3}, scan {:.3}, rest {:.3}  |  {} sessions, {} skipped, {} steps scanned, {} matches{}  |  store opened in {:.1}s",
         r.table.rows.len(),
         if r.table.rows.len() > limit { format!(" (showing {limit})") } else { String::new() },
         best,
@@ -740,6 +767,7 @@ fn query(a: &Args) {
         st.sessions_skipped,
         st.steps_scanned,
         st.matches,
+        if st.summarized { format!(", step summaries of {} segment(s)", st.summary_segments) } else { String::new() },
         open_s
     );
 }
@@ -750,13 +778,15 @@ fn synth_store(a: &Args) {
     let seed = a.num("seed", 1);
     let mut n = 0;
     for s in 0..a.num("sessions", 20) {
-        for q in synth::session(seed, s, a.num("per", 40) as usize) {
+        for q in synth::session_with(seed, s, a.num("per", 40) as usize, a.get("rich").is_some()) {
             db.put(&Put { session: &q.session, agent: &q.agent, id: &q.id, time: &q.time, meta: b"", body: &q.body, digest: None }).expect("put");
             n += 1;
         }
         db.commit().expect("commit");
     }
-    db.flush().expect("flush");
+    if a.get("no-flush").is_none() {
+        db.flush().expect("flush");
+    }
     println!("{n} synthetic requests in {} sessions", db.session_count());
 }
 

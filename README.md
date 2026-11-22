@@ -84,7 +84,8 @@ nothing per key or per block in it.
   stay in memory while it takes writes, and leave two flushes after its last write. A session
   that wakes up later is read back from its parts.
 - **Unflushed data** (up to 64 MB), and **caches with fixed budgets** (256 MB in all by default)
-  for sessions, steps, segment blocks, directory blocks, index blocks and pieces.
+  for sessions, steps (with each session's turn tree and steps by shape code), segment blocks,
+  directory blocks, index blocks, pieces and decoded step-summary blocks (1/12 of the budget).
 
 A session is a self-contained unit: its messages, requests and steps (with its own dictionary of
 input values; tool and field names are shared) live in its parts and are read on demand. A
@@ -160,16 +161,129 @@ where time > ago(30d)
 
 How a query runs: leading `where` stages and each element's test are compiled against the
 dictionaries (a test over one column is evaluated once per distinct value; tests on tool and
-outcome become a table over the 256 shape codes); sessions lacking a tool an element needs are
-skipped; the matcher makes one pass per session over its turn tree, in parallel across sessions;
-later stages work on the matched rows. Errors point at the query with a caret; unknown columns
-and mismatched types are refused before running.
+outcome become a table over the 256 shape codes, and an element's whole bit mask comes from one
+lookup by shape code when tool and outcome decide every test); sessions lacking a tool an element
+needs are skipped; the matcher makes one pass per session over its turn tree, in parallel across
+sessions (on one thread it runs on the caller's thread); later stages work on the matched rows.
+Errors point at the query with a caret; unknown columns and mismatched types are refused before
+running. A session's turn tree and its steps grouped by shape code are worked out when its steps
+are read and kept with them in the step cache (counted in its budget); a session taking writes
+drops them when a step is added. Queries whose tests read no input values (tool, outcome,
+session, time and size tests, compared fields) take sessions' steps from a second cache that
+holds them without their values (about 13 KB per session on the real logs, against 80 KB with
+them): on all the logs the steps with their values are 88 MB, more than the step cache's share
+of the default budget, and every pattern query used to read every session again.
 
-`tdb check-queries` generates random patterns from the store's own tools and compares the engine
-with `src/query/reference.rs`, a brute-force evaluator that reads tools, inputs and outcomes from
-the stored messages, lists every root-to-leaf path of each session's turn tree and tries every
-binding. Planted bugs in the matcher (exclusions ignored, `next` treated as `then`, repeats
-allowed to skip turns) each make it fail.
+**Compared fields.** When every element of a pattern is compared (`a.file_path == b.file_path`),
+only steps with the value can bind, so for each value the matcher visits just the turns holding
+it, in tree order, and carries partial matches from one visited turn to the next one below it as
+waiting through each turn between would: repeats must be done, the next element must allow any
+later turn (not `next`), the `within` window must still be open at the last turn between, and no
+exclusion the match is inside may hit there (counted per turn along each root path). Values are
+found by dictionary code in an array, long values by text. With some elements not compared, each
+value runs the full pass as before.
+
+**Grouping by an input field** (`by file_path`, `dcount(command)`) groups by the decoded value:
+`"a\/b"` with `"a/b"`, `1.0` with `1`, and `null` with steps that lack the field (`dcount` does
+not count it). Until now the columnar path grouped by the raw JSON text, so a field holding `null`
+made a second empty group; the brute-force check below found it.
+
+### Step summaries
+
+`src/stats.rs`, `src/query/summary.rs`. Each segment keeps summaries of the steps of its parts,
+written with it (at a flush, or rebuilt by the merge that writes it) and never changed, so
+recovery needs nothing beyond what it already does:
+
+- **Part table**: per part, one row per (tool, outcome, UTC day): steps, sum, minimum and maximum
+  of result sizes, earliest and latest time.
+- **Field tables**: per input field. A field whose distinct values average under 256 bytes
+  (paths, patterns, flags) keeps the segment's distinct values once each, in 64 KB blocks, and one
+  row per (value, part, tool, outcome, day) with steps and summed result sizes; values with the
+  same decoded value point at one group. A field of long text (commands, file contents, prompts;
+  distinct values averaging 256 bytes or more) keeps no copy of its values: its table lists the
+  steps that have it, each with where its value's text sits in the part's encoded step data, so
+  reading it is a slice of a (cached) segment block. Values over 4 KB are listed by step either
+  way and read from the message, as a scan reads them. Parts where a step gives a field twice are
+  marked, and queries on that field read those parts from their steps.
+- **Word index**: per field, the words of every string value (lower-cased runs of ASCII letters
+  and digits and non-ASCII characters, 3 bytes or more), sorted, each with the values or listed
+  steps that hold it. A `contains`, `has`, `startswith`, `endswith`, `==` or `in` test with a
+  literal splits the pattern into words: a word inside the pattern must be a whole word of the
+  value, the first may end one, the last may start one, a lone word may sit anywhere inside one
+  (found with one substring search over the whole word list). Only values holding words that fit
+  every such word are tested; values that are not strings are always tested. Case-sensitive tests
+  use the index only for ASCII patterns, where case folding is per character.
+
+`where ... | summarize ... by ...` is answered from these when every part of it can be: `where`
+tests on tool, outcome, session, agent and at most one input field; keys tool, outcome, session,
+agent, that field and `bin(time, N)` for a whole number of days; aggregates `count`, `countif`
+(the same kinds of tests), `sum`/`avg` of `out_bytes`, `min`/`max` of `out_bytes` and `time`
+(without a field), `dcount` of tool, session, agent or the field; and the stages after it must not
+depend on the order of its rows (a `sort` or `top` on every key, or `count`): the scan returns
+groups in first-seen order, the summaries in another. Tool and outcome tests are folded into a
+leftover test per tool, so rows of tools that cannot pass are never looked at; field tests are
+worked out once per distinct value; steps without the field are the part table less the field
+table. A following `sort ... | take n` or `top n` picks its rows on the group counters (first
+finding the n-th best value of an integer first key) before any row is made. Steps no summary
+covers are read from their sessions as before: steps not flushed yet, parts in segments written
+before summaries existed, and parts in a segment that a fold replaced (each segment holding such
+parts works out once per manifest version which of its parts are live). Anything else (a `time`
+test, `bin(time, 1h)`, two input fields, `sum(step)`) runs the scan.
+
+Strings tests on a value's raw JSON text (`contains`, case-insensitive or not) now decide without
+decoding whenever that gives the decoded answer: the pattern is ASCII with no character an escape
+stands for (quote, backslash, control characters, and `/` when the text has `\/`), the text has
+no `\u` escapes, and an occurrence counts only if it does not start right after an odd run of
+backslashes; case-insensitive tests also need the text free of U+0130 and U+212A, the only two
+characters whose lower case is ASCII (checked over every code point). Before, any text with an
+escape or a non-ASCII character was decoded and lower-cased; and a pattern with `/` could miss a
+value written with `\/`.
+
+What the summaries cost (2026-11-23): 1.6 MB on the 200-file sample's store
+(124.8 MB in all; postings 0.73 MB, words 0.34, rows and listed steps 0.24, values 0.25, part
+tables 0.04), which main stored in 123.1 MB the same day: +1.2%. On every log: 8.1 MB of 585.5 MB
+(1.4%). Ingest: the build before this branch and this one, run back to back on the same 200 files
+(load 5–7), went through the write path at 769–817 MB/s and 870–875 MB/s, so no cost shows above
+the noise; flushes write 1.3% more bytes; compacting that store takes about 0.3 s more (1.0 s
+against 0.6–0.8 s), for splitting values into words and finding equal values at every flush and
+merge. Memory: decoded summary blocks share 1/12 of the cache budget; steps without values 1/12
+(taken from the step cache, now 1/6).
+
+### Checks
+
+`tdb check-queries` compares the engine with `src/query/reference.rs`, brute-force evaluators that
+read tools, inputs and outcomes from the stored messages (no dictionaries, shape codes, summaries
+or skipping):
+
+- generated patterns over the store's own tools: every root-to-leaf path of each session's turn
+  tree, every binding (`--n`, default 300);
+- generated two-element patterns on a compared field, often with `next`, repeats, `within` and an
+  exclusion: the sparse matcher's cases (`--eq`, default 150);
+- generated `where ... | summarize ...` queries mixing tests the summaries answer with ones they
+  do not (`time`, `out_bytes`, `strlen`, `matches`, `step`), keys including `file_path`, `command`
+  and `bin(time, 1h)`, sorted, some with `take` or `top` (`--agg`, default 300). Each runs three
+  ways (summaries, step scan, brute force evaluating every `where`, key and aggregate on every
+  step) and all three must agree to the printed cell.
+
+`tdb synth --rich x` makes synthetic sessions whose tool inputs exercise all of this: values over
+4 KB, JSON escapes (`\"`, `\\`, `\/`, `\n`, `\t`), `\u` escapes, non-ASCII text including U+0130 and
+U+212A, `null`s, numbers, arrays and a key given twice. `tests/query.rs` runs the checks on such
+stores split over several segments with steps not yet flushed, after `compact`, on a store where
+folds left replaced parts in older segments, and on sessions taking writes between queries.
+
+`scripts/planted-bugs.sh` plants one bug at a time in a copy of the source and requires the
+checks to fail. All 15 are caught: in the summaries, a day off by one in the part table, `countif`
+ignoring the outcome, field rows counted as one step each, a word prefix taken as the whole word,
+values that are not strings left untested, steps without the field left out, long values left
+out, parts that folds replaced counted, steps not flushed yet left out, the `take n` cut one value
+too tight, values grouped by their text; in the matcher, exclusions ignored across skipped turns,
+turn trees kept after a step is added, and wrong bits in the per-shape masks; and in the raw-text
+test, a hit right after an escaping backslash counted. (A 16th, the `within` window not tested
+across skipped turns, was caught by nothing because it is not a bug: a match past its window
+there is past it at the visited turn too, which tests it; the redundant test was dropped.)
+Earlier, planted bugs in the matcher
+(exclusions ignored, `next` treated as `then`, repeats allowed to skip turns) each made the
+pattern check fail.
 
 ## Head-to-head against PostgreSQL
 
@@ -188,61 +302,124 @@ parallel workers, JIT off, C collation. PostgreSQL is reached over loopback TCP,
 pays a client round trip (about 0.1 ms) that the in-process engine does not; that matters for the
 sub-millisecond rows below.
 
-Measured 2026-11-22 (on the layout with the index and appended blob files) on 200 log files: 146
-sessions, 18,533 requests, 21,477 steps, 133 MB of distinct message text (the logs grew since the
-2026-11-21 run, so the 200 files sampled differ). Every answer matched (16 of 16 queries, 746 of 746
-reads). Each query best of 7. The samples differ, so this is not a like-for-like comparison with the
-2026-11-21 run on the previous layout (156 sessions, 15,663 requests); most one-thread times are within
-10% of it, the largest change being most edited files (0.54 against 0.37 ms).
+Measured 2026-11-23 on 200 log files: 156 sessions, 20,220 requests, 26,246 steps, 204.7 MB of
+distinct message text. Every answer matched (16 of 16 queries, 756 of 756 reads). Each query best
+of 7. The machine was at load 15–19 from other work during this run (PostgreSQL's times were about
+1.4x lower at load 3, and the ratios held: a run at load 3 a few minutes earlier, before the last
+change to `git commit`, gave 26x for most edited files and 29x for `git commit`). "Before" is this
+branch's starting point (main at d2067f6) on the same sample earlier the same day, at load 3.4
+(the logs grew by 153 steps between the runs).
 
 | | TranscriptDB | PostgreSQL |
 |---|---|---|
-| Disk (tables, indexes, TOAST) | 67.5 MB | 168.4 MB (2.49x) |
+| Disk (tables, indexes, TOAST) | 124.8 MB, of which step summaries 1.6 MB | 250.1 MB (2.00x) |
 
-| Query | TDB, 1 thread | TDB, 8 threads | PostgreSQL | PG / TDB (1 thread) |
-|---|---|---|---|---|
-| Bash, then Edit, then Bash; no Read between | 0.67 ms | 0.22 ms | 197 ms | 293x |
-| Bash fails, only test files edited, Bash passes | 0.75 ms | 0.29 ms | 398 ms | 528x |
-| 3 Read/Grep turns in a row, then Edit | 0.20 ms | 0.13 ms | 13.0 ms | 64x |
-| Bash fails, then passes the next turn | 0.42 ms | 0.19 ms | 11.6 ms | 27x |
-| Edit, then Bash within 3 turns | 0.26 ms | 0.13 ms | 8.8 ms | 34x |
-| Write a file, later Read the same file | 0.37 ms | 0.38 ms | 1.82 ms | 4.9x |
-| 3 failing turns in a row | 0.37 ms | 0.17 ms | 11.3 ms | 31x |
-| WebSearch, then WebFetch the next turn | 0.07 ms | 0.08 ms | 10.9 ms | 161x |
-| Steps per tool, top 10 | 0.23 ms | 0.26 ms | 0.80 ms | 3.5x |
-| Failure rate per tool | 0.26 ms | 0.30 ms | 1.85 ms | 7.1x |
-| Bash steps and failures per week | 0.29 ms | 0.33 ms | 1.75 ms | 6.0x |
-| Sessions with the most failed steps | 0.10 ms | 0.11 ms | 0.99 ms | 10x |
-| Most edited files | 0.54 ms | 0.53 ms | 0.70 ms | 1.3x |
-| Average output size per tool | 0.25 ms | 0.28 ms | 1.96 ms | 7.9x |
-| Sessions using browser tools, per day | 0.07 ms | 0.10 ms | 2.52 ms | 36x |
-| Commands running `git commit` | 14.2 ms | 3.3 ms | 18.9 ms | 1.3x |
+| Query | TDB before, 1 thread | TDB, 1 thread | TDB, 8 threads | PostgreSQL | PG / TDB (1 thread) |
+|---|---|---|---|---|---|
+| Bash, then Edit, then Bash; no Read between | 0.83 ms | 0.901 ms | 0.430 ms | 665 ms | 738x |
+| Bash fails, only test files edited, Bash passes | 0.78 ms | 0.970 ms | 0.654 ms | 839 ms | 865x |
+| 3 Read/Grep turns in a row, then Edit | 0.27 ms | 0.235 ms | 0.174 ms | 28.5 ms | 121x |
+| Bash fails, then passes the next turn | 0.48 ms | 0.480 ms | 0.255 ms | 25.8 ms | 54x |
+| Edit, then Bash within 3 turns | 0.33 ms | 0.267 ms | 0.181 ms | 17.7 ms | 66x |
+| Write a file, later Read the same file | 1.45 ms | 0.067 ms | 0.116 ms | 3.22 ms | 48x |
+| 3 failing turns in a row | 0.42 ms | 0.409 ms | 0.199 ms | 22.1 ms | 54x |
+| WebSearch, then WebFetch the next turn | 0.10 ms | 0.058 ms | 0.087 ms | 22.1 ms | 380x |
+| Steps per tool, top 10 | 0.27 ms | 0.013 ms | 0.013 ms | 0.904 ms | 70x |
+| Failure rate per tool | 0.32 ms | 0.025 ms | 0.025 ms | 2.19 ms | 86x |
+| Bash steps and failures per week | 0.36 ms | 0.013 ms | 0.013 ms | 1.95 ms | 151x |
+| Sessions with the most failed steps | 0.10 ms | 0.013 ms | 0.013 ms | 1.18 ms | 90x |
+| Most edited files | 0.49 ms | 0.023 ms | 0.023 ms | 0.602 ms | 26x |
+| Average output size per tool | 0.30 ms | 0.020 ms | 0.019 ms | 2.34 ms | 118x |
+| Sessions using browser tools, per day | 0.14 ms | 0.020 ms | 0.020 ms | 3.56 ms | 179x |
+| Commands running `git commit` | 18.6 ms | 0.224 ms | 0.219 ms | 23.5 ms | 105x |
 
 | Read (median / p95 per item) | TranscriptDB | PostgreSQL |
 |---|---|---|
-| A request's messages in order | 0.46 / 1.5 ms | 1.31 / 3.9 ms |
-| 20 steps with their call and result messages | 0.10 / 0.23 ms | 0.42 / 1.4 ms |
-| A whole session's messages | 0.31 / 1.8 ms | 0.92 / 8.5 ms |
+| A request's messages in order | 0.53 / 6.5 ms | 3.14 / 15.6 ms |
+| 20 steps with their call and result messages | 0.11 / 0.25 ms | 0.57 / 3.4 ms |
+| A whole session's messages | 0.31 / 1.7 ms | 1.11 / 8.6 ms |
 
-Every query is faster on one thread, so the design's bar ("each query faster") is met on this
-sample; the closest are `git commit` and most edited files (1.3x each). The first run of the
-comparison (before the fixes below) lost three: `command contains ...` over long commands (278 ms
-against 17), the same-file pattern (7.3 ms against 1.7) and most edited files (0.72 against 0.46).
-What changed:
+Every query is at least 20x faster than PostgreSQL on one thread on this sample. The closest is
+most edited files (26x): its 970 groups are counted in an array from the `file_path` field table,
+and about half of the 23 µs left is parsing (about 3 µs), planning (about 4) and building the 10
+rows. The pattern queries that were already far ahead move with the machine's load (two runs a few
+minutes apart at load 4 gave 0.67 and 0.75 ms for the first); their work is unchanged except that a
+step's tests are one table lookup by shape code, one-thread runs no longer start a thread, and
+sessions' steps come from the cache without values. `PG / TDB` uses unrounded times.
 
-- long input values (over 4 KB) keep their byte position in the call's stored message, so a test
-  reads just those bytes (a frame or two) instead of rebuilding and parsing the whole message;
-  values up to 4 KB (98% of shell commands) are dictionary-coded, with a hash-keyed index;
-- a test over one input field is worked out per distinct value the first time a step reaches it;
-  `contains` with a plain ASCII pattern runs on the raw JSON text and decodes only on a hit
-  (a raw miss is a real miss when there are no `\u` escapes);
-- `isnull`/`isnotnull` test presence without looking at values;
-- `summarize` over step columns groups on dictionary codes (a dense array for one key), with flat
-  accumulators; `top` and `sort | take` select the rows they keep instead of sorting all;
-- a compared field (`a.file_path == b.file_path`) skips values that an element never has, and each
-  scan starts at the first step that can begin a match;
-- reads cache decompressed frames per thread and fetch a request's opaque values (signatures,
-  images) with a few large reads instead of one each.
+**All the logs.** The same comparison on every Claude Code log on this Mac (2026-11-23): 1,068
+sessions, 127,902 requests, 148,265 steps, 1,059 MB of distinct message text; PostgreSQL 1,280.1 MB
+on disk, TranscriptDB 585.5 MB (2.19x), of which step summaries 8.1 MB. Every answer matched (16 of
+16, 900 of 900 reads). Best of 7, load 14 falling to 9. The last column is the first full run of
+this branch, before steps without values were cached apart and before listed values were read from
+their step blocks.
+
+| Query | TDB, 1 thread | TDB, 8 threads | PostgreSQL | PG / TDB (1 thread) | first full run, TDB 1 thread |
+|---|---|---|---|---|---|
+| Bash, then Edit, then Bash; no Read between | 3.88 ms | 0.968 ms | 1,831 ms | 472x | 121 ms |
+| Bash fails, only test files edited, Bash passes | 90.7 ms | 28.0 ms | 3,419 ms | 38x | 128 ms |
+| 3 Read/Grep turns in a row, then Edit | 1.14 ms | 0.662 ms | 146 ms | 128x | 85.8 ms |
+| Bash fails, then passes the next turn | 2.41 ms | 0.976 ms | 128 ms | 53x | 86.4 ms |
+| Edit, then Bash within 3 turns | 1.46 ms | 0.700 ms | 85.1 ms | 58x | 86.4 ms |
+| Write a file, later Read the same file | 0.406 ms | 0.598 ms | 15.0 ms | 37x | 94.4 ms (0.2x) |
+| 3 failing turns in a row | 2.28 ms | 0.949 ms | 125 ms | 55x | 107 ms |
+| WebSearch, then WebFetch the next turn | 0.326 ms | 0.503 ms | 126 ms | 385x | 127 ms |
+| Steps per tool, top 10 | 0.037 ms | 0.037 ms | 4.78 ms | 131x | 0.04 ms |
+| Failure rate per tool | 0.075 ms | 0.074 ms | 9.11 ms | 121x | 0.09 ms |
+| Bash steps and failures per week | 0.055 ms | 0.054 ms | 16.3 ms | 298x | 0.06 ms |
+| Sessions with the most failed steps | 0.050 ms | 0.050 ms | 11.2 ms | 222x | 0.06 ms |
+| Most edited files | 0.109 ms | 0.107 ms | 4.43 ms | 41x | 0.12 ms |
+| Average output size per tool | 0.056 ms | 0.055 ms | 9.06 ms | 161x | 0.06 ms |
+| Sessions using browser tools, per day | 0.055 ms | 0.055 ms | 21.8 ms | 399x | 0.07 ms |
+| Commands running `git commit` | 29.1 ms | 29.1 ms | 49.5 ms | 1.7x | 72.5 ms |
+
+| Read (median / p95 per item) | TranscriptDB | PostgreSQL |
+|---|---|---|
+| A request's messages in order | 1.04 / 3.3 ms | 5.12 / 18.3 ms |
+| 20 steps with their call and result messages | 0.46 / 1.1 ms | 2.01 / 4.2 ms |
+| A whole session's messages | 0.69 / 2.5 ms | 2.76 / 9.4 ms |
+
+At this size the cache budget decides. All sessions' steps with their values take 88 MB (74 MB of it
+input values), more than the step cache's share of the 256 MB default: in the first full run every
+pattern query read every session again (0 hits), 85–128 ms whatever the pattern, and the same-file
+pattern lost to PostgreSQL. Patterns now take steps without values (13 KB a session, 14 MB for all),
+which stay cached. Two queries still read values and so still miss:
+
+- **`git commit` (1.7x):** its candidates (steps whose commands hold a word ending in `git` and one
+  starting with `commit`) are confirmed on their text, read from their parts' step blocks. A large
+  session's block is several MB, the blocks needed take more than the summaries' 22 MB cache, and
+  each run decompresses about 300 of them; on the 200-file sample they stay cached (105x). Keeping
+  a copy of long field values in the summaries (about 2% more storage on these logs; the first
+  design here did that) or step blocks of bounded size would remove this.
+- **Bash fails, only test files edited (38x):** `file_path contains "test"` needs the sessions'
+  values; it stays far ahead because PostgreSQL's window query over 233,389 path rows takes 3.4 s.
+
+What changed for the eight that were under 20x:
+
+- **Aggregations** read the segments' step summaries instead of every step (see Step summaries):
+  per tool, outcome and day for counts, failures, result sizes and sessions; the `file_path` field
+  table for most edited files (only rows of the four edit tools are read); the word index for
+  `command contains "git commit"` (only commands holding a word that ends in `git` and one that
+  starts with `commit` are confirmed on their text, without decoding). Most edited files, the tightest, also
+  picks its 10 rows on the counters before making them, finding the 10th-best count first.
+- **Write a file, later Read the same file** (a compared field) visits for each path only the turns
+  that hold it, with each session's turn tree and steps by shape code kept in the step cache, and
+  values found by dictionary code.
+- **Every query** costs less to start: one-thread queries run on the caller's thread instead of a
+  scoped thread, and tests of `tool` against literals are worked out on the names without building
+  a value per tool (an empty query, `where tool == "nothing" | count`, went from 42 to 19 µs on
+  average).
+
+What the summaries cost: 1.6 MB of this store (+1.2%), no measurable ingest cost, about 0.3 s more
+to compact it (see Step summaries).
+
+Earlier fixes (2026-11-21/22), from the first run of this comparison, which lost three queries:
+long input values keep their place in the message so a test reads only those bytes; values up to
+4 KB are dictionary-coded with a hash-keyed index; a test over one field is worked out once per
+distinct value; `isnull`/`isnotnull` test presence only; `summarize` groups on dictionary codes;
+`top` and `sort | take` select instead of sorting all; compared fields skip values an element never
+has; reads cache frames per thread and fetch a request's opaque values with a few large reads.
+
 
 ## Reading Claude Code's logs
 
@@ -268,6 +445,7 @@ scripts/test.sh            # unit + end-to-end tests on synthetic sessions
 scripts/check-rebuild.sh   # ingest every local log, merge, rebuild every request, sizes, read times
 scripts/crash-test.sh 1000 # SIGKILL the writer 1000 times at random moments
 scripts/h2h.sh             # head-to-head against PostgreSQL (needs postgresql@18)
+scripts/planted-bugs.sh    # plant each query bug in a copy of the source; the checks must fail
 tdb growth --store DIR     # grow a synthetic store 1x..16x; open time, memory, reads, rewrites per round
 ```
 
@@ -290,8 +468,9 @@ at the end unless `KEEP=1`. Both it and the crash test exit non-zero on any fail
 | 40 messages in a row / whole session | median 0.10 ms / 0.27 ms |
 | Recheck with folding (2026-11-23) | the logs have grown to 127,477 requests: all byte for byte, steps match the reference in all 1,066 sessions; ingest 1.01 GB/s through the write path; store 575.4 MB; 7 merges during ingest, none reaching 256 MB, so nothing folded; rebuild 8.7 GB/s on 10 threads (load 3.5), one request median 0.39 ms |
 | Steps | every step of 1,063 sessions; engine and reference agree on every distinct step; 0 wrong `prev`, 0 results without a call |
-| Crash test (2026-11-23) | 1,000 SIGKILLs during writes, flushes, appends to blob files, merges of segments and index runs, folds and rewrites of half-replaced segments: 26,170 acknowledged, 0 lost, 0 wrong bytes, steps all match, request count equal to the requests listed; at least 77 folds and 2 rewrites finished between kills; recovery removed 1,108 files left by interrupted flushes and merges. (The writer now uses 128 KB segments and compacts on 3% of commits, where it used 1 MB and 50%: with those, nearly every child was killed mid-compaction and no merge reached full size, so nothing folded.) |
+| Crash test (2026-11-23) | 1,000 SIGKILLs during writes, flushes, appends to blob files, merges of segments and index runs, folds and rewrites of half-replaced segments: 26,170 acknowledged, 0 lost, 0 wrong bytes, steps all match, request count equal to the requests listed; at least 77 folds and 2 rewrites finished between kills; recovery removed 1,108 files left by interrupted flushes and merges. (The writer now uses 128 KB segments and compacts on 3% of commits, where it used 1 MB and 50%: with those, nearly every child was killed mid-compaction and no merge reached full size, so nothing folded.) Rerun with step summaries written at every flush and merge: 1,000 SIGKILLs, 21,827 acknowledged, 0 lost, 0 wrong bytes, steps all match, at least 48 folds and 1 rewrite. |
 | Queries vs reference (2026-11-21) | 100 generated queries, 758 real sessions up to 120 steps: engine = brute force in every session (337,573 matches); 300 on synthetic: same |
+| Queries vs reference (2026-11-23) | on the 200-file sample: 100 generated patterns and 100 on a compared field, 146 sessions up to 400 steps, 0 differ (112,035 matches); 300 and then 200 generated aggregations three ways (summaries, scan, brute force) on all 156 sessions, 0 differ (123 and 93 answered from summaries); on rich synthetic stores (split over segments, with steps not flushed, after `compact`, with a 1–2 MB cache): 0 differ in 400 compared-field patterns and 400 aggregations each |
 
 ### Growth (synthetic sessions, 1x to 16x)
 
@@ -377,9 +556,9 @@ tdb crash-test    --store DIR [--kills 1000] [--sync full|fsync|os]
 tdb check-steps   --store DIR
 tdb steps         --store DIR [--top 15]
 tdb serve         --store DIR [--port 8377]
-tdb synth         --store DIR [--sessions 20 --per 40]
-tdb query         --store DIR --q 'QUERY' [--limit 30] [--threads N] [--repeat N]
-tdb check-queries --store DIR [--n 300] [--max-steps 400] [--seed S]
+tdb synth         --store DIR [--sessions 20 --per 40] [--rich x] [--no-flush x]
+tdb query         --store DIR --q 'QUERY' [--limit 30] [--threads N] [--repeat N] [--summaries off]
+tdb check-queries --store DIR [--n 300] [--eq 150] [--agg 300] [--max-steps 400] [--seed S]
 tdb h2h           --store DIR [--pg 127.0.0.1:5455] [--no-load x] [--reps 5] [--reads 200]
 ```
 
@@ -391,8 +570,11 @@ MANIFEST              live segments (with what folds replaced in each), index ru
                       checkpoint, first live log (crc32c)
 wal-NNNNNN.log        [len][crc32c][record]...
 seg-NNNNNN.tdb        frames per session part | blocks: groups of parts (messages + requests,
-                      steps) | session directory in 64 KB blocks, each entry saying where its
-                      part's blocks are | catalog | footer
+                      steps) | step summaries: per field values, rows, words, postings, then the
+                      head (parts, part table, where each field's blocks are) | session directory
+                      in 64 KB blocks, each entry saying where its part's blocks are | catalog
+                      (points at the summary head; segments written before summaries existed still
+                      open, but a store written now does not open in an older build) | footer
 idx-NNNNNN.tdb        key pages (2048 sorted (kind, hash, value) keys + their Bloom filter, each
                       with a crc32c) | fence pages (first key of 1024 pages) | piece table and
                       opaque value table (1024 a block, by id) | catalog | footer
@@ -402,12 +584,14 @@ LOCK                  held with flock while a process has the store open
 
 ## What's next
 
-1. Derived columns (rules at write time, backfilled when a merge rewrites a session), then text
-   search with an index so substring tests stop scanning every distinct value.
-2. Queries that skip whole segments from their catalogs (time range, tool names) before reading
-   any session.
-3. Merges run inside the flush that triggers them; a background thread would keep writes going
+1. Derived columns (rules at write time, backfilled when a merge rewrites a session).
+2. Summaries for `time` tests (the part table has each row's earliest and latest time, so a row
+   wholly inside or outside a range could be counted without its steps) and for `bin(time, 1h)`;
+   pattern queries that skip whole segments from their catalogs before reading any session.
+3. The field tables keep short values a second time (the step parts keep each part's own
+   dictionary): one dictionary per segment that the step parts point into would remove that copy.
+4. Merges run inside the flush that triggers them; a background thread would keep writes going
    while a big merge runs (index merges are capped at 1 GB and segment merges at 256 MB).
-4. A bigger head-to-head on the full logs, and a multi-terabyte run on an external disk (the
-   index's filters are about 1.8 bytes per key and are read through the cache, so at that size
-   ingest speed depends on how much of them the cache holds).
+5. A multi-terabyte run on an external disk (the index's filters are about 1.8 bytes per key and
+   are read through the cache, so at that size ingest speed depends on how much of them the
+   cache holds).

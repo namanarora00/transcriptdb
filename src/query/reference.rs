@@ -407,3 +407,340 @@ pub fn random_query(db: &Db, r: &mut crate::synth::Rng) -> String {
     }
     q
 }
+
+// ---------------------------------------------------------------------------- aggregations
+
+/// Every session's steps as the reference reads them from the stored messages.
+pub struct RawStore {
+    sessions: Vec<(u32, Vec<RawStep>)>,
+}
+
+/// Read every step of every session from the stored messages (once, for many queries).
+pub fn raw_store(db: &Db) -> Result<RawStore, QError> {
+    let mut sessions = Vec::with_capacity(db.session_count());
+    for s in 0..db.session_count() as u32 {
+        sessions.push((s, raw_steps(db, s)?));
+    }
+    Ok(RawStore { sessions })
+}
+
+/// `where ... | summarize ... by ... [| sort ... [| take n]]` by brute force over steps read
+/// from the messages: each `where` and each key and aggregate evaluated on every step, groups
+/// by the keys' values. Returns the rows as printed cells; without a `sort`, rows come
+/// ordered by their keys.
+pub fn summarize(db: &Db, raw: &RawStore, src: &str, now: i64) -> Result<Vec<Vec<String>>, QError> {
+    use super::value::Key;
+    let q: Query = super::parse::parse(src)?;
+    let mut i = 0;
+    let mut pre = Vec::new();
+    while let Some(Stage::Where(e)) = q.stages.get(i) {
+        pre.push(e.clone());
+        i += 1;
+    }
+    let Some(Stage::Summarize { aggs, by }) = q.stages.get(i) else { return Err(QError::new("reference: needs where stages then summarize")) };
+    struct Acc {
+        key: Vec<Value>,
+        count: Vec<i64>,
+        sum: Vec<f64>,
+        all_int: Vec<bool>,
+        best: Vec<Option<Value>>,
+        set: Vec<std::collections::HashSet<Key>>,
+    }
+    let na = aggs.len();
+    let mut groups: HashMap<Vec<Key>, Acc> = HashMap::new();
+    for (s, steps) in &raw.sessions {
+        let ss_arc = db.steps(*s);
+        let ss = &*ss_arc;
+        for (pos, st) in steps.iter().enumerate() {
+            let ctx = RawCtx { db, s: *s, pos: pos as u32, st, ss, now };
+            let mut pass = true;
+            for e in &pre {
+                if !eval(e, &ctx)?.truthy() {
+                    pass = false;
+                    break;
+                }
+            }
+            if !pass {
+                continue;
+            }
+            let kv = by.iter().map(|(_, e)| eval(e, &ctx)).collect::<Result<Vec<_>, _>>()?;
+            let kk: Vec<Key> = kv.iter().map(|v| v.key()).collect();
+            let acc = groups.entry(kk).or_insert_with(|| Acc { key: kv, count: vec![0; na], sum: vec![0.0; na], all_int: vec![true; na], best: vec![None; na], set: vec![Default::default(); na] });
+            for (ai, (_, f, arg)) in aggs.iter().enumerate() {
+                let v = match arg {
+                    Some(e) => eval(e, &ctx)?,
+                    None => Value::Null,
+                };
+                match f {
+                    super::parse::AggFn::Count => acc.count[ai] += 1,
+                    super::parse::AggFn::CountIf => acc.count[ai] += v.truthy() as i64,
+                    super::parse::AggFn::Sum | super::parse::AggFn::Avg => match v {
+                        Value::Int(x) => {
+                            acc.sum[ai] += x as f64;
+                            acc.count[ai] += 1;
+                        }
+                        Value::Float(x) => {
+                            acc.sum[ai] += x;
+                            acc.count[ai] += 1;
+                            acc.all_int[ai] = false;
+                        }
+                        _ => {}
+                    },
+                    super::parse::AggFn::Min | super::parse::AggFn::Max => {
+                        if !matches!(v, Value::Null) {
+                            let better = match &acc.best[ai] {
+                                None => true,
+                                Some(b) => {
+                                    let o = v.order(b);
+                                    if *f == super::parse::AggFn::Min { o.is_lt() } else { o.is_gt() }
+                                }
+                            };
+                            if better {
+                                acc.best[ai] = Some(v);
+                            }
+                        }
+                    }
+                    super::parse::AggFn::DCount => {
+                        if !matches!(v, Value::Null) {
+                            acc.set[ai].insert(v.key());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if by.is_empty() && groups.is_empty() {
+        groups.insert(Vec::new(), Acc { key: Vec::new(), count: vec![0; na], sum: vec![0.0; na], all_int: vec![true; na], best: vec![None; na], set: vec![Default::default(); na] });
+    }
+    let cols: Vec<String> = by.iter().map(|(n, _)| n.clone()).chain(aggs.iter().map(|(n, _, _)| n.clone())).collect();
+    let mut rows: Vec<Vec<Value>> = groups
+        .into_values()
+        .map(|a| {
+            let mut vals = a.key.clone();
+            for (ai, (_, f, _)) in aggs.iter().enumerate() {
+                vals.push(match f {
+                    super::parse::AggFn::Count | super::parse::AggFn::CountIf => Value::Int(a.count[ai]),
+                    super::parse::AggFn::DCount => Value::Int(a.set[ai].len() as i64),
+                    super::parse::AggFn::Sum if a.all_int[ai] => Value::Int(a.sum[ai] as i64),
+                    super::parse::AggFn::Sum => Value::Float(a.sum[ai]),
+                    super::parse::AggFn::Avg if a.count[ai] == 0 => Value::Null,
+                    super::parse::AggFn::Avg => Value::Float(a.sum[ai] / a.count[ai] as f64),
+                    super::parse::AggFn::Min | super::parse::AggFn::Max => a.best[ai].clone().unwrap_or(Value::Null),
+                });
+            }
+            vals
+        })
+        .collect();
+    // rows by their keys first (a canonical order), then the query's own order
+    let nk = by.len();
+    rows.sort_by(|a, b| {
+        for k in 0..nk {
+            let o = a[k].order(&b[k]);
+            if o.is_ne() {
+                return o;
+            }
+        }
+        std::cmp::Ordering::Equal
+    });
+    let col = |e: &Expr| match e {
+        Expr::Ref(p) if p.len() == 1 => cols.iter().position(|c| *c == p[0]),
+        _ => None,
+    };
+    let mut take = None;
+    for st in &q.stages[i + 1..] {
+        match st {
+            Stage::Sort(keys) => {
+                let ks: Vec<(usize, bool)> = keys.iter().map(|(e, d)| col(e).map(|c| (c, *d))).collect::<Option<_>>().ok_or_else(|| QError::new("reference: sort on a column of the summary only"))?;
+                rows.sort_by(|a, b| {
+                    for &(c, desc) in &ks {
+                        let o = a[c].order(&b[c]);
+                        let o = if desc { o.reverse() } else { o };
+                        if o.is_ne() {
+                            return o;
+                        }
+                    }
+                    std::cmp::Ordering::Equal
+                });
+            }
+            Stage::Top { n, by: e, desc } => {
+                let c = col(e).ok_or_else(|| QError::new("reference: top on a column of the summary only"))?;
+                rows.sort_by(|a, b| {
+                    let o = a[c].order(&b[c]);
+                    if *desc { o.reverse() } else { o }
+                });
+                take = Some(*n);
+            }
+            Stage::Take(n) => take = Some(take.map_or(*n, |t: usize| t.min(*n))),
+            _ => return Err(QError::new("reference: only sort, top and take after summarize")),
+        }
+    }
+    if let Some(n) = take {
+        rows.truncate(n);
+    }
+    Ok(rows.into_iter().map(|r| r.into_iter().map(|v| v.to_string()).collect()).collect())
+}
+
+/// One aggregation query three ways: from the summaries, by scanning steps, and by brute
+/// force. Returns whether the summaries answered it and whether all three agree.
+pub fn compare_summarize(db: &Db, raw: &RawStore, src: &str) -> Result<(bool, bool), QError> {
+    let run = |on: bool| -> Result<(Vec<Vec<String>>, bool), QError> {
+        super::exec::set_summaries(on);
+        let r = super::run(db, src, 1);
+        super::exec::set_summaries(true);
+        let r = r?;
+        Ok((super::exec::render(db, &r.table, usize::MAX)?.1, r.stats.summarized))
+    };
+    let (fast, used) = run(true)?;
+    let (scan, _) = run(false)?;
+    let brute = summarize(db, raw, src, super::exec::now_ms())?;
+    Ok((used, fast == scan && scan == brute))
+}
+
+/// A random `where ... | summarize ...` query over the store's own tools, mixing tests the
+/// summaries can answer (tool, outcome, session, one input field) with ones they cannot.
+pub fn random_summarize(db: &Db, r: &mut crate::synth::Rng) -> String {
+    let sd = db.step_dicts();
+    let mut counts = vec![0usize; sd.tools.len()];
+    for s in 0..db.session_count() as u32 {
+        for row in &db.steps(s).rows {
+            counts[row.tool as usize] += 1;
+        }
+    }
+    let mut tools: Vec<(usize, u32)> = counts.into_iter().enumerate().map(|(t, n)| (n, t as u32)).collect();
+    tools.sort_by(|a, b| b.cmp(a));
+    let names: Vec<String> = tools.iter().take(6).map(|(_, t)| String::from_utf8_lossy(sd.tools.get(*t)).into_owned()).collect();
+    let names = if names.is_empty() { vec!["Bash".to_string()] } else { names };
+    let sid = if db.session_count() > 0 { db.session_key(r.below(db.session_count() as u64) as u32).0 } else { String::new() };
+    let sid_prefix: String = sid.chars().take(3).collect();
+    let tool = |r: &mut crate::synth::Rng| format!("{:?}", r.pick(&names));
+    let atom = |r: &mut crate::synth::Rng| -> String {
+        match r.below(34) {
+            0 | 1 => format!("tool == {}", tool(r)),
+            2 => format!("tool in ({}, {})", tool(r), tool(r)),
+            3 => format!("tool != {}", tool(r)),
+            4 => r#"tool startswith "re""#.into(),
+            5 => "failed".into(),
+            6 => "not failed".into(),
+            7 => r#"agent == """#.into(),
+            8 => r#"agent != """#.into(),
+            9 => format!("session startswith {sid_prefix:?}"),
+            10 => format!("file_path contains {:?}", r.pick(&["src", "test", ".rs", "/repo", "ünï", "C:", "src/1"])),
+            11 => format!("command contains {:?}", r.pick(&["git commit", "git", "commit", "cargo test", "\"hi\"", "/ slash", "kelvin", "istanbul", "café", "upper", "nline two", "ttab"])),
+            12 => format!("command has {:?}", r.pick(&["git", "commit", "status"])),
+            13 => format!("command contains_cs {:?}", r.pick(&["Git", "GIT", "git commit"])),
+            14 => format!("command startswith {:?}", r.pick(&["git", "echo", "cat"])),
+            15 => format!("command endswith {:?}", r.pick(&["upper", "status", "EOF"])),
+            16 => r#"command == "git status""#.into(),
+            17 => r#"command in ("ls", "git status", "Git Commit -m Upper")"#.into(),
+            18 => format!("file_path == {:?}", format!("/repo/src/{}.rs", r.below(12))),
+            19 => "isnull(file_path)".into(),
+            20 => "isnotnull(command)".into(),
+            21 => "isnull(command)".into(),
+            22 => r#"content contains "fn main""#.into(),
+            23 => r#"not (file_path contains "src")"#.into(),
+            24 => format!("out_bytes > {}", r.pick(&[100, 300])),
+            25 => "time > ago(100000d)".into(),
+            26 => "strlen(command) > 12".into(),
+            27 => r#"pattern contains "fn""#.into(),
+            28 => r#"description contains "the""#.into(),
+            29 => r#"not (command contains "commit")"#.into(),
+            30 => r#"file_path not in ("/repo/src/1.rs", "/repo/src/2.rs")"#.into(),
+            31 => r#"command matches "git*""#.into(),
+            32 => format!("step < {}", r.pick(&[5, 40])),
+            _ => "ok".into(),
+        }
+    };
+    let pred = |r: &mut crate::synth::Rng| -> String {
+        match r.below(10) {
+            0..=4 => atom(r),
+            5..=7 => format!("{} and {}", atom(r), atom(r)),
+            8 => format!("({} or {})", atom(r), atom(r)),
+            _ => format!("not ({})", atom(r)),
+        }
+    };
+    let mut q = String::new();
+    for _ in 0..r.below(3) {
+        q.push_str(&format!("where {} | ", pred(r)));
+    }
+    const KEYS: &[&str] = &["tool", "failed", "ok", "session", "agent", "bin(time, 1d)", "bin(time, 7d)", "file_path", "command", "bin(time, 1h)", "content"];
+    let nk = r.below(3) as usize;
+    let mut keys: Vec<&str> = Vec::new();
+    while keys.len() < nk {
+        let k = *r.pick(KEYS);
+        if !keys.contains(&k) {
+            keys.push(k);
+        }
+    }
+    const AGGS: &[&str] = &["n = count()", "f = countif(failed)", "b = countif(tool == \"Bash\")", "c = countif(file_path contains \"src\")", "s = sum(out_bytes)", "a = avg(out_bytes)", "lo = min(time)", "hi = max(out_bytes)", "ds = dcount(session)", "df = dcount(file_path)", "dt = dcount(tool)", "da = dcount(agent)", "dc = dcount(command)"];
+    let na = 1 + r.below(3) as usize;
+    let mut aggs: Vec<&str> = Vec::new();
+    while aggs.len() < na {
+        let a = *r.pick(AGGS);
+        if !aggs.contains(&a) {
+            aggs.push(a);
+        }
+    }
+    q.push_str(&format!("summarize {}", aggs.join(", ")));
+    if !keys.is_empty() {
+        let named: Vec<String> = keys.iter().enumerate().map(|(i, k)| format!("k{i} = {k}")).collect();
+        q.push_str(&format!(" by {}", named.join(", ")));
+        let dir = |r: &mut crate::synth::Rng| if r.chance(0.5) { "asc" } else { "desc" };
+        let all: Vec<String> = (0..keys.len()).map(|i| format!("k{i} {}", dir(r))).collect();
+        match r.below(4) {
+            0 if keys.len() == 1 => q.push_str(&format!(" | top {} by k0 {}", 1 + r.below(5), dir(r))),
+            1 => {
+                let first = aggs[0].split(' ').next().unwrap();
+                q.push_str(&format!(" | sort by {first} {}, {} | take {}", dir(r), all.join(", "), 1 + r.below(6)));
+            }
+            _ => q.push_str(&format!(" | sort by {}", all.join(", "))),
+        }
+    }
+    q
+}
+
+/// A random two-element `match` whose elements must share a field's value, often with an
+/// exclusion between them, a window, `next` or repeats: the cases where the matcher visits
+/// only the turns holding each value.
+pub fn random_eq_query(db: &Db, r: &mut crate::synth::Rng) -> String {
+    let sd = db.step_dicts();
+    let mut counts = vec![0usize; sd.tools.len()];
+    for s in 0..db.session_count() as u32 {
+        for row in &db.steps(s).rows {
+            counts[row.tool as usize] += 1;
+        }
+    }
+    let mut tools: Vec<(usize, u32)> = counts.into_iter().enumerate().map(|(t, n)| (n, t as u32)).collect();
+    tools.sort_by(|a, b| b.cmp(a));
+    let names: Vec<String> = tools.iter().take(6).map(|(_, t)| String::from_utf8_lossy(sd.tools.get(*t)).into_owned()).collect();
+    let names = if names.is_empty() { vec!["Read".to_string()] } else { names };
+    let tool = |r: &mut crate::synth::Rng| format!("{:?}", r.pick(&names));
+    let atom = |r: &mut crate::synth::Rng| -> String {
+        match r.below(7) {
+            0 | 1 => format!("tool == {}", tool(r)),
+            2 => format!("tool in ({}, {})", tool(r), tool(r)),
+            3 => "failed".into(),
+            4 => "not failed".into(),
+            5 => format!("tool != {}", tool(r)),
+            _ => format!("out_bytes > {}", r.pick(&[200, 1000])),
+        }
+    };
+    let pred = |r: &mut crate::synth::Rng| if r.chance(0.7) { atom(r) } else { format!("{} and {}", atom(r), atom(r)) };
+    let rep = match r.below(8) {
+        0 => "{2}",
+        1 => "{1,2}",
+        _ => "",
+    };
+    let link = if r.chance(0.25) { "next" } else { "then" };
+    let mut q = format!("match a: {}{rep} {link} b: {}", pred(r), pred(r));
+    if r.chance(0.4) {
+        q.push_str(&format!(" within {}", 1 + r.below(6)));
+    }
+    let mut cons = Vec::new();
+    if r.chance(0.6) {
+        cons.push(format!("no ({}) between a and b", atom(r)));
+    }
+    let f = if r.chance(0.8) { "file_path" } else { "command" };
+    cons.push(format!("a.{f} == b.{f}"));
+    q.push_str(&format!(" where {}", cons.join(" and ")));
+    q
+}

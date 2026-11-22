@@ -22,7 +22,7 @@
 //! constraint (window, exclusions) only gets easier with later bindings.
 
 use crate::record::NONE;
-use crate::steps::SessionSteps;
+use crate::steps::{SessionSteps, Turns};
 
 pub const MAX_ELEMS: usize = 8;
 pub const UNBOUNDED: u32 = u32::MAX;
@@ -110,7 +110,6 @@ pub fn run_from(sp: &Spec, ss: &SessionSteps, masks: &[u64], start: usize, out: 
     if n == 0 || sp.n == 0 {
         return;
     }
-    let last_elem = sp.n - 1;
     let mut inst_of = vec![0u32; n];
     let mut depth: Vec<u32> = Vec::new();
     let mut range: Vec<(u32, u32)> = Vec::new();
@@ -146,82 +145,155 @@ pub fn run_from(sp: &Spec, ss: &SessionSteps, masks: &[u64], start: usize, out: 
         };
         let d = pd + 1;
         let gx = masks[i..j].iter().fold(0u64, |a, m| a | (m >> 32));
-        new.clear();
-        let mut done: Option<Th> = None;
-        let within_ok = |start: u32| sp.within.is_none_or(|w| d - start <= w);
-
-        // threads that wait through this turn
-        for t in &before {
-            let k = t.k as usize;
-            if t.count < sp.min[k] || k == last_elem || sp.next[k + 1] || !within_ok(t.start) {
-                continue;
-            }
-            if killed(sp, k, false, gx) {
-                continue;
-            }
-            put(sp, &mut new, *t);
-        }
-        // threads that take a step of this turn
-        for (pos, &m) in masks.iter().enumerate().take(j).skip(i) {
-            let pos = pos as u32;
-            for ti in 0..=before.len() {
-                let init = ti == before.len();
-                let mut cands: [Option<Th>; 2] = [None, None];
-                if init {
-                    if m & 1 == 1 {
-                        let mut b = [NONE; MAX_ELEMS];
-                        b[0] = pos;
-                        cands[0] = Some(Th { k: 0, count: 1, start: d, last: d, binds: b });
-                    }
-                } else {
-                    let t = &before[ti];
-                    let k = t.k as usize;
-                    // one more of the same element
-                    if t.count < sp.max[k] && d == t.last + 1 && m >> k & 1 == 1 {
-                        let mut u = *t;
-                        u.count += 1;
-                        u.last = d;
-                        u.binds[k] = pos;
-                        cands[0] = Some(u);
-                    }
-                    // the next element
-                    if t.count >= sp.min[k] && k < last_elem && m >> (k + 1) & 1 == 1 && (!sp.next[k + 1] || d == t.last + 1) {
-                        let mut u = *t;
-                        u.k += 1;
-                        u.count = 1;
-                        u.last = d;
-                        u.binds[k + 1] = pos;
-                        cands[1] = Some(u);
-                    }
-                }
-                for u in cands.into_iter().flatten() {
-                    let k = u.k as usize;
-                    if !within_ok(u.start) || killed(sp, k, true, gx) {
-                        continue;
-                    }
-                    if k == last_elem && u.count == sp.min[k] {
-                        let better = match &done {
-                            None => true,
-                            Some(x) => (u.start, u.binds) > (x.start, x.binds),
-                        };
-                        if better {
-                            done = Some(u);
-                        }
-                    } else {
-                        put(sp, &mut new, u);
-                    }
-                }
-            }
-        }
-        if let Some(t) = done {
-            let mut b = [NONE; MAX_ELEMS];
-            b[..sp.n].copy_from_slice(&t.binds[..sp.n]);
-            out.push(Match { end: t.binds[last_elem], binds: b });
-            new.clear();
-        }
+        turn(sp, &before, d, gx, (i..j).map(|pos| (pos as u32, masks[pos])), &mut new, out);
         depth.push(d);
         range.push((pool.len() as u32, new.len() as u32));
         pool.extend_from_slice(&new);
         i = j;
+    }
+}
+
+/// One turn at depth `d` whose steps are `steps` (position, mask) and whose exclusion hits
+/// are `gx`: from the threads alive after the parent turn (`before`), the threads alive
+/// after it go to `new`, and a match it completes to `out`.
+fn turn(sp: &Spec, before: &[Th], d: u32, gx: u64, steps: impl Iterator<Item = (u32, u64)>, new: &mut Vec<Th>, out: &mut Vec<Match>) {
+    let last_elem = sp.n - 1;
+    new.clear();
+    let mut done: Option<Th> = None;
+    let within_ok = |start: u32| sp.within.is_none_or(|w| d - start <= w);
+
+    // threads that wait through this turn
+    for t in before {
+        let k = t.k as usize;
+        if t.count < sp.min[k] || k == last_elem || sp.next[k + 1] || !within_ok(t.start) {
+            continue;
+        }
+        if killed(sp, k, false, gx) {
+            continue;
+        }
+        put(sp, new, *t);
+    }
+    // threads that take a step of this turn
+    for (pos, m) in steps {
+        for ti in 0..=before.len() {
+            let init = ti == before.len();
+            let mut cands: [Option<Th>; 2] = [None, None];
+            if init {
+                if m & 1 == 1 {
+                    let mut b = [NONE; MAX_ELEMS];
+                    b[0] = pos;
+                    cands[0] = Some(Th { k: 0, count: 1, start: d, last: d, binds: b });
+                }
+            } else {
+                let t = &before[ti];
+                let k = t.k as usize;
+                // one more of the same element
+                if t.count < sp.max[k] && d == t.last + 1 && m >> k & 1 == 1 {
+                    let mut u = *t;
+                    u.count += 1;
+                    u.last = d;
+                    u.binds[k] = pos;
+                    cands[0] = Some(u);
+                }
+                // the next element
+                if t.count >= sp.min[k] && k < last_elem && m >> (k + 1) & 1 == 1 && (!sp.next[k + 1] || d == t.last + 1) {
+                    let mut u = *t;
+                    u.k += 1;
+                    u.count = 1;
+                    u.last = d;
+                    u.binds[k + 1] = pos;
+                    cands[1] = Some(u);
+                }
+            }
+            for u in cands.into_iter().flatten() {
+                let k = u.k as usize;
+                if !within_ok(u.start) || killed(sp, k, true, gx) {
+                    continue;
+                }
+                if k == last_elem && u.count == sp.min[k] {
+                    let better = match &done {
+                        None => true,
+                        Some(x) => (u.start, u.binds) > (x.start, x.binds),
+                    };
+                    if better {
+                        done = Some(u);
+                    }
+                } else {
+                    put(sp, new, u);
+                }
+            }
+        }
+    }
+    if let Some(t) = done {
+        let mut b = [NONE; MAX_ELEMS];
+        b[..sp.n].copy_from_slice(&t.binds[..sp.n]);
+        out.push(Match { end: t.binds[last_elem], binds: b });
+        new.clear();
+    }
+}
+
+/// Like [`run`], for a pattern all of whose elements must have the same value of a field:
+/// only the steps with that value can bind (`steps`, (position, mask), by position), so
+/// only their turns are visited. Threads are carried from a visited turn to the next one
+/// below it as waiting through each turn between would carry them: they need their
+/// repeats done, a later element that may come any later turn, and no exclusion they are
+/// inside hit there (the `within` window is tested at the visited turn, deeper than any
+/// turn between). `gx` holds
+/// each turn's exclusion hits over all its steps; `xs[x]` counts, per turn, the turns on
+/// its path from the root up to it hitting exclusion `x`.
+pub fn run_sparse(sp: &Spec, t: &Turns, gx: &[u64], xs: &[Vec<u32>], steps: &[(u32, u64)], out: &mut Vec<Match>) {
+    if steps.is_empty() || sp.n == 0 {
+        return;
+    }
+    let last_elem = sp.n - 1;
+    // visited turns with their steps, in preorder (parents first)
+    let mut vt: Vec<(u32, usize, usize)> = Vec::new();
+    let mut a = 0;
+    while a < steps.len() {
+        let g = t.of[steps[a].0 as usize];
+        let mut b = a + 1;
+        while b < steps.len() && t.of[steps[b].0 as usize] == g {
+            b += 1;
+        }
+        vt.push((g, a, b));
+        a = b;
+    }
+    vt.sort_by_key(|x| t.tin[x.0 as usize]);
+    // threads alive after each visited turn: sets[i] = pool[range]
+    let mut pool: Vec<Th> = Vec::new();
+    let mut sets: Vec<(u32, u32)> = Vec::with_capacity(vt.len());
+    let mut stack: Vec<usize> = Vec::new();
+    let mut before: Vec<Th> = Vec::new();
+    let mut new: Vec<Th> = Vec::new();
+    for (vi, &(g, a, b)) in vt.iter().enumerate() {
+        while stack.last().is_some_and(|&p| !t.is_ancestor(vt[p].0, g)) {
+            stack.pop();
+        }
+        before.clear();
+        let d = t.depth[g as usize];
+        if let Some(&p) = stack.last() {
+            let pg = vt[p].0;
+            let (o, l) = sets[p];
+            let set = &pool[o as usize..(o + l) as usize];
+            if d == t.depth[pg as usize] + 1 {
+                before.extend_from_slice(set);
+            } else {
+                // the turns strictly between: from pg's child down to g's parent
+                let up = t.parent[g as usize] as usize;
+                let hit: u64 = xs.iter().enumerate().fold(0, |acc, (x, c)| if c[up] > c[pg as usize] { acc | 1 << x } else { acc });
+                for th in set {
+                    let k = th.k as usize;
+                    // (no window test: a thread past it here is past it at `g` too, which tests it)
+                    if th.count < sp.min[k] || k == last_elem || sp.next[k + 1] || killed(sp, k, false, hit) {
+                        continue;
+                    }
+                    before.push(*th);
+                }
+            }
+        }
+        turn(sp, &before, d, gx[g as usize], steps[a..b].iter().copied(), &mut new, out);
+        sets.push((pool.len() as u32, new.len() as u32));
+        pool.extend_from_slice(&new);
+        stack.push(vi);
     }
 }

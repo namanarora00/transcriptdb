@@ -17,6 +17,7 @@ use crate::block::{file, handle, read_block, read_catalog, write_block, write_ca
 use crate::bloom::{key_hash, Bloom};
 use crate::codec::{corrupt, Dec, Enc, Result};
 use crate::record::ReqRec;
+use crate::stats::StatsBuilder;
 use crate::steps::{self, StepRow};
 use crate::wal::{sync_file, SyncMode};
 use std::cell::RefCell;
@@ -70,6 +71,8 @@ pub struct StepPart {
     /// (field, value as JSON text)
     pub values: Vec<(u32, Vec<u8>)>,
     pub longs: Vec<(u32, u32)>,
+    /// JSON text of each of `longs`, for the summaries (filled when writing, not when reading).
+    pub long_text: Vec<Vec<u8>>,
 }
 
 /// Where a session's part sits: (block, offset in the decompressed block, length).
@@ -116,6 +119,10 @@ pub struct SegCat {
     pub dirs: Vec<(u32, BlockRef)>,
     pub frame_bytes: u64,
     pub node_bytes: u64,
+    /// The step summaries (`stats.rs`) and their size on disk; segments written before
+    /// summaries existed have none.
+    pub stats: Option<BlockRef>,
+    pub stats_bytes: u64,
 }
 
 impl SegCat {
@@ -148,6 +155,11 @@ impl SegCat {
         }
         e.var(self.frame_bytes);
         e.var(self.node_bytes);
+        if let Some(r) = &self.stats {
+            e.u8(1);
+            r.encode(&mut e);
+            e.var(self.stats_bytes);
+        }
         e.buf
     }
 
@@ -171,6 +183,10 @@ impl SegCat {
         }
         c.frame_bytes = d.var()?;
         c.node_bytes = d.var()?;
+        if !d.done() && d.u8()? == 1 {
+            c.stats = Some(BlockRef::decode(&mut d)?);
+            c.stats_bytes = d.var()?;
+        }
         if !d.done() || c.dirs.windows(2).any(|w| w[0].0 > w[1].0) || (c.sessions > 0) != !c.dirs.is_empty() {
             return corrupt("bad segment catalog");
         }
@@ -267,12 +283,17 @@ pub fn decode_core(b: &[u8]) -> Result<CorePart> {
     Ok(CorePart { frames, raw_len, nodes, first_node, first_req, requests })
 }
 
-fn encode_steps(p: &StepPart, e: &mut Enc) {
+/// Encode a step part; returns where each value's text starts in the encoding.
+fn encode_steps(p: &StepPart, e: &mut Enc) -> Vec<u32> {
+    let base = e.buf.len();
+    let mut at = Vec::with_capacity(p.values.len());
     e.var(p.first as u64);
     e.var(p.values.len() as u64);
     for (f, v) in &p.values {
         e.var(*f as u64);
-        e.bytes(v);
+        e.var(v.len() as u64);
+        at.push((e.buf.len() - base) as u32);
+        e.raw(v);
     }
     e.var(p.rows.len() as u64);
     for (r, fs) in p.rows.iter().zip(&p.fields) {
@@ -298,6 +319,7 @@ fn encode_steps(p: &StepPart, e: &mut Enc) {
             }
         }
     }
+    at
 }
 
 pub fn decode_steps(b: &[u8]) -> Result<StepPart> {
@@ -345,7 +367,7 @@ pub fn decode_steps(b: &[u8]) -> Result<StepPart> {
     if !d.done() {
         return corrupt("trailing bytes in a step part");
     }
-    Ok(StepPart { first, rows, fields, values, longs })
+    Ok(StepPart { first, rows, fields, values, longs, long_text: Vec::new() })
 }
 
 fn encode_dir(dir: &[DirEnt]) -> Vec<u8> {
@@ -403,6 +425,7 @@ pub struct SegWriter {
     core_waiting: Vec<usize>,
     steps_buf: Vec<u8>,
     steps_waiting: Vec<usize>,
+    stats: StatsBuilder,
 }
 
 impl SegWriter {
@@ -426,6 +449,7 @@ impl SegWriter {
             core_waiting: Vec::new(),
             steps_buf: Vec::new(),
             steps_waiting: Vec::new(),
+            stats: StatsBuilder::default(),
         })
     }
 
@@ -496,7 +520,8 @@ impl SegWriter {
         self.core_buf.extend_from_slice(&e.buf);
         self.core_waiting.push(i);
         let mut e = Enc::new();
-        encode_steps(steps, &mut e);
+        let value_at = encode_steps(steps, &mut e);
+        self.stats.add_part(session, &key, steps, &steps.long_text, &value_at)?;
         let steps_ref = (BlockRef::default(), self.steps_buf.len() as u32, e.buf.len() as u32);
         self.steps_buf.extend_from_slice(&e.buf);
         self.steps_waiting.push(i);
@@ -545,6 +570,17 @@ impl SegWriter {
     pub fn finish(mut self, mode: SyncMode) -> Result<SegCat> {
         self.seal(false)?;
         self.seal(true)?;
+        let stats = std::mem::take(&mut self.stats);
+        let (f, pos) = (&mut self.f, &mut self.pos);
+        let mut stats_bytes = 0u64;
+        let step_refs: Vec<PartRef> = self.dir.iter().map(|d| d.steps).collect();
+        let head = stats.finish(&step_refs, &mut |raw| {
+            let r = write_block(f, pos, raw, 3)?;
+            stats_bytes += r.clen as u64;
+            Ok(r)
+        })?;
+        self.cat.stats = Some(head);
+        self.cat.stats_bytes = stats_bytes;
         // the directory in blocks of about GROUP bytes, each starting at a new entry
         let mut a = 0;
         while a < self.dir.len() {

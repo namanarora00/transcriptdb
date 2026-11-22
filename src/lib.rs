@@ -24,6 +24,7 @@ pub mod query;
 pub mod record;
 pub mod segment;
 pub mod split;
+pub mod stats;
 pub mod steps;
 pub mod synth;
 pub mod trace;

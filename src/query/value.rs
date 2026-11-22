@@ -123,6 +123,32 @@ impl Value {
     }
 }
 
+/// What a field value (raw JSON text) groups by in `summarize ... by` and `dcount`: two
+/// values share a group exactly when their decoded values are equal (`Value::key`), so
+/// `"a\/b"` groups with `"a/b"` and `1.0` with `1`. `None` for `null`, which groups with
+/// steps that lack the field and is not counted by `dcount`.
+pub fn group_key(raw: &[u8]) -> Option<Vec<u8>> {
+    match Value::from_json(raw) {
+        Value::Null => None,
+        Value::Str(s) => {
+            let mut k = Vec::with_capacity(s.len() + 1);
+            k.push(b's');
+            k.extend_from_slice(s.as_bytes());
+            Some(k)
+        }
+        Value::Bool(b) => Some(vec![b'b', b as u8]),
+        v => match v.key() {
+            Key::Num(i, f) => {
+                let mut k = vec![b'n'];
+                k.extend_from_slice(&i.to_le_bytes());
+                k.extend_from_slice(&f.to_le_bytes());
+                Some(k)
+            }
+            other => Some(format!("{other:?}").into_bytes()),
+        },
+    }
+}
+
 pub fn fmt_time(ms: i64) -> String {
     let secs = ms.div_euclid(1000);
     let days = secs.div_euclid(86_400);
@@ -276,26 +302,26 @@ fn has_term(s: &str, term: &str) -> bool {
 /// Case-insensitive ASCII substring search without allocating: find candidates by the
 /// first byte (either case), then compare the rest in place.
 fn ascii_ci_contains(h: &[u8], n: &[u8]) -> bool {
-    let Some(&first) = n.first() else { return true };
+    ascii_ci_find(h, n).is_some()
+}
+
+/// Where `n` first occurs in `h`, ignoring ASCII case.
+pub fn ascii_ci_find(h: &[u8], n: &[u8]) -> Option<usize> {
+    let Some(&first) = n.first() else { return Some(0) };
     if h.len() < n.len() {
-        return false;
+        return None;
     }
     let (lo, up) = (first.to_ascii_lowercase(), first.to_ascii_uppercase());
     let last_start = h.len() - n.len();
     let mut i = 0;
     while i <= last_start {
-        match memchr::memchr2(lo, up, &h[i..=last_start]) {
-            None => return false,
-            Some(k) => {
-                let at = i + k;
-                if h[at..at + n.len()].eq_ignore_ascii_case(n) {
-                    return true;
-                }
-                i = at + 1;
-            }
+        let at = i + memchr::memchr2(lo, up, &h[i..=last_start])?;
+        if h[at..at + n.len()].eq_ignore_ascii_case(n) {
+            return Some(at);
         }
+        i = at + 1;
     }
-    false
+    None
 }
 
 pub fn str_op(op: StrOp, s: &str, pat: &str, cs: bool) -> bool {

@@ -232,6 +232,44 @@ pub struct SessionSteps {
     pub calls: HashMap<Box<[u8]>, CallInfo>,
     /// Bitset of tool codes present in the session.
     pub tool_set: Vec<u64>,
+    /// The turn tree of `rows`, worked out on first use and dropped when a step is added.
+    pub turns: std::sync::OnceLock<std::sync::Arc<Turns>>,
+    /// Step positions by shape code, likewise.
+    pub by_shape: std::sync::OnceLock<std::sync::Arc<ByShape>>,
+    /// A copy without the input values (`vals` empty; see [`SessionSteps::without_values`]):
+    /// for queries whose tests read none, so the steps of many more sessions fit the cache.
+    pub light: bool,
+    /// Per field: how many values it has (kept in a copy without them).
+    pub counts: Vec<(u32, u32)>,
+}
+
+/// Step positions grouped by shape code: code `c`'s are `pos[start[c]..start[c + 1]]`, ascending.
+#[derive(Debug, Clone, Default)]
+pub struct ByShape {
+    pub start: Vec<u32>,
+    pub pos: Vec<u32>,
+}
+
+impl ByShape {
+    pub fn new(shape: &[u8]) -> ByShape {
+        let mut start = vec![0u32; 257];
+        for &c in shape {
+            start[c as usize + 1] += 1;
+        }
+        for c in 0..256 {
+            start[c + 1] += start[c];
+        }
+        let mut fill = start.clone();
+        let mut pos = vec![0u32; shape.len()];
+        for (i, &c) in shape.iter().enumerate() {
+            pos[fill[c as usize] as usize] = i as u32;
+            fill[c as usize] += 1;
+        }
+        ByShape { start, pos }
+    }
+    pub fn of(&self, code: u8) -> &[u32] {
+        &self.pos[self.start[code as usize] as usize..self.start[code as usize + 1] as usize]
+    }
 }
 
 impl SessionSteps {
@@ -253,7 +291,27 @@ impl SessionSteps {
 
     /// Values of field `f` in this session.
     pub fn field_dict(&self, f: u32) -> Option<&Dict> {
+        assert!(!self.light, "input values read from a copy of a session's steps without them");
         self.vals.iter().find(|x| x.0 == f).map(|x| &x.1)
+    }
+
+    /// A copy without the input values: rows, field codes, shape codes, tool set, turns and
+    /// steps by shape code, and each field's number of values.
+    pub fn without_values(&self) -> SessionSteps {
+        SessionSteps {
+            rows: self.rows.clone(),
+            fstart: self.fstart.clone(),
+            fields: self.fields.clone(),
+            longs: self.longs.clone(),
+            shape: self.shape.clone(),
+            flushed: self.flushed,
+            tool_set: self.tool_set.clone(),
+            turns: self.turns.clone(),
+            by_shape: self.by_shape.clone(),
+            light: true,
+            counts: if self.light { self.counts.clone() } else { self.vals.iter().map(|(f, d)| (*f, d.len() as u32)).collect() },
+            ..SessionSteps::default()
+        }
     }
 
     /// The JSON text of value `v` of field `f` (a short value; see [`is_long`]).
@@ -266,6 +324,9 @@ impl SessionSteps {
     }
 
     pub fn value_count(&self, f: u32) -> usize {
+        if self.light {
+            return self.counts.iter().find(|x| x.0 == f).map_or(0, |x| x.1 as usize);
+        }
         self.field_dict(f).map_or(0, |d| d.len())
     }
 
@@ -280,8 +341,20 @@ impl SessionSteps {
         self.vals[i].1.intern(text)
     }
 
+    /// The session's turns (worked out once).
+    pub fn turns(&self) -> std::sync::Arc<Turns> {
+        self.turns.get_or_init(|| std::sync::Arc::new(Turns::new(&self.rows))).clone()
+    }
+
+    /// Step positions by shape code (worked out once).
+    pub fn by_shape(&self) -> std::sync::Arc<ByShape> {
+        self.by_shape.get_or_init(|| std::sync::Arc::new(ByShape::new(&self.shape))).clone()
+    }
+
     /// Append a step, keeping shape codes and the tool set in step.
     pub fn push(&mut self, row: StepRow, fields: &[(u32, FieldVal)]) -> u32 {
+        self.turns.take();
+        self.by_shape.take();
         let pos = self.rows.len() as u32;
         if self.fstart.is_empty() {
             self.fstart.push(0);
@@ -309,7 +382,73 @@ impl SessionSteps {
 
     /// Bytes this takes in memory, roughly.
     pub fn bytes(&self) -> usize {
-        self.rows.len() * 40 + self.fields.len() * 8 + self.fstart.len() * 4 + self.longs.len() * 8 + self.shape.len() + self.tail.len() * 4 + self.vals.iter().map(|(_, d)| d.bytes() + d.len() * 48).sum::<usize>() + self.calls.len() * 96 + 256
+        self.turns.get().map_or(0, |t| t.of.len() * 4 + t.depth.len() * 16) + self.by_shape.get().map_or(0, |b| 1028 + b.pos.len() * 4) + self.counts.len() * 8 + self.rows.len() * 40 + self.fields.len() * 8 + self.fstart.len() * 4 + self.longs.len() * 8 + self.shape.len() + self.tail.len() * 4 + self.vals.iter().map(|(_, d)| d.bytes() + d.len() * 48).sum::<usize>() + self.calls.len() * 96 + 256
+    }
+}
+
+/// A session's turns: steps that share `prev`, call message and result message form a turn;
+/// a turn's parent is the turn of its `prev`. Kept with the session's steps once worked out.
+#[derive(Debug, Clone, Default)]
+pub struct Turns {
+    /// Turn of each step.
+    pub of: Vec<u32>,
+    pub parent: Vec<u32>,
+    pub depth: Vec<u32>,
+    /// Preorder number of each turn and the last preorder number in its subtree.
+    pub tin: Vec<u32>,
+    pub tout: Vec<u32>,
+}
+
+impl Turns {
+    pub fn new(rows: &[StepRow]) -> Turns {
+        let n = rows.len();
+        let mut t = Turns { of: Vec::with_capacity(n), parent: Vec::with_capacity(n), depth: Vec::with_capacity(n), tin: Vec::new(), tout: Vec::new() };
+        let mut i = 0;
+        while i < n {
+            let r = rows[i];
+            let mut j = i + 1;
+            while j < n && rows[j].prev == r.prev && rows[j].call_node == r.call_node && rows[j].result_node == r.result_node {
+                j += 1;
+            }
+            let g = t.depth.len() as u32;
+            t.of.resize(j, g);
+            let p = if r.prev == u32::MAX { u32::MAX } else { t.of[r.prev as usize] };
+            t.depth.push(if p == u32::MAX { 1 } else { t.depth[p as usize] + 1 });
+            t.parent.push(p);
+            i = j;
+        }
+        // preorder numbers from subtree sizes (parents come before their children)
+        let nt = t.depth.len();
+        let mut size = vec![1u32; nt];
+        for g in (0..nt).rev() {
+            let p = t.parent[g];
+            if p != u32::MAX {
+                size[p as usize] += size[g];
+            }
+        }
+        t.tin = vec![0; nt];
+        let mut next = vec![0u32; nt];
+        let mut clock = 0u32;
+        for g in 0..nt {
+            let p = t.parent[g];
+            let at = if p == u32::MAX {
+                let x = clock;
+                clock += size[g];
+                x
+            } else {
+                let x = next[p as usize];
+                next[p as usize] += size[g];
+                x
+            };
+            t.tin[g] = at;
+            next[g] = at + 1;
+        }
+        t.tout = (0..nt).map(|g| t.tin[g] + size[g] - 1).collect();
+        t
+    }
+
+    pub fn is_ancestor(&self, a: u32, b: u32) -> bool {
+        self.tin[a as usize] <= self.tin[b as usize] && self.tin[b as usize] <= self.tout[a as usize]
     }
 }
 

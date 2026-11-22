@@ -158,7 +158,71 @@ fn user_text(r: &mut Rng) -> Msg {
     }
 }
 
-fn assistant(r: &mut Rng, ids: &mut u64) -> (Msg, Vec<String>) {
+/// Tool inputs that stress the query engine's text handling: long values (over the
+/// dictionary's limit), JSON escapes, `\u` escapes, non-ASCII text (including the two
+/// characters whose lower case is ASCII), `null`s, numbers, arrays, and a key given twice.
+fn rich_input(r: &mut Rng, tool: &str) -> String {
+    let long = |r: &mut Rng, mid: &str| {
+        let mut t = String::from("cat <<'EOF'\n");
+        let lines = 120 + r.below(80);
+        for i in 0..lines {
+            t.push_str(&text(r, 6));
+            if i == lines / 2 {
+                t.push_str(mid);
+            }
+            t.push('\n');
+        }
+        t.push_str("EOF");
+        t
+    };
+    match tool {
+        "Bash" => {
+            let cmd = match r.below(12) {
+                0 => jstr(&format!("git commit -m \"fix: thing {}\"", r.below(9))),
+                1 => jstr("git status"),
+                2 => jstr(&format!("cargo test {}", r.below(20))),
+                3 => r#""echo \"hi\"\nline two\ttab \\ back \/ slash git commit""#.to_string(),
+                4 => jstr(["echo café — git commit", "echo \u{212a}elvin git commit", "echo \u{130}stanbul GIT COMMIT"][r.below(3) as usize]),
+                5 => {
+                    let mid = if r.chance(0.5) { " git commit -m wip " } else { " cargo build " };
+                    jstr(&long(r, mid))
+                }
+                6 => r#""\u0067it commit -m \"escaped\"""#.to_string(),
+                7 => jstr("Git Commit -m Upper"),
+                8 => "null".to_string(),
+                9 => jstr(&format!("ls -la src/{}", r.below(5))),
+                10 => r#"["git","commit"]"#.to_string(),
+                _ => jstr("legit commits && git committed"),
+            };
+            if r.chance(0.03) {
+                format!(r#"{{"command":"ls","command":{cmd}}}"#)
+            } else {
+                format!(r#"{{"command":{cmd},"description":{}}}"#, text_lit(r, 3))
+            }
+        }
+        "Edit" | "Write" | "Read" => {
+            let path = match r.below(8) {
+                0 => "null".to_string(),
+                1 => jstr(&format!("/repo/tests/test_{}.rs", r.below(6))),
+                2 => r#""C:\\repo\\src\\main.rs""#.to_string(),
+                3 => r#""\/repo\/src\/lib.rs""#.to_string(),
+                4 => jstr(&format!("/repo/docs/Ünïcode-{}.md", r.below(3))),
+                _ => jstr(&format!("/repo/src/{}.rs", r.below(12))),
+            };
+            match tool {
+                "Write" => {
+                    let content = if r.chance(0.3) { long(r, "fn main() {}") } else { format!("fn f{}() {{}}", r.below(9)) };
+                    format!(r#"{{"file_path":{path},"content":{}}}"#, jstr(&content))
+                }
+                "Edit" => format!(r#"{{"file_path":{path},"old_string":{},"new_string":{}}}"#, text_lit(r, 4), text_lit(r, 4)),
+                _ => format!(r#"{{"file_path":{path},"limit":{}}}"#, r.below(500)),
+            }
+        }
+        _ => format!(r#"{{"pattern":{},"path":{}}}"#, jstr(&format!("fn {}", text(r, 1))), jstr("/repo")),
+    }
+}
+
+fn assistant(r: &mut Rng, ids: &mut u64, rich: bool) -> (Msg, Vec<String>) {
     let mut bs = Vec::new();
     if r.chance(0.6) {
         bs.push(format!(r#"{{"type":"thinking","thinking":{},"signature":"{}"}}"#, { let n = 10 + r.below(60) as usize; text_lit(r, n) }, { let n = 200 + r.below(400) as usize; b64(r, n) }));
@@ -172,10 +236,14 @@ fn assistant(r: &mut Rng, ids: &mut u64) -> (Msg, Vec<String>) {
         *ids += 1;
         let id = format!("toolu_{:016x}", *ids);
         let tool = *r.pick(TOOLS);
-        let input = match tool {
-            "Bash" => format!(r#"{{"command":{},"description":{}}}"#, jstr(&format!("cargo test {}", r.below(100))), text_lit(r, 4)),
-            "Edit" => format!(r#"{{"file_path":"/repo/src/{}.rs","old_string":{},"new_string":{}}}"#, r.below(20), text_lit(r, 8), text_lit(r, 8)),
-            _ => format!(r#"{{"file_path":"/repo/src/{}.rs","limit":{},"ratio":{}}}"#, r.below(20), r.below(500), "1.5e-3"),
+        let input = if rich {
+            rich_input(r, tool)
+        } else {
+            match tool {
+                "Bash" => format!(r#"{{"command":{},"description":{}}}"#, jstr(&format!("cargo test {}", r.below(100))), text_lit(r, 4)),
+                "Edit" => format!(r#"{{"file_path":"/repo/src/{}.rs","old_string":{},"new_string":{}}}"#, r.below(20), text_lit(r, 8), text_lit(r, 8)),
+                _ => format!(r#"{{"file_path":"/repo/src/{}.rs","limit":{},"ratio":{}}}"#, r.below(20), r.below(500), "1.5e-3"),
+            }
         };
         bs.push(format!(r#"{{"type":"tool_use","id":"{id}","name":"{tool}","input":{input}}}"#));
         calls.push(id);
@@ -240,6 +308,12 @@ fn body(r: &mut Rng, model: &str, system: &str, tools: &str, msgs: &[Msg], prett
 
 /// All requests of synthetic session `no`, in order.
 pub fn session(seed: u64, no: u64, n_requests: usize) -> Vec<SynthRequest> {
+    session_with(seed, no, n_requests, false)
+}
+
+/// Like [`session`]; with `rich`, tool inputs exercise the query engine's text handling
+/// (see `rich_input`). Without it, the requests are exactly [`session`]'s.
+pub fn session_with(seed: u64, no: u64, n_requests: usize, rich: bool) -> Vec<SynthRequest> {
     let mut r = Rng::new(seed.wrapping_mul(1_000_003).wrapping_add(no));
     let session = format!("{:08x}-synth-{no}", seed as u32);
     let agent = if r.chance(0.3) { format!("a{:016x}", r.next()) } else { String::new() };
@@ -276,7 +350,7 @@ pub fn session(seed: u64, no: u64, n_requests: usize) -> Vec<SynthRequest> {
         }
         out.push(req(&session, &agent, no, k, start, body(&mut r, model, &system, &tools, &msgs, pretty)));
         // the model answers; tools run
-        let (a, calls) = assistant(&mut r, &mut ids);
+        let (a, calls) = assistant(&mut r, &mut ids, rich);
         msgs.push(a);
         if r.chance(0.05) {
             // the same short message twice in one context

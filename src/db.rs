@@ -32,13 +32,14 @@ use crate::manifest::{Dead, Manifest};
 use crate::record::*;
 use crate::segment::{decode_core, decode_steps, key_bytes, seg_path, CorePart, DirEnt, SegNode, SegWriter, Segment, StepPart};
 use crate::split::{self, HoleKind, Keep, OpaqueEnc, OpaqueHole, OpaqueKind, Skeleton};
+use crate::stats::{self, FieldDir, FieldRows, StatsHead, ValChunk, Words};
 use crate::steps::{self, FieldVal, SessionSteps, StepDicts, StepRow};
 use crate::wal::{self, SyncMode, WalWriter};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use xxhash_rust::xxh3::{xxh3_128, xxh3_128_with_seed};
 
 #[derive(Debug, Clone)]
@@ -280,6 +281,8 @@ pub struct Stats {
     pub catalog_bytes: usize,
     /// File bytes of session parts that folds replaced, not yet dropped by a rewrite.
     pub dead_bytes: u64,
+    /// Segment bytes of the step summaries (part of `seg_file_bytes`).
+    pub summary_bytes: u64,
     pub active_sessions: usize,
     pub active_bytes: usize,
     pub caches: Vec<(&'static str, CacheStats)>,
@@ -298,6 +301,69 @@ struct BlobFile {
     uid: u64,
     path: PathBuf,
     len: u64,
+}
+
+/// Where a query that reads summaries finds steps (see [`Db::step_sources`]).
+#[derive(Debug, Clone)]
+pub enum StepSource {
+    /// A segment's summaries; with `live`, only the parts marked live count.
+    Seg { num: u32, live: Option<Arc<Vec<bool>>> },
+    /// Steps `start..end` of a session, read from its steps.
+    Rows { session: u32, start: u32, end: u32 },
+}
+
+/// A decoded block of a segment's summaries.
+pub enum StatBlock {
+    Head(StatsHead),
+    Rows(FieldRows),
+    Vals(ValChunk),
+    Words(Words),
+    Post(Vec<u8>),
+    /// A block of encoded step parts, read for the values of fields listed by step.
+    Raw(Vec<u8>),
+}
+
+impl StatBlock {
+    fn bytes(&self) -> usize {
+        match self {
+            StatBlock::Head(h) => h.bytes(),
+            StatBlock::Rows(r) => r.bytes(),
+            StatBlock::Vals(v) => 64 + v.buf.len() + v.off.len() * 4,
+            StatBlock::Words(w) => w.bytes(),
+            StatBlock::Post(p) | StatBlock::Raw(p) => 32 + p.len(),
+        }
+    }
+    // A block is cached under its own offset, so it always has the kind it was read as.
+    pub fn head(&self) -> &StatsHead {
+        match self {
+            StatBlock::Head(x) => x,
+            _ => unreachable!("summary block of another kind"),
+        }
+    }
+    pub fn rows(&self) -> &FieldRows {
+        match self {
+            StatBlock::Rows(x) => x,
+            _ => unreachable!("summary block of another kind"),
+        }
+    }
+    pub fn vals(&self) -> &ValChunk {
+        match self {
+            StatBlock::Vals(x) => x,
+            _ => unreachable!("summary block of another kind"),
+        }
+    }
+    pub fn words(&self) -> &Words {
+        match self {
+            StatBlock::Words(x) => x,
+            _ => unreachable!("summary block of another kind"),
+        }
+    }
+    pub fn post(&self) -> &[u8] {
+        match self {
+            StatBlock::Post(x) | StatBlock::Raw(x) => x,
+            _ => unreachable!("summary block of another kind"),
+        }
+    }
 }
 
 pub struct Db {
@@ -320,8 +386,15 @@ pub struct Db {
     ix: Cache<(u32, u8, u32), IxBlock>,
     cores: Cache<u32, SessionCore>,
     stepc: Cache<u32, SessionSteps>,
+    /// Sessions' steps without their input values, for queries that read none.
+    lightc: Cache<u32, SessionSteps>,
     pieces: Cache<u32, Vec<u8>>,
     skels: Cache<u32, Skeleton>,
+    /// Decoded summary blocks by (segment, offset).
+    statc: Cache<(u32, u64), StatBlock>,
+    /// Per segment holding parts that folds replaced: which of its parts are live, as of a
+    /// manifest generation.
+    live_masks: Mutex<HashMap<u32, (u64, Arc<Vec<bool>>)>>,
     active: HashMap<u32, Active>,
     /// Sessions that took writes in the last `idle_flushes` flushes, as of the last flush
     /// (merges after it drop them from `active`).
@@ -451,9 +524,12 @@ impl Db {
             blocks: Cache::sharded(cb / 8, 16),
             ix: Cache::sharded(cb / 8, 16),
             cores: Cache::new(cb / 4),
-            stepc: Cache::new(cb / 4),
+            stepc: Cache::new(cb / 6),
+            lightc: Cache::new(cb / 12),
             pieces: Cache::sharded(cb / 16, 16),
             skels: Cache::sharded(cb / 32, 16),
+            statc: Cache::new(cb / 12),
+            live_masks: Mutex::new(HashMap::new()),
             active: HashMap::new(),
             busy: BTreeSet::new(),
             key_ix: HashMap::new(),
@@ -749,6 +825,30 @@ impl Db {
         if let Some(c) = self.stepc.get(&s) {
             return Ok(c);
         }
+        let ss = self.read_steps(s)?;
+        let size = ss.bytes();
+        Ok(self.stepc.insert(s, Arc::new(ss), size))
+    }
+
+    /// A session's steps without their input values (or with them, when they are at hand),
+    /// cached on their own: queries whose tests read no values use this.
+    fn load_light_steps(&self, s: u32) -> Result<Arc<SessionSteps>> {
+        if let Some(a) = self.active.get(&s) {
+            return Ok(a.steps.clone());
+        }
+        if let Some(c) = self.stepc.get(&s) {
+            return Ok(c);
+        }
+        if let Some(c) = self.lightc.get(&s) {
+            return Ok(c);
+        }
+        let ss = self.read_steps(s)?.without_values();
+        let size = ss.bytes();
+        Ok(self.lightc.insert(s, Arc::new(ss), size))
+    }
+
+    /// Decode a session's steps from its parts (with its turns and steps by shape code).
+    fn read_steps(&self, s: u32) -> Result<SessionSteps> {
         let parts = self.parts(s)?;
         let mut ss = SessionSteps::default();
         let mut fs: Vec<(u32, FieldVal)> = Vec::new();
@@ -781,8 +881,9 @@ impl Db {
             }
         }
         ss.flushed = ss.rows.len() as u32;
-        let size = ss.bytes();
-        Ok(self.stepc.insert(s, Arc::new(ss), size))
+        ss.turns();
+        ss.by_shape();
+        Ok(ss)
     }
 
     /// Load a session for writing (no-op if it already takes writes).
@@ -795,6 +896,7 @@ impl Db {
         let steps = self.load_steps(s)?;
         self.cores.remove(&s);
         self.stepc.remove(&s);
+        self.lightc.remove(&s);
         let mut ss = Arc::unwrap_or_clone(steps);
         let mut children = HashMap::with_capacity(core.nodes.len());
         for (i, n) in core.nodes.iter().enumerate() {
@@ -1166,7 +1268,7 @@ impl Db {
 
     /// Steps `rows` of a session with the segment's tool and field codes and a dictionary
     /// of their own values.
-    fn step_part(&self, w: &mut SegWriter, ss: &SessionSteps, rows: std::ops::Range<u32>) -> StepPart {
+    fn step_part(&self, w: &mut SegWriter, s: u32, ss: &SessionSteps, rows: std::ops::Range<u32>) -> Result<StepPart> {
         let mut vl: HashMap<(u32, u32), u32> = HashMap::new();
         let mut p = StepPart { first: rows.start, ..StepPart::default() };
         for pos in rows {
@@ -1177,6 +1279,9 @@ impl Db {
                 let lf = w.field_code(self.sd.fields.get(f));
                 let lv = if steps::is_long(v) {
                     p.longs.push(ss.long_at(v));
+                    // the summaries index long values' words, so their text is read here
+                    let name = String::from_utf8_lossy(self.sd.fields.get(f)).into_owned();
+                    p.long_text.push(self.long_value(s, ss, pos, v, &name)?.unwrap_or_default());
                     steps::LONG_BASE + p.longs.len() as u32 - 1
                 } else {
                     *vl.entry((f, v)).or_insert_with(|| {
@@ -1189,7 +1294,7 @@ impl Db {
             p.rows.push(r);
             p.fields.push(fs);
         }
-        p
+        Ok(p)
     }
 
     /// Write nodes `nodes` and requests `reqs` of a session as one part, main line first.
@@ -1308,7 +1413,7 @@ impl Db {
             let a = &self.active[&s];
             let (core, ss) = (&a.core, &a.steps);
             let cp = self.core_part(&mut w, core, core.flushed_nodes..core.nodes.len() as u32, core.flushed_reqs..core.requests.len() as u32)?;
-            let sp = self.step_part(&mut w, ss, ss.flushed..ss.rows.len() as u32);
+            let sp = self.step_part(&mut w, s, ss, ss.flushed..ss.rows.len() as u32)?;
             w.add(s, core.key.clone(), &cp, &sp)?;
             written.push((s, cp));
         }
@@ -1517,7 +1622,7 @@ impl Db {
             for (a, b) in runs {
                 let (pa, pb) = (&parts[a].1, &parts[b - 1].1);
                 let cp = self.core_part(wr, &core, pa.first_node..pb.first_node + pb.n_nodes, pa.first_req..pb.first_req + pb.n_reqs)?;
-                let sp = self.step_part(wr, &ss, pa.first_row..pb.first_row + pb.n_rows);
+                let sp = self.step_part(wr, s, &ss, pa.first_row..pb.first_row + pb.n_rows)?;
                 wr.add(s, core.key.clone(), &cp, &sp)?;
             }
         }
@@ -1540,7 +1645,7 @@ impl Db {
             return corrupt("merge with unflushed sessions");
         }
         self.key_ix.clear();
-        for c in [&self.cores as &dyn Clear, &self.stepc, &self.dirs, &self.blocks] {
+        for c in [&self.cores as &dyn Clear, &self.stepc, &self.lightc, &self.dirs, &self.blocks, &self.statc] {
             c.clear_all();
         }
         let mut bytes_out = 0;
@@ -2006,6 +2111,7 @@ impl Db {
             st.node_bytes += c.node_bytes;
             st.frame_bytes += c.frame_bytes;
             st.seg_file_bytes += sg.file_bytes;
+            st.summary_bytes += c.stats_bytes;
             st.catalog_bytes += c.bytes();
         }
         let dead = self.dead_total();
@@ -2044,6 +2150,8 @@ impl Db {
         st.caches = vec![
             ("sessions", self.cores.stats()),
             ("steps", self.stepc.stats()),
+            ("steps without values", self.lightc.stats()),
+            ("step summaries", self.statc.stats()),
             ("blocks", self.blocks.stats()),
             ("directories", self.dirs.stats()),
             ("index blocks", self.ix.stats()),
@@ -2059,6 +2167,21 @@ impl Db {
 
     pub fn try_steps(&self, s: u32) -> Result<Arc<SessionSteps>> {
         self.load_steps(s)
+    }
+
+    /// A session's steps with their values if they are in memory already (taking writes or
+    /// cached), without reading anything.
+    pub fn cached_steps(&self, s: u32) -> Option<Arc<SessionSteps>> {
+        if let Some(a) = self.active.get(&s) {
+            return Some(a.steps.clone());
+        }
+        self.stepc.get(&s)
+    }
+
+    /// A session's steps, possibly without their input values (`light`): for reading rows,
+    /// field codes, turns and shapes only.
+    pub fn light_steps(&self, s: u32) -> Result<Arc<SessionSteps>> {
+        self.load_light_steps(s)
     }
 
     /// Tool and field names.
@@ -2110,6 +2233,151 @@ impl Db {
                 Ok(Some(out))
             }
         }
+    }
+
+    /// The raw JSON text of long input value `v` (a `LONG_BASE` code) of field `name` of
+    /// step `pos`: just its bytes, unless an opaque value sits inside (then the message is
+    /// rebuilt). `None` if the call no longer has the field.
+    pub fn long_value(&self, s: u32, ss: &SessionSteps, pos: u32, v: u32, name: &str) -> Result<Option<Vec<u8>>> {
+        let (off, len) = ss.long_at(v);
+        let r = ss.rows[pos as usize];
+        match self.stored_range(s, r.call_node, off, len)? {
+            Some(b) => Ok(Some(b)),
+            None => self.read_input(s, ss, pos, name),
+        }
+    }
+
+    /// The raw JSON text of input field `name` of a step, read from the stored message (the
+    /// full message only if an opaque value sits inside that field).
+    pub fn read_input(&self, s: u32, ss: &SessionSteps, pos: u32, name: &str) -> Result<Option<Vec<u8>>> {
+        let r = ss.rows[pos as usize];
+        let find = |m: &[u8]| -> Option<(usize, usize)> {
+            let (calls, _) = steps::scan_message(m);
+            let c = calls.iter().find(|c| c.block == r.call_block)?;
+            let (_, v) = c.fields.iter().find(|(k, _)| *k == name.as_bytes())?;
+            let start = v.as_ptr() as usize - m.as_ptr() as usize;
+            Some((start, start + v.len()))
+        };
+        let (stored, holes) = self.stored_message(s, r.call_node)?;
+        match find(&stored) {
+            None => Ok(None),
+            Some((a, b)) if !holes.iter().any(|&h| (h as usize) >= a && (h as usize) <= b) => Ok(Some(stored[a..b].to_vec())),
+            Some(_) => {
+                let m = self.message(s, r.call_node)?;
+                Ok(find(&m).map(|(a, b)| m[a..b].to_vec()))
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------ step summaries
+
+    /// Where every step is, for queries that read summaries: each live segment with
+    /// summaries as a whole (with which of its parts are live, when folds replaced some),
+    /// and as row ranges of sessions the rest: parts in segments without summaries and
+    /// steps not yet flushed. Every step of every session is in exactly one source.
+    pub fn step_sources(&self) -> Result<Vec<StepSource>> {
+        let mut out = Vec::new();
+        for (&num, seg) in &self.segs {
+            let live = if self.manifest.dead.iter().any(|(n, _)| *n == num) { Some(self.live_mask(seg)?) } else { None };
+            if seg.cat.stats.is_some() {
+                out.push(StepSource::Seg { num, live });
+                continue;
+            }
+            let mut i = 0;
+            for k in 0..seg.cat.dirs.len() {
+                for d in self.dir_block(seg, k)?.iter() {
+                    if live.as_ref().is_none_or(|m| m[i]) && d.n_rows > 0 {
+                        out.push(StepSource::Rows { session: d.session, start: d.first_row, end: d.first_row + d.n_rows });
+                    }
+                    i += 1;
+                }
+            }
+        }
+        let mut act: Vec<(&u32, &Active)> = self.active.iter().collect();
+        act.sort_by_key(|x| *x.0);
+        for (&s, a) in act {
+            if (a.steps.flushed as usize) < a.steps.rows.len() {
+                out.push(StepSource::Rows { session: s, start: a.steps.flushed, end: a.steps.rows.len() as u32 });
+            }
+        }
+        Ok(out)
+    }
+
+    /// Which parts of a segment are live (in directory order): a part a fold replaced is
+    /// covered by a part of the same session in another segment.
+    fn live_mask(&self, seg: &Arc<Segment>) -> Result<Arc<Vec<bool>>> {
+        let generation = self.manifest.generation;
+        if let Some((g, m)) = self.live_masks.lock().unwrap().get(&seg.num)
+            && *g == generation
+        {
+            return Ok(m.clone());
+        }
+        let mut mask = Vec::new();
+        let mut live_of: HashMap<u32, Vec<(u32, u32)>> = HashMap::new();
+        for k in 0..seg.cat.dirs.len() {
+            for d in self.dir_block(seg, k)?.iter() {
+                if let std::collections::hash_map::Entry::Vacant(e) = live_of.entry(d.session) {
+                    e.insert(self.parts(d.session)?.iter().filter(|p| p.0.num == seg.num).map(|p| (p.1.first_req, p.1.first_row)).collect());
+                }
+                mask.push(live_of[&d.session].contains(&(d.first_req, d.first_row)));
+            }
+        }
+        let m = Arc::new(mask);
+        self.live_masks.lock().unwrap().insert(seg.num, (generation, m.clone()));
+        Ok(m)
+    }
+
+    fn stat_block(&self, num: u32, r: &BlockRef, decode: impl FnOnce(&[u8]) -> Result<StatBlock>) -> Result<Arc<StatBlock>> {
+        let key = (num, r.off);
+        if let Some(b) = self.statc.get(&key) {
+            return Ok(b);
+        }
+        let seg = self.segs.get(&num).ok_or_else(|| bad(format!("segment {num} is gone")))?;
+        let b = decode(&seg.block(r)?)?;
+        let size = b.bytes();
+        Ok(self.statc.insert(key, Arc::new(b), size))
+    }
+
+    /// The head of a segment's summaries (`None` for a segment written without them).
+    pub fn stats_head(&self, num: u32) -> Result<Option<Arc<StatBlock>>> {
+        let Some(seg) = self.segs.get(&num) else { return corrupt(format!("segment {num} is gone")) };
+        let Some(r) = seg.cat.stats else { return Ok(None) };
+        Ok(Some(self.stat_block(num, &r, |b| Ok(StatBlock::Head(stats::decode_head(b)?)))?))
+    }
+
+    pub fn stats_rows(&self, num: u32, head: &StatsHead, f: &FieldDir) -> Result<Arc<StatBlock>> {
+        let n = head.parts.len();
+        self.stat_block(num, &f.rows, |b| Ok(StatBlock::Rows(stats::decode_rows(b, n)?)))
+    }
+
+    /// The block of values holding value `v` of a field.
+    pub fn stats_values(&self, num: u32, f: &FieldDir, v: u32) -> Result<Arc<StatBlock>> {
+        let i = f.chunks.partition_point(|c| c.0 <= v).checked_sub(1).ok_or_else(|| bad("summary value before the first block"))?;
+        let (first, r) = f.chunks[i];
+        let b = self.stat_block(num, &r, |b| Ok(StatBlock::Vals(stats::decode_chunk(b, first)?)))?;
+        if (v - first) as usize >= b.vals().len() {
+            return corrupt("summary value past its block");
+        }
+        Ok(b)
+    }
+
+    /// A field's word list and postings.
+    pub fn stats_words(&self, num: u32, f: &FieldDir) -> Result<(Arc<StatBlock>, Arc<StatBlock>)> {
+        let post = self.stat_block(num, &f.post, |b| Ok(StatBlock::Post(b.to_vec())))?;
+        let n = post.post().len();
+        let words = self.stat_block(num, &f.words, |b| Ok(StatBlock::Words(stats::decode_words(b, n)?)))?;
+        Ok((words, post))
+    }
+
+    /// A block of encoded step parts, decompressed, kept with the summaries' blocks (whose
+    /// cache is not split into shards, so a block of one large session still fits).
+    pub fn step_block(&self, num: u32, r: &BlockRef) -> Result<Arc<StatBlock>> {
+        self.stat_block(num, r, |b| Ok(StatBlock::Raw(b.to_vec())))
+    }
+
+    /// A segment's tool and field codes mapped to the store's.
+    pub fn seg_codes(&self, num: u32) -> Option<&(Vec<u32>, Vec<u32>)> {
+        self.seg_codes.get(&num)
     }
 
     /// One message (tree node) of a session, with opaque values put back.
@@ -2195,7 +2463,7 @@ impl Db {
 
     /// Drop everything read from files from the caches (sessions taking writes stay).
     pub fn clear_caches(&self) {
-        for c in [&self.cores as &dyn Clear, &self.stepc, &self.dirs, &self.blocks, &self.ix, &self.pieces, &self.skels] {
+        for c in [&self.cores as &dyn Clear, &self.stepc, &self.lightc, &self.dirs, &self.blocks, &self.ix, &self.pieces, &self.skels, &self.statc] {
             c.clear_all();
         }
     }

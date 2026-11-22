@@ -51,34 +51,13 @@ pub fn resolve(path: &[String]) -> Result<StepCol, QError> {
 /// The raw JSON text of input field `name` of a step, read from the stored message (the
 /// full message only if an opaque value sits inside that field).
 pub fn read_input(db: &Db, s: u32, ss: &SessionSteps, pos: u32, name: &str) -> Result<Option<Vec<u8>>, QError> {
-    let r = ss.rows[pos as usize];
-    let find = |m: &[u8]| -> Option<(usize, usize)> {
-        let (calls, _) = steps::scan_message(m);
-        let c = calls.iter().find(|c| c.block == r.call_block)?;
-        let (_, v) = c.fields.iter().find(|(k, _)| *k == name.as_bytes())?;
-        let start = v.as_ptr() as usize - m.as_ptr() as usize;
-        Some((start, start + v.len()))
-    };
-    let (stored, holes) = db.stored_message(s, r.call_node).map_err(|e| QError::new(e.to_string()))?;
-    match find(&stored) {
-        None => Ok(None),
-        Some((a, b)) if !holes.iter().any(|&h| (h as usize) >= a && (h as usize) <= b) => Ok(Some(stored[a..b].to_vec())),
-        Some(_) => {
-            let m = db.message(s, r.call_node).map_err(|e| QError::new(e.to_string()))?;
-            Ok(find(&m).map(|(a, b)| m[a..b].to_vec()))
-        }
-    }
+    db.read_input(s, ss, pos, name).map_err(|e| QError::new(e.to_string()))
 }
 
 /// The raw JSON text of long value `v` (a `LONG_BASE` code) of input field `name`: only its
 /// bytes are read, unless an opaque value sits inside (then the whole message).
 pub fn long_value(db: &Db, s: u32, ss: &SessionSteps, pos: u32, v: u32, name: &str) -> Result<Option<Vec<u8>>, QError> {
-    let (off, len) = ss.long_at(v);
-    let r = ss.rows[pos as usize];
-    match db.stored_range(s, r.call_node, off, len).map_err(|e| QError::new(e.to_string()))? {
-        Some(b) => Ok(Some(b)),
-        None => read_input(db, s, ss, pos, name),
-    }
+    db.long_value(s, ss, pos, v, name).map_err(|e| QError::new(e.to_string()))
 }
 
 /// The value of one step column.
@@ -282,9 +261,13 @@ fn compile_atom(db: &Db, e: &Expr, now: i64) -> Result<Sp, QError> {
         match single_col(e)? {
             Some(StepCol::Tool) => {
                 let col = StepCol::Tool;
-                let t: Vec<bool> = (0..sd.tools.len() as u32)
-                    .map(|c| eval(e, &OneCol { col: &col, v: Value::Str(String::from_utf8_lossy(sd.tools.get(c)).into()), now }).map(|v| v.truthy()))
-                    .collect::<Result<_, _>>()?;
+                let t: Vec<bool> = match tool_name_test(e) {
+                    // common forms tested on the names directly, without building values
+                    Some(f) => (0..sd.tools.len() as u32).map(|c| f(&name(sd.tools.get(c)))).collect(),
+                    None => (0..sd.tools.len() as u32)
+                        .map(|c| eval(e, &OneCol { col: &col, v: Value::Str(String::from_utf8_lossy(sd.tools.get(c)).into()), now }).map(|v| v.truthy()))
+                        .collect::<Result<_, _>>()?,
+                };
                 Sp::Tool(t.into())
             }
             Some(StepCol::Field(name)) => {
@@ -304,42 +287,183 @@ fn compile_atom(db: &Db, e: &Expr, now: i64) -> Result<Sp, QError> {
     })
 }
 
-/// Test one dictionary value (raw JSON text) against a one-column expression. String tests
-/// with a literal pattern run on the text itself, decoded only if it has escapes.
+/// A name as text (checked as UTF-8 first: much faster than a lossy conversion that has
+/// nothing to replace).
+fn name(b: &[u8]) -> std::borrow::Cow<'_, str> {
+    match std::str::from_utf8(b) {
+        Ok(s) => std::borrow::Cow::Borrowed(s),
+        Err(_) => String::from_utf8_lossy(b),
+    }
+}
+
+/// `tool == "x"`, `tool != "x"`, `tool in (...)` and string tests against a literal, as a
+/// test on the name that agrees with evaluating the expression.
+fn tool_name_test(e: &Expr) -> Option<Box<dyn Fn(&str) -> bool>> {
+    use super::parse::CmpOp;
+    let lit = |x: &Expr| match x {
+        Expr::Lit(Value::Str(s)) => Some(s.to_string()),
+        _ => None,
+    };
+    let is_ref = |x: &Expr| matches!(x, Expr::Ref(_));
+    match e {
+        Expr::Cmp(op @ (CmpOp::Eq | CmpOp::Ne), a, b) => {
+            let l = if is_ref(a) { lit(b)? } else if is_ref(b) { lit(a)? } else { return None };
+            let eq = *op == CmpOp::Eq;
+            Some(Box::new(move |n| (n == l) == eq))
+        }
+        Expr::In { e: inner, list, neg } if is_ref(inner) => {
+            let ls: Vec<String> = list.iter().map(lit).collect::<Option<_>>()?;
+            let neg = *neg;
+            Some(Box::new(move |n| ls.iter().any(|l| l == n) != neg))
+        }
+        Expr::Str { op, e: inner, pat, neg, cs } if is_ref(inner) => {
+            let (op, p, neg, cs) = (*op, lit(pat)?, *neg, *cs);
+            Some(Box::new(move |n| super::value::str_op(op, n, &p, cs) != neg))
+        }
+        _ => None,
+    }
+}
+
+/// `contains` on the raw text of a JSON string (between the quotes), giving the answer
+/// for the decoded text without decoding it, or `None` when that cannot be done.
+///
+/// It can when the pattern is ASCII with no character an escape stands for (quote,
+/// backslash, control characters, and `/` if the text has `\/`) and the text has no `\u`
+/// escapes: then the decoded text holds the pattern exactly where the raw text holds it
+/// starting at a character that is not escaped (one not right after an odd run of
+/// backslashes). Case-insensitive tests also need the text free of the two characters
+/// whose lower case is ASCII (U+0130 and U+212A): otherwise lower-casing the decoded text
+/// changes only ASCII letters, as an ASCII-only comparison does.
+pub fn raw_contains(body: &[u8], p: &[u8], cs: bool) -> Option<bool> {
+    use memchr::memmem::find;
+    if !p.iter().all(|&c| c.is_ascii() && c >= 0x20 && c != b'"' && c != b'\\') || find(body, b"\\u").is_some() || (p.contains(&b'/') && find(body, b"\\/").is_some()) {
+        return None;
+    }
+    if !cs && !body.is_ascii() && (find(body, "\u{130}".as_bytes()).is_some() || find(body, "\u{212a}".as_bytes()).is_some()) {
+        return None;
+    }
+    let mut i = 0;
+    loop {
+        let at = if cs { find(&body[i..], p) } else { super::value::ascii_ci_find(&body[i..], p) };
+        let Some(k) = at else { return Some(false) };
+        let a = i + k;
+        let slashes = body[..a].iter().rev().take_while(|&&c| c == b'\\').count();
+        if slashes % 2 == 0 {
+            return Some(true);
+        }
+        i = a + 1;
+    }
+}
+
+/// Test one value (raw JSON text) against a one-column expression, as evaluating it on the
+/// decoded value does. String tests with a literal pattern run on the text itself, decoded
+/// only if that cannot decide.
 fn test_raw(e: &Expr, name: &str, raw: &[u8], now: i64) -> Result<bool, QError> {
     if let Expr::Str { op, e: inner, pat, neg, cs } = e
         && let (Expr::Ref(_), Expr::Lit(Value::Str(p))) = (inner.as_ref(), pat.as_ref())
-            && raw.len() >= 2 && raw[0] == b'"' {
-                let body = &raw[1..raw.len() - 1];
-                // Without \u escapes, a pattern free of characters JSON escapes (quote,
-                // backslash, control) can only occur in the decoded text where it also occurs
-                // in the raw text. So a raw miss is a real miss; raw hits are confirmed on the
-                // decoded text (an escape like \t could fake one). ASCII only, so case folding
-                // agrees with the general path.
-                if *op == super::parse::StrOp::Contains
-                    && !*cs
-                    && p.bytes().all(|c| c.is_ascii() && c >= 0x20 && c != b'"' && c != b'\\')
-                    && body.is_ascii()
-                    && memchr::memmem::find(body, b"\\u").is_none()
-                    && !super::value::str_op(super::parse::StrOp::Contains, std::str::from_utf8(body).unwrap(), p, false)
-                {
-                    return Ok(*neg);
-                }
-                let hit = if body.contains(&b'\\') {
-                    super::value::str_op(*op, &super::value::json_unescape(body), p, *cs)
-                } else {
-                    match std::str::from_utf8(body) {
-                        Ok(t) => super::value::str_op(*op, t, p, *cs),
-                        Err(_) => super::value::str_op(*op, &String::from_utf8_lossy(body), p, *cs),
-                    }
-                };
-                return Ok(hit != *neg);
+        && raw.len() >= 2
+        && raw[0] == b'"'
+    {
+        let body = &raw[1..raw.len() - 1];
+        if *op == super::parse::StrOp::Contains
+            && let Some(hit) = raw_contains(body, p.as_bytes(), *cs)
+        {
+            return Ok(hit != *neg);
+        }
+        let hit = if body.contains(&b'\\') {
+            super::value::str_op(*op, &super::value::json_unescape(body), p, *cs)
+        } else {
+            match std::str::from_utf8(body) {
+                Ok(t) => super::value::str_op(*op, t, p, *cs),
+                Err(_) => super::value::str_op(*op, &String::from_utf8_lossy(body), p, *cs),
             }
+        };
+        return Ok(hit != *neg);
+    }
     let col = StepCol::Field(name.to_string());
     Ok(eval(e, &OneCol { col: &col, v: Value::from_json(raw), now })?.truthy())
 }
 
+/// A step's value of the field an atom tests, as the summaries hand it over.
+#[derive(Debug, Clone, Copy)]
+pub enum FieldArg<'a> {
+    Missing,
+    /// A dictionary value (JSON text).
+    Short(&'a [u8]),
+    /// A long value's text (`None` if it could not be found in the call).
+    Long(Option<&'a [u8]>),
+}
+
+/// The answer of a field atom (`Field` or `Present`) for one value, exactly as
+/// [`Sp::test`] gives it for a step with that value.
+pub fn field_atom(sp: &Sp, arg: FieldArg, now: i64) -> Result<bool, QError> {
+    match sp {
+        Sp::Field { name, missing, expr, .. } => match arg {
+            FieldArg::Missing => Ok(*missing),
+            FieldArg::Short(t) | FieldArg::Long(Some(t)) => test_raw(expr, name, t, now),
+            FieldArg::Long(None) => {
+                let col = StepCol::Field(name.clone());
+                Ok(eval(expr, &OneCol { col: &col, v: Value::Null, now })?.truthy())
+            }
+        },
+        Sp::Present { want, .. } => {
+            let present = match arg {
+                FieldArg::Missing => false,
+                FieldArg::Short(t) => t != b"null",
+                FieldArg::Long(_) => true,
+            };
+            Ok(present == *want)
+        }
+        _ => Err(QError::new("internal: not a field test")),
+    }
+}
+
+/// The answer of a session atom for a session with this id and agent.
+pub fn session_atom(sp: &Sp, sid: &str, agent: &str, now: i64) -> Result<bool, QError> {
+    let Sp::Session { col, expr, .. } = sp else { return Err(QError::new("internal: not a session test")) };
+    let v = if *col == StepCol::Session { sid } else { agent };
+    Ok(eval(expr, &OneCol { col, v: Value::Str(v.into()), now })?.truthy())
+}
+
+/// A per-step expression decided by tool and outcome alone: its answer per tool code and
+/// outcome, or `None` if it reads other columns.
+pub fn shape_atom(db: &Db, e: &Expr, now: i64) -> Option<Vec<[bool; 2]>> {
+    let mut refs = Vec::new();
+    e.refs(&mut refs);
+    let cols: Vec<StepCol> = refs.into_iter().map(|r| resolve(r).ok()).collect::<Option<_>>()?;
+    if !cols.iter().all(|c| matches!(c, StepCol::Tool | StepCol::Failed | StepCol::Ok)) {
+        return None;
+    }
+    let sd = db.step_dicts();
+    let one = |tool: &str| -> Option<[bool; 2]> {
+        let a = eval(e, &ShapeCtx { tool, failed: false, now }).ok()?.truthy();
+        let b = eval(e, &ShapeCtx { tool, failed: true, now }).ok()?.truthy();
+        Some([a, b])
+    };
+    if !cols.contains(&StepCol::Tool) {
+        let x = one("")?;
+        return Some(vec![x; sd.tools.len()]);
+    }
+    (0..sd.tools.len() as u32).map(|t| one(&String::from_utf8_lossy(sd.tools.get(t)))).collect()
+}
+
 impl Sp {
+    /// Whether testing a step reads its input values (so it needs the session's steps with
+    /// their values, not a copy without them).
+    pub fn reads_values(&self) -> bool {
+        match self {
+            Sp::Const(_) | Sp::Tool(_) | Sp::Session { .. } => false,
+            Sp::Field { .. } | Sp::Present { .. } => true,
+            Sp::Generic(e) => {
+                let mut refs = Vec::new();
+                e.refs(&mut refs);
+                refs.iter().any(|r| !matches!(resolve(r), Ok(StepCol::Tool | StepCol::Failed | StepCol::Ok | StepCol::Time | StepCol::OutBytes | StepCol::Step | StepCol::Session | StepCol::Agent)))
+            }
+            Sp::And(v) | Sp::Or(v) => v.iter().any(|x| x.reads_values()),
+            Sp::Not(x) => x.reads_values(),
+        }
+    }
+
     pub fn test(&self, db: &Db, s: u32, ss: &SessionSteps, pos: u32, now: i64) -> Result<bool, QError> {
         Ok(match self {
             Sp::Const(b) => *b,
@@ -568,6 +692,43 @@ mod tests {
     fn atom(q: &str) -> Expr {
         let Some(crate::query::parse::Stage::Where(e)) = parse(q).unwrap().stages.into_iter().next() else { panic!() };
         e
+    }
+
+    #[test]
+    fn raw_contains_agrees_with_decoding() {
+        // (raw text between the quotes, pattern, case-sensitive)
+        let cases: &[(&str, &str, bool)] = &[
+            ("cargo test", "test", false),
+            ("cargo TEST", "test", false),
+            ("cargo TEST", "test", true),
+            (r"run \test", "test", false),
+            (r"run \\test", "test", false),
+            (r"run \\\test", "test", false),
+            (r"a\/b", "a/b", false),
+            (r"\u0067it commit", "git commit", false),
+            ("echo \u{212a}elvin", "kelvin", false),
+            ("echo \u{130}stanbul", "istanbul", false),
+            ("café — ok", "ok", false),
+            ("café — OK", "ok", false),
+            (r#"say \"hi\""#, "hi", false),
+            (r"line\nnext", "nnext", false),
+            (r"line\nnext", "next", false),
+        ];
+        for &(body, p, cs) in cases {
+            let decoded = crate::query::value::json_unescape(body.as_bytes());
+            let want = crate::query::value::str_op(crate::query::parse::StrOp::Contains, &decoded, p, cs);
+            if let Some(got) = raw_contains(body.as_bytes(), p.as_bytes(), cs) {
+                assert_eq!(got, want, "{body:?} contains {p:?} (cs {cs})");
+            }
+            let raw = format!("\"{body}\"");
+            let e = atom(&format!("where command {} {p:?}", if cs { "contains_cs" } else { "contains" }));
+            assert_eq!(test_raw(&e, "command", raw.as_bytes(), 0).unwrap(), want, "{body:?} contains {p:?} (cs {cs})");
+        }
+        // what a raw search cannot decide is handed back
+        assert_eq!(raw_contains(br"\u0067it", b"git", false), None);
+        assert_eq!(raw_contains(br"a\/b", b"a/b", false), None);
+        assert_eq!(raw_contains("\u{212a}".as_bytes(), b"k", false), None);
+        assert_eq!(raw_contains("\u{212a}".as_bytes(), b"k", true), Some(false));
     }
 
     #[test]
