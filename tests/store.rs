@@ -341,7 +341,7 @@ fn a_store_opens_in_one_place_at_a_time() {
 #[test]
 fn many_files_with_few_open_at_once() {
     let dir = tmpdir("files");
-    let o = Options { flush_bytes: 24 << 10, sync: SyncMode::Os, merge_at: 50, open_files: 4, cache_bytes: 64 << 10, ..Options::default() };
+    let o = Options { flush_bytes: 24 << 10, sync: SyncMode::Os, merge_at: 50, open_files: 4, cache_bytes: 64 << 10, blob_bytes: 16 << 10, ..Options::default() };
     let reqs = traffic(51, 10, 30);
     let mut db = Db::open(&dir, o.clone()).unwrap();
     for q in &reqs {
@@ -349,7 +349,78 @@ fn many_files_with_few_open_at_once() {
         db.commit().unwrap();
     }
     db.flush().unwrap();
-    assert!(db.stats().segments + db.stats().blobs > 20, "{} files", db.stats().segments + db.stats().blobs);
+    let st = db.stats();
+    assert!(st.segments > 20 && st.runs > 20 && st.blobs > 4, "{} segments, {} index runs, {} blob files", st.segments, st.runs, st.blobs);
+    check_all(&db, &reqs);
+    drop(db);
+    let db = Db::open(&dir, o).unwrap();
+    check_all(&db, &reqs);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn blob_files_fill_up_and_an_unfinished_append_is_cut() {
+    use std::io::Write;
+    let dir = tmpdir("blobfill");
+    let o = Options { flush_bytes: 32 << 10, sync: SyncMode::Os, blob_bytes: 24 << 10, ..Options::default() };
+    let reqs = traffic(61, 8, 30);
+    let (first, rest) = reqs.split_at(reqs.len() / 2);
+    let mut db = Db::open(&dir, o.clone()).unwrap();
+    for q in first {
+        put(&mut db, q);
+        db.commit().unwrap();
+    }
+    db.flush().unwrap();
+    let st = db.stats();
+    // each file grows past the cap once, then a new one starts: files follow bytes, not flushes
+    assert!(st.blobs >= 2 && (st.blobs as u64) <= st.blob_file_bytes / (24 << 10) + 1, "{} blob files for {} bytes", st.blobs, st.blob_file_bytes);
+    assert!(st.runs < 12, "{} index runs after {} flushes", st.runs, st.merges.merges);
+    drop(db);
+    // a flush that appended to the last blob file and crashed before the manifest
+    let mut blobs: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().path()).filter(|p| p.extension().is_some_and(|e| e == "dat")).collect();
+    blobs.sort();
+    std::fs::OpenOptions::new().append(true).open(blobs.last().unwrap()).unwrap().write_all(&[7u8; 1000]).unwrap();
+    let mut db = Db::open(&dir, o.clone()).unwrap();
+    assert_eq!(db.recovery.blob_tail_bytes, 1000);
+    check_all(&db, first);
+    for q in rest {
+        put(&mut db, q);
+        db.commit().unwrap();
+    }
+    // every request again: each is found by id through the index and stored once
+    for q in &reqs {
+        assert!(matches!(put(&mut db, q), PutOutcome::Duplicate(_)), "{} stored twice", q.id);
+    }
+    db.flush().unwrap();
+    check_all(&db, &reqs);
+    drop(db);
+    let db = Db::open(&dir, o).unwrap();
+    assert_eq!(db.recovery.blob_tail_bytes, 0);
+    check_all(&db, &reqs);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn index_runs_stay_few_through_many_small_flushes() {
+    let dir = tmpdir("runs");
+    let o = Options { flush_bytes: 24 << 10, sync: SyncMode::Os, merge_at: 3, seg_bytes: 64 << 10, run_bytes: 16 << 10, blob_bytes: 32 << 10, idle_flushes: 1, ..Options::default() };
+    let reqs = traffic(71, 12, 30);
+    let mut db = Db::open(&dir, o.clone()).unwrap();
+    for (i, q) in reqs.iter().enumerate() {
+        put(&mut db, q);
+        db.commit().unwrap();
+        if i % 7 == 0 {
+            db.flush().unwrap();
+        }
+        if i % 40 == 39 {
+            db.compact().unwrap();
+        }
+    }
+    db.flush().unwrap();
+    let st = db.stats();
+    // runs under the cap merge three at a time; the rest are full
+    let full = st.index_file_bytes / (16 << 10);
+    assert!((st.runs as u64) <= full + 2 * 3, "{} index runs for {} bytes of index", st.runs, st.index_file_bytes);
     check_all(&db, &reqs);
     drop(db);
     let db = Db::open(&dir, o).unwrap();

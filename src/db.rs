@@ -10,22 +10,24 @@
 //! that state only ever changes by applying a log record ([`Db::apply`]), both live and
 //! during recovery.
 //!
-//! What stays in memory does not grow with the data: the manifest, one small catalog per
-//! file, the sessions taking writes, the unflushed data, and caches with fixed budgets.
-//! A session is a self-contained unit (its messages, requests and steps) stored as parts
-//! in segments; it is read from its parts on demand. Shared pieces and opaque values are
-//! in blob files, found by id range, or by hash through each blob file's Bloom filter.
-//! Flushes write level-0 segments; merges combine them with the level-1 segments whose
-//! session ranges they touch, so finished sessions settle and are not rewritten again.
+//! What stays in memory hardly grows with the data: the manifest, one small catalog per
+//! segment and index run (nothing per key or per block), the sessions taking writes, the
+//! unflushed data, and caches with fixed budgets. A session is a self-contained unit (its
+//! messages, requests and steps) stored as parts in segments and read from its parts on
+//! demand. Shared pieces and opaque values are appended to blob files. The index finds a
+//! piece or opaque value by hash or by id, a request by its id and a session by its key;
+//! each flush adds an index run and runs merge by size tiers, so a lookup reads a few runs.
+//! Flushes write level-0 segments; merges combine segments by size tiers up to a cap.
 
-use crate::blob::{blob_path, find_in, Blob, BlobWriter, TBlock, HASHES, ID_BLOCK, OPAQUES, PIECES};
-use crate::bloom::key_hash;
+use crate::blob::{self, blob_path, BlobAppend};
+use crate::block::BlockRef;
 use crate::cache::{Cache, CacheStats};
+use crate::index::{self, IxBlock, OpaqueEnt, PieceEnt, Run, RunWriter, IDS, K_OPAQUES, K_PIECES, NS_OPAQUE, NS_PIECE, NS_REQUEST, NS_SESSION};
 use crate::codec::{corrupt, Error, Result};
 use crate::layout;
 use crate::manifest::Manifest;
 use crate::record::*;
-use crate::segment::{decode_core, decode_dir, decode_reqtab, decode_steps, key_bytes, seg_path, CorePart, DirEnt, ReqTab, SegNode, SegWriter, Segment, StepPart};
+use crate::segment::{decode_core, decode_steps, key_bytes, seg_path, CorePart, DirEnt, SegNode, SegWriter, Segment, StepPart};
 use crate::split::{self, HoleKind, Keep, OpaqueEnc, OpaqueHole, OpaqueKind, Skeleton};
 use crate::steps::{self, FieldVal, SessionSteps, StepDicts, StepRow};
 use crate::wal::{self, SyncMode, WalWriter};
@@ -57,8 +59,12 @@ pub struct Options {
     pub seg_bytes: u64,
     /// Sessions that took no writes for this many flushes stop being kept in memory.
     pub idle_flushes: u64,
-    /// Most segment and blob files kept open at once (process-wide).
+    /// Most segment, index and blob files kept open at once (process-wide).
     pub open_files: usize,
+    /// A flush starts a new blob file once the last one has this many bytes.
+    pub blob_bytes: u64,
+    /// Index runs this big are not merged again.
+    pub run_bytes: u64,
 }
 
 impl Default for Options {
@@ -75,6 +81,8 @@ impl Default for Options {
             seg_bytes: 256 << 20,
             idle_flushes: 2,
             open_files: 128,
+            blob_bytes: 1 << 30,
+            run_bytes: 1 << 30,
         }
     }
 }
@@ -203,6 +211,8 @@ pub struct RecoveryReport {
     pub skipped: usize,
     pub torn_bytes: u64,
     pub orphans_removed: usize,
+    /// Bytes cut from blob files past the length the manifest gives them.
+    pub blob_tail_bytes: u64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -236,6 +246,7 @@ pub struct Stats {
     pub opaques_dropped: usize,
     pub segments: usize,
     pub level0: usize,
+    pub runs: usize,
     pub blobs: usize,
     /// Uncompressed bytes of all stored messages (after cutting markers and opaque values).
     pub node_bytes: u64,
@@ -244,9 +255,10 @@ pub struct Stats {
     pub piece_raw_bytes: u64,
     pub piece_bytes: u64,
     pub opaque_bytes: u64,
-    /// Segment bytes other than frames: blocks of parts, request tables, directories, catalogs.
+    /// Segment bytes other than frames: blocks of parts, directories, catalogs.
     pub index_bytes: u64,
     pub seg_file_bytes: u64,
+    pub index_file_bytes: u64,
     pub blob_file_bytes: u64,
     pub wal_bytes: u64,
     pub mem_bytes: usize,
@@ -262,6 +274,20 @@ pub struct Stats {
     pub merges: MergeStats,
 }
 
+impl Stats {
+    /// Bytes of every file the store's data is in (segments, index runs, blob files).
+    pub fn store_bytes(&self) -> u64 {
+        self.seg_file_bytes + self.index_file_bytes + self.blob_file_bytes
+    }
+}
+
+/// A blob file: an id for the open-file cache, its path, and the length made durable.
+struct BlobFile {
+    uid: u64,
+    path: PathBuf,
+    len: u64,
+}
+
 pub struct Db {
     dir: PathBuf,
     /// Held with an exclusive lock while the store is open.
@@ -271,14 +297,15 @@ pub struct Db {
     segs: BTreeMap<u32, Arc<Segment>>,
     /// Per segment: its tool and field codes mapped to the store's.
     seg_codes: HashMap<u32, (Vec<u32>, Vec<u32>)>,
-    /// In file order, so piece and opaque id ranges ascend.
-    blobs: Vec<Arc<Blob>>,
-    dirs: Cache<u32, Vec<DirEnt>>,
-    /// Request table blocks by (segment, block).
-    reqtabs: Cache<(u32, u32), ReqTab>,
-    blocks: Cache<(u32, u32), Vec<u8>>,
-    /// Blob table blocks by (file, kind, index).
-    tables: Cache<(u32, u8, u32), TBlock>,
+    /// Index runs in id order (oldest first), so piece and opaque id ranges ascend.
+    runs: Vec<Arc<Run>>,
+    blob_files: BTreeMap<u32, BlobFile>,
+    /// Directory blocks by (segment, block).
+    dirs: Cache<(u32, u32), Vec<DirEnt>>,
+    /// Segment blocks by (segment, offset).
+    blocks: Cache<(u32, u64), Vec<u8>>,
+    /// Index blocks by (run, kind, index).
+    ix: Cache<(u32, u8, u32), IxBlock>,
     cores: Cache<u32, SessionCore>,
     stepc: Cache<u32, SessionSteps>,
     pieces: Cache<u32, Vec<u8>>,
@@ -303,6 +330,24 @@ fn piece_hash(kind: u8, b: &[u8]) -> u128 {
 
 fn opaque_hash(enc: u8, b: &[u8]) -> u128 {
     xxh3_128_with_seed(b, 0x6f70_0000 | enc as u64)
+}
+
+fn request_hash(id: &str) -> u128 {
+    xxh3_128_with_seed(id.as_bytes(), 0x7265_7100)
+}
+
+fn session_hash(key: &(String, String)) -> u128 {
+    xxh3_128_with_seed(&key_bytes(&key.0, &key.1), 0x7365_7300)
+}
+
+/// Size tier: 0 under 4 << `shift` bytes, then one more for every factor of 4.
+fn tier(b: u64, shift: u32) -> u32 {
+    let (mut t, mut x) = (0u32, b >> shift);
+    while x >= 4 {
+        x /= 4;
+        t += 1;
+    }
+    t
 }
 
 pub fn sha256(b: &[u8]) -> [u8; 32] {
@@ -335,11 +380,11 @@ impl Db {
             }
         };
         let mut rec = RecoveryReport::default();
-        let live: BTreeSet<u32> = manifest.segs.iter().chain(&manifest.blobs).copied().collect();
+        let live: BTreeSet<u32> = manifest.segs.iter().chain(&manifest.runs).copied().chain(manifest.blobs.iter().map(|b| b.0)).collect();
         let mut wal_nums = Vec::new();
         for e in fs::read_dir(&dir)? {
             let name = e?.file_name().to_string_lossy().into_owned();
-            let file = parse_num(&name, "seg-", ".tdb").or_else(|| parse_num(&name, "blob-", ".tdb"));
+            let file = parse_num(&name, "seg-", ".tdb").or_else(|| parse_num(&name, "idx-", ".tdb")).or_else(|| parse_num(&name, "blob-", ".dat"));
             if let Some(n) = file {
                 if !live.contains(&(n as u32)) {
                     fs::remove_file(dir.join(&name))?;
@@ -365,11 +410,11 @@ impl Db {
             manifest,
             segs: BTreeMap::new(),
             seg_codes: HashMap::new(),
-            blobs: Vec::new(),
-            dirs: Cache::new(cb / 16),
-            reqtabs: Cache::sharded(cb / 16, 16),
+            runs: Vec::new(),
+            blob_files: BTreeMap::new(),
+            dirs: Cache::sharded(cb / 16, 16),
             blocks: Cache::sharded(cb / 8, 16),
-            tables: Cache::sharded(cb / 16, 16),
+            ix: Cache::sharded(cb / 8, 16),
             cores: Cache::new(cb / 4),
             stepc: Cache::new(cb / 4),
             pieces: Cache::sharded(cb / 16, 16),
@@ -393,12 +438,14 @@ impl Db {
             db.add_segment(Segment::open(&db.dir, n)?);
             rec.segments += 1;
         }
-        let mut blobs = db.manifest.blobs.clone();
-        blobs.sort_unstable();
-        for n in blobs {
-            db.blobs.push(Arc::new(Blob::open(&db.dir, n)?));
+        for &(n, len) in &db.manifest.blobs {
+            rec.blob_tail_bytes += blob::trim(&db.dir, n, len, db.opts.sync)?;
+            db.blob_files.insert(n, BlobFile { uid: crate::block::uid(), path: blob_path(&db.dir, n), len });
         }
-        db.check_blob_ranges()?;
+        for &n in &db.manifest.runs {
+            db.runs.push(Arc::new(Run::open(&db.dir, n)?));
+        }
+        db.check_run_ranges()?;
         db.next_session = db.manifest.sessions;
         db.seq = db.manifest.checkpoint;
 
@@ -438,17 +485,17 @@ impl Db {
         self.segs.insert(seg.num, Arc::new(seg));
     }
 
-    fn check_blob_ranges(&self) -> Result<()> {
+    fn check_run_ranges(&self) -> Result<()> {
         let (mut p, mut o) = (0u32, 0u64);
-        for b in &self.blobs {
-            if b.cat.piece_lo != p || b.cat.opaque_lo != o {
-                return corrupt(format!("blob file {} does not continue the id ranges", b.num));
+        for r in &self.runs {
+            if r.cat.plo != p || r.cat.olo != o {
+                return corrupt(format!("index run {} does not continue the id ranges", r.num));
             }
-            p += b.cat.n_pieces;
-            o += b.cat.n_opaques;
+            p += r.cat.np;
+            o += r.cat.no;
         }
         if p != self.manifest.pieces || o != self.manifest.opaques {
-            return corrupt("blob files do not cover the ids the manifest names");
+            return corrupt("index runs do not cover the ids the manifest names");
         }
         Ok(())
     }
@@ -463,32 +510,33 @@ impl Db {
 
     // ------------------------------------------------------------------ finding things in files
 
-    fn dir_of(&self, seg: &Segment) -> Result<Arc<Vec<DirEnt>>> {
-        if let Some(d) = self.dirs.get(&seg.num) {
+    fn dir_block(&self, seg: &Segment, k: usize) -> Result<Arc<Vec<DirEnt>>> {
+        let key = (seg.num, k as u32);
+        if let Some(d) = self.dirs.get(&key) {
             return Ok(d);
         }
-        let d = decode_dir(&seg.block(seg.cat.dir)?)?;
-        let size = d.iter().map(|x| 96 + x.key.0.len() + x.key.1.len()).sum();
-        Ok(self.dirs.insert(seg.num, Arc::new(d), size))
+        let d = seg.dir_block(k)?;
+        let size = d.iter().map(|x| 160 + x.key.0.len() + x.key.1.len()).sum();
+        Ok(self.dirs.insert(key, Arc::new(d), size))
     }
 
-    fn block(&self, seg: &Segment, b: u32) -> Result<Arc<Vec<u8>>> {
-        if let Some(x) = self.blocks.get(&(seg.num, b)) {
+    fn block(&self, seg: &Segment, r: &BlockRef) -> Result<Arc<Vec<u8>>> {
+        if let Some(x) = self.blocks.get(&(seg.num, r.off)) {
             return Ok(x);
         }
-        let raw = seg.block(b)?;
+        let raw = seg.block(r)?;
         let n = raw.len();
-        Ok(self.blocks.insert((seg.num, b), Arc::new(raw), n))
+        Ok(self.blocks.insert((seg.num, r.off), Arc::new(raw), n))
     }
 
-    fn tblock(&self, blob: &Blob, kind: u8, i: usize) -> Result<Arc<TBlock>> {
-        let k = (blob.num, kind, i as u32);
-        if let Some(t) = self.tables.get(&k) {
+    fn ixb(&self, run: &Run, kind: u8, i: usize) -> Result<Arc<IxBlock>> {
+        let k = (run.num, kind, i as u32);
+        if let Some(t) = self.ix.get(&k) {
             return Ok(t);
         }
-        let t = blob.table_block(kind, i)?;
+        let t = run.block(kind, i)?;
         let n = t.bytes();
-        Ok(self.tables.insert(k, Arc::new(t), n))
+        Ok(self.ix.insert(k, Arc::new(t), n))
     }
 
     /// Every part of session `s`, in order.
@@ -498,49 +546,44 @@ impl Db {
             if !seg.cat.may_hold(s) {
                 continue;
             }
-            let dir = self.dir_of(seg)?;
-            let a = dir.partition_point(|d| d.session < s);
-            for d in dir[a..].iter().take_while(|d| d.session == s) {
-                out.push((seg.clone(), d.clone()));
+            for k in seg.cat.dir_blocks_for(s) {
+                let dir = self.dir_block(seg, k)?;
+                let a = dir.partition_point(|d| d.session < s);
+                for d in dir[a..].iter().take_while(|d| d.session == s) {
+                    out.push((seg.clone(), d.clone()));
+                }
             }
         }
         out.sort_by_key(|p| (p.1.first_req, p.1.first_node, p.1.first_row));
         Ok(out)
     }
 
-    fn find_session_in_files(&self, key: &(String, String)) -> Result<Option<u32>> {
-        let h = key_hash(&key_bytes(&key.0, &key.1));
-        for seg in self.segs.values().rev() {
-            if !seg.cat.key_bloom.may_contain(h) {
-                continue;
-            }
-            if let Some(d) = self.dir_of(seg)?.iter().find(|d| d.key == *key) {
-                return Ok(Some(d.session));
+    /// The newest value stored under (`ns`, `h`) in the index runs.
+    fn index_get(&self, ns: u8, h: u128) -> Result<Option<u64>> {
+        for run in self.runs.iter().rev() {
+            if let Some(v) = index::lookup(run, (ns, h), |kind, i| self.ixb(run, kind, i))? {
+                return Ok(Some(v));
             }
         }
         Ok(None)
     }
 
-    fn find_request_in_files(&self, id: &str) -> Result<Option<ReqId>> {
-        let h = key_hash(id.as_bytes());
-        for seg in self.segs.values().rev() {
-            if !seg.cat.req_bloom.may_contain(h) {
-                continue;
-            }
-            let Some(b) = seg.cat.reqtab_block_for(id) else { continue };
-            let tab = match self.reqtabs.get(&(seg.num, b)) {
-                Some(t) => t,
-                None => {
-                    let t = decode_reqtab(&seg.block(b)?)?;
-                    let size = t.iter().map(|x| x.0.len() + 32).sum();
-                    self.reqtabs.insert((seg.num, b), Arc::new(t), size)
-                }
-            };
-            if let Ok(i) = tab.binary_search_by(|x| (*x.0).cmp(id)) {
-                return Ok(Some(req_id(tab[i].1, tab[i].2)));
-            }
+    fn find_session_in_files(&self, key: &(String, String)) -> Result<Option<u32>> {
+        let Some(s) = self.index_get(NS_SESSION, session_hash(key))? else { return Ok(None) };
+        let s = u32::try_from(s).map_err(|_| bad("index gives a bad session id"))?;
+        if s >= self.next_session || self.load_core(s)?.key != *key {
+            return corrupt("index points a session key at another session");
         }
-        Ok(None)
+        Ok(Some(s))
+    }
+
+    fn find_request_in_files(&self, id: &str) -> Result<Option<ReqId>> {
+        let Some(r) = self.index_get(NS_REQUEST, request_hash(id))? else { return Ok(None) };
+        let (core, k) = self.core_req(r)?;
+        if *core.requests[k as usize].id != *id {
+            return corrupt("index points a request id at another request");
+        }
+        Ok(Some(r))
     }
 
     /// An existing piece or opaque value with this hash (tag 0 = piece, 1 = opaque).
@@ -549,28 +592,25 @@ impl Db {
         if mem.is_some() {
             return Ok(mem);
         }
-        for b in self.blobs.iter().rev() {
-            if !b.cat.bloom.may_contain(hash as u64) {
-                continue;
-            }
-            let Some(i) = b.cat.hash_block_for(tag, hash) else { continue };
-            if let TBlock::Hashes(v) = &*self.tblock(b, HASHES, i)?
-                && let Some(id) = find_in(v, tag, hash)
-            {
-                return Ok(Some(id));
-            }
+        self.index_get(if tag == 0 { NS_PIECE } else { NS_OPAQUE }, hash)
+    }
+
+    fn run_for_piece(&self, id: u32) -> Result<&Arc<Run>> {
+        let i = self.runs.partition_point(|r| r.cat.plo + r.cat.np <= id);
+        self.runs.get(i).filter(|r| r.cat.has_piece(id)).ok_or_else(|| bad(format!("missing piece {id}")))
+    }
+
+    fn run_for_opaque(&self, id: u64) -> Result<&Arc<Run>> {
+        let i = self.runs.partition_point(|r| r.cat.olo + r.cat.no <= id);
+        self.runs.get(i).filter(|r| r.cat.has_opaque(id)).ok_or_else(|| bad(format!("missing opaque value {id}")))
+    }
+
+    fn blob_read(&self, num: u32, off: u64, len: u32) -> Result<Vec<u8>> {
+        let b = self.blob_files.get(&num).ok_or_else(|| bad(format!("blob file {num} is not live")))?;
+        if off + len as u64 > b.len {
+            return corrupt(format!("a value runs past the end of blob file {num}"));
         }
-        Ok(None)
-    }
-
-    fn blob_for_piece(&self, id: u32) -> Result<&Arc<Blob>> {
-        let i = self.blobs.partition_point(|b| b.cat.piece_lo + b.cat.n_pieces <= id);
-        self.blobs.get(i).filter(|b| b.has_piece(id)).ok_or_else(|| bad(format!("missing piece {id}")))
-    }
-
-    fn blob_for_opaque(&self, id: u64) -> Result<&Arc<Blob>> {
-        let i = self.blobs.partition_point(|b| b.cat.opaque_lo + b.cat.n_opaques <= id);
-        self.blobs.get(i).filter(|b| b.has_opaque(id)).ok_or_else(|| bad(format!("missing opaque value {id}")))
+        blob::read(b.uid, &b.path, off, len)
     }
 
     fn opaque_meta(&self, id: u64) -> Result<OpaqueMeta> {
@@ -578,25 +618,26 @@ impl Db {
     }
 
     /// [`Db::opaque_meta`], keeping the table blocks it needs in `tables` for the next call.
-    fn opaque_meta_in(&self, id: u64, tables: &mut HashMap<(u32, u32), Arc<TBlock>>) -> Result<OpaqueMeta> {
+    fn opaque_meta_in(&self, id: u64, tables: &mut HashMap<(u32, u32), Arc<IxBlock>>) -> Result<OpaqueMeta> {
         if id >= self.manifest.opaques {
             let (enc, _, hash, payload, len) = self.mem.opaques.get((id - self.manifest.opaques) as usize).ok_or_else(|| bad(format!("missing opaque value {id}")))?;
             let loc = if payload.is_some() { OLoc::Mem((id - self.manifest.opaques) as u32) } else { OLoc::Dropped { len: *len } };
             return Ok(OpaqueMeta { enc: *enc, hash: *hash, loc });
         }
-        let b = self.blob_for_opaque(id)?;
-        let i = (id - b.cat.opaque_lo) as usize;
-        let t = match tables.get(&(b.num, (i / ID_BLOCK) as u32)) {
+        let r = self.run_for_opaque(id)?;
+        let i = (id - r.cat.olo) as usize;
+        let key = (r.num, (i / IDS) as u32);
+        let t = match tables.get(&key) {
             Some(t) => t.clone(),
             None => {
-                let t = self.tblock(b, OPAQUES, i / ID_BLOCK)?;
-                tables.insert((b.num, (i / ID_BLOCK) as u32), t.clone());
+                let t = self.ixb(r, K_OPAQUES, i / IDS)?;
+                tables.insert(key, t.clone());
                 t
             }
         };
-        let TBlock::Opaques(v) = &*t else { return corrupt("blob block of the wrong kind") };
-        let o = *v.get(i % ID_BLOCK).ok_or_else(|| bad(format!("missing opaque value {id}")))?;
-        let loc = if o.dropped { OLoc::Dropped { len: o.len } } else { OLoc::Blob { blob: b.num, off: o.off, len: o.len } };
+        let IxBlock::Opaques(v) = &*t else { return corrupt("index block of the wrong kind") };
+        let o = *v.get(i % IDS).ok_or_else(|| bad(format!("missing opaque value {id}")))?;
+        let loc = if o.dropped { OLoc::Dropped { len: o.len } } else { OLoc::Blob { blob: o.file, off: o.off, len: o.len } };
         Ok(OpaqueMeta { enc: o.enc, hash: o.hash, loc })
     }
 
@@ -613,7 +654,7 @@ impl Db {
         let Some(first) = parts.first() else { return Err(Error::BadRequest(format!("no session {s}"))) };
         let mut core = SessionCore { key: first.1.key.clone(), ..SessionCore::default() };
         for (seg, d) in &parts {
-            let raw = self.block(seg, d.core.0)?;
+            let raw = self.block(seg, &d.core.0)?;
             let (a, b) = (d.core.1 as usize, (d.core.1 + d.core.2) as usize);
             let p = decode_core(raw.get(a..b).ok_or_else(|| bad("session part past its block"))?)?;
             if p.first_node as usize != core.nodes.len() || p.first_req as usize != core.requests.len() {
@@ -649,7 +690,7 @@ impl Db {
         let mut ss = SessionSteps::default();
         let mut fs: Vec<(u32, FieldVal)> = Vec::new();
         for (seg, d) in &parts {
-            let raw = self.block(seg, d.steps.0)?;
+            let raw = self.block(seg, &d.steps.0)?;
             let (a, b) = (d.steps.1 as usize, (d.steps.1 + d.steps.2) as usize);
             let p = decode_steps(raw.get(a..b).ok_or_else(|| bad("step part past its block"))?)?;
             if p.first as usize != ss.rows.len() {
@@ -1109,7 +1150,8 @@ impl Db {
         Ok(CorePart { frames, raw_len: stream.len() as u64, nodes, first_node: first, first_req, requests: core.requests[reqs.start as usize..reqs.end as usize].to_vec() })
     }
 
-    /// Write everything in memory to a new segment and blob file, and trim the log.
+    /// Write everything in memory to files (a new segment and index run; values appended
+    /// to a blob file), and trim the log.
     pub fn flush(&mut self) -> Result<()> {
         self.wal.commit()?;
         if self.mem.touched.is_empty() && self.mem.pieces.is_empty() && self.mem.opaques.is_empty() {
@@ -1118,6 +1160,83 @@ impl Db {
         let new_wal = self.wal.num + 1;
         self.wal = WalWriter::create(&self.dir, new_wal, self.opts.sync)?;
         let mut man = self.manifest.clone();
+        let mut flushed = 0u64;
+
+        // values: appended to the last blob file, or a new one once that is full
+        let lo = self.manifest.opaques;
+        let n = self.mem.opaques.len();
+        let mut pents = Vec::with_capacity(self.mem.pieces.len());
+        let mut oents: Vec<OpaqueEnt> = self.mem.opaques.iter().map(|(enc, kind, h, _, len)| OpaqueEnt { enc: *enc, kind: *kind, dropped: true, hash: *h, file: 0, off: 0, len: *len }).collect();
+        let mut blob_len = None;
+        if !self.mem.pieces.is_empty() || self.mem.opaques.iter().any(|o| o.3.is_some()) {
+            let (bn, len) = match man.blobs.last() {
+                Some(&(bn, len)) if len < self.opts.blob_bytes => (bn, len),
+                _ => {
+                    let bn = man.next_file;
+                    man.next_file += 1;
+                    man.blobs.push((bn, 0));
+                    (bn, 0)
+                }
+            };
+            let mut bw = BlobAppend::open(&self.dir, bn, len, self.opts.level)?;
+            let start = bw.pos();
+            for (kind, h, raw) in &self.mem.pieces {
+                let (off, clen) = bw.piece(raw)?;
+                pents.push(PieceEnt { kind: *kind, hash: *h, file: bn, off, clen, rawlen: raw.len() as u32 });
+            }
+            // values in the order requests read them: by session, then by message
+            let mut order = Vec::with_capacity(n);
+            let mut placed = vec![false; n];
+            for &s in &self.mem.touched {
+                let core = &self.active[&s].core;
+                for nm in &core.nodes[core.flushed_nodes as usize..] {
+                    for &(_, oid) in nm.holes.iter().flat_map(|h| h.iter()) {
+                        if oid >= lo && !std::mem::replace(&mut placed[(oid - lo) as usize], true) {
+                            order.push((oid - lo) as usize);
+                        }
+                    }
+                }
+            }
+            order.extend((0..n).filter(|&i| !placed[i]));
+            for i in order {
+                if let Some(p) = &self.mem.opaques[i].3 {
+                    let off = bw.opaque(p)?;
+                    oents[i] = OpaqueEnt { dropped: false, file: bn, off, len: p.len() as u32, ..oents[i] };
+                }
+            }
+            let new_len = bw.finish(self.opts.sync)?;
+            flushed += new_len - start;
+            man.blobs.last_mut().unwrap().1 = new_len;
+            blob_len = Some((bn, new_len));
+        }
+
+        // index: what this flush added, findable by hash; values by id
+        let rn = man.next_file;
+        man.next_file += 1;
+        let mut keys: Vec<(u8, u128, u64)> = Vec::with_capacity(pents.len() + n + self.mem.req_ix.len());
+        keys.extend(pents.iter().enumerate().map(|(i, p)| (NS_PIECE, p.hash, self.manifest.pieces as u64 + i as u64)));
+        keys.extend(oents.iter().enumerate().map(|(i, o)| (NS_OPAQUE, o.hash, lo + i as u64)));
+        keys.extend(self.mem.req_ix.iter().map(|(id, &r)| (NS_REQUEST, request_hash(id), r)));
+        for s in self.manifest.sessions..self.next_session {
+            let a = self.active.get(&s).ok_or_else(|| bad(format!("new session {s} is not in memory at a flush")))?;
+            keys.push((NS_SESSION, session_hash(&a.core.key), s as u64));
+        }
+        keys.sort_unstable();
+        keys.dedup();
+        let mut rw = RunWriter::create(&self.dir, rn, self.manifest.pieces, lo)?;
+        for (ns, h, v) in keys {
+            rw.key(ns, h, v)?;
+        }
+        for e in &pents {
+            rw.piece(e)?;
+        }
+        for e in &oents {
+            rw.opaque(e)?;
+        }
+        flushed += rw.finish(self.opts.sync)?;
+        man.runs.push(rn);
+
+        // messages, requests and steps of every session that took writes
         let num = man.next_file;
         man.next_file += 1;
         let mut w = SegWriter::create(&self.dir, num, self.opts.frame_size, self.opts.level, 0, self.seq)?;
@@ -1132,42 +1251,6 @@ impl Db {
         }
         w.finish(self.opts.sync)?;
         man.segs.push(num);
-        let mut blob_num = None;
-        if !self.mem.pieces.is_empty() || !self.mem.opaques.is_empty() {
-            let bn = man.next_file;
-            man.next_file += 1;
-            let mut bw = BlobWriter::create(&self.dir, bn, self.opts.level, self.manifest.pieces, self.manifest.opaques)?;
-            for (kind, h, raw) in &self.mem.pieces {
-                bw.piece(*kind, *h, raw)?;
-            }
-            // values in the order requests read them: by session, then by message
-            let lo = self.manifest.opaques;
-            let n = self.mem.opaques.len();
-            let mut order = Vec::with_capacity(n);
-            let mut placed = vec![false; n];
-            for &s in &self.mem.touched {
-                let core = &self.active[&s].core;
-                for nm in &core.nodes[core.flushed_nodes as usize..] {
-                    for &(_, oid) in nm.holes.iter().flat_map(|h| h.iter()) {
-                        if oid >= lo && !std::mem::replace(&mut placed[(oid - lo) as usize], true) {
-                            order.push((oid - lo) as usize);
-                        }
-                    }
-                }
-            }
-            order.extend((0..n).filter(|&i| !placed[i]));
-            bw.opaques(n);
-            for i in order {
-                let (enc, kind, h, payload, len) = &self.mem.opaques[i];
-                match payload {
-                    Some(p) => bw.opaque(i, *enc, *kind, *h, p)?,
-                    None => bw.dropped(i, *enc, *kind, *h, *len),
-                }
-            }
-            bw.finish(self.opts.sync)?;
-            man.blobs.push(bn);
-            blob_num = Some(bn);
-        }
         man.generation += 1;
         man.checkpoint = self.seq;
         man.wal_start = new_wal;
@@ -1178,12 +1261,12 @@ impl Db {
         self.manifest = man;
 
         let seg = Segment::open(&self.dir, num)?;
-        self.merge_stats.flushed += seg.file_bytes;
+        flushed += seg.file_bytes;
+        self.merge_stats.flushed += flushed;
         self.add_segment(seg);
-        if let Some(bn) = blob_num {
-            let b = Blob::open(&self.dir, bn)?;
-            self.merge_stats.flushed += b.file_bytes;
-            self.blobs.push(Arc::new(b));
+        self.runs.push(Arc::new(Run::open(&self.dir, rn)?));
+        if let Some((bn, len)) = blob_len {
+            self.blob_files.entry(bn).or_insert_with(|| BlobFile { uid: crate::block::uid(), path: blob_path(&self.dir, bn), len: 0 }).len = len;
         }
         for (s, cp) in written {
             let a = self.active.get_mut(&s).unwrap();
@@ -1214,27 +1297,59 @@ impl Db {
     /// Once `merge_at` flushed segments wait, merge them; then merge any `merge_at` merged
     /// segments of one size tier (sizes in powers of 4 from 1 MB) under the size cap. Each
     /// byte is rewritten about once per tier, and finished data stops moving at the cap.
+    /// Index runs merge the same way, `merge_at` neighbours of one tier at a time.
     fn merge_policy(&mut self) -> Result<()> {
+        // index runs first: they are small, and every lookup reads each one
+        let w = self.opts.merge_at.max(2);
+        loop {
+            let open = |r: &Run| r.file_bytes < self.opts.run_bytes;
+            let pick = (0..(self.runs.len() + 1).saturating_sub(w)).find(|&i| {
+                // runs are small, so their tiers start at 256 KB
+                let t = tier(self.runs[i].file_bytes, 16);
+                self.runs[i..i + w].iter().all(|r| open(r) && tier(r.file_bytes, 16) == t)
+            });
+            let Some(i) = pick else { break };
+            self.merge_runs(i, w)?;
+        }
         let l0: BTreeSet<u32> = self.segs.values().filter(|s| s.cat.level == 0).map(|s| s.num).collect();
         if l0.len() >= self.opts.merge_at {
             self.merge(l0)?;
         }
-        let tier = |b: u64| {
-            let (mut t, mut x) = (0u32, b >> 20);
-            while x >= 4 {
-                x /= 4;
-                t += 1;
-            }
-            t
-        };
         loop {
             let mut tiers: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
             for sg in self.segs.values().filter(|s| s.cat.level > 0 && s.file_bytes < self.opts.seg_bytes) {
-                tiers.entry(tier(sg.file_bytes)).or_default().push(sg.num);
+                tiers.entry(tier(sg.file_bytes, 20)).or_default().push(sg.num);
             }
             let Some((_, group)) = tiers.into_iter().find(|(_, v)| v.len() >= self.opts.merge_at) else { break };
             self.merge(group.into_iter().take(self.opts.merge_at).collect())?;
         }
+        Ok(())
+    }
+
+    /// Merge index runs `i..i + n` into one.
+    fn merge_runs(&mut self, i: usize, n: usize) -> Result<()> {
+        let inputs: Vec<Arc<Run>> = self.runs[i..i + n].to_vec();
+        let nums: Vec<u32> = inputs.iter().map(|r| r.num).collect();
+        let mut man = self.manifest.clone();
+        let pos = man.runs.iter().position(|&r| r == nums[0]).ok_or_else(|| bad("index run missing from the manifest"))?;
+        if man.runs.get(pos..pos + n) != Some(&nums[..]) {
+            return corrupt("index runs out of step with the manifest");
+        }
+        let num = man.next_file;
+        man.next_file += 1;
+        let bytes_out = index::merge(&self.dir, num, &inputs, self.opts.sync)?;
+        man.runs.splice(pos..pos + n, [num]);
+        man.generation += 1;
+        man.store(&self.dir, self.opts.sync)?;
+        self.manifest = man;
+        self.runs.splice(i..i + n, [Arc::new(Run::open(&self.dir, num)?)]);
+        for r in &inputs {
+            crate::block::forget(r.path());
+            let _ = fs::remove_file(r.path());
+        }
+        self.merge_stats.merges += 1;
+        self.merge_stats.bytes_in += inputs.iter().map(|r| r.file_bytes).sum::<u64>();
+        self.merge_stats.bytes_out += bytes_out;
         Ok(())
     }
 
@@ -1262,8 +1377,10 @@ impl Db {
         for &n in &inputs {
             let seg = self.segs.get(&n).ok_or_else(|| bad(format!("merge of a missing segment {n}")))?.clone();
             bytes_in += seg.file_bytes;
-            for d in self.dir_of(&seg)?.iter() {
-                sessions.insert(d.session);
+            for k in 0..seg.cat.dirs.len() {
+                for d in self.dir_block(&seg, k)?.iter() {
+                    sessions.insert(d.session);
+                }
             }
         }
         let mut man = self.manifest.clone();
@@ -1321,7 +1438,7 @@ impl Db {
             return corrupt("merge with unflushed sessions");
         }
         self.key_ix.clear();
-        for c in [&self.cores as &dyn Clear, &self.stepc, &self.dirs, &self.reqtabs, &self.blocks] {
+        for c in [&self.cores as &dyn Clear, &self.stepc, &self.dirs, &self.blocks] {
             c.clear_all();
         }
         let mut bytes_out = 0;
@@ -1387,9 +1504,8 @@ impl Db {
             OLoc::Dropped { .. } => None,
             OLoc::Mem(mi) => self.mem.opaques[mi as usize].3.as_ref().map(|p| p.to_vec()),
             OLoc::Blob { blob, off, len } => {
-                let b = self.blobs.iter().find(|b| b.num == blob).ok_or_else(|| bad("blob file is gone"))?;
                 st.opaque_reads += 1;
-                Some(b.read(off, len)?)
+                Some(self.blob_read(blob, off, len)?)
             }
         })
     }
@@ -1472,8 +1588,7 @@ impl Db {
                     j += 1;
                     end = end.max(wanted[j].1 + wanted[j].2 as u64);
                 }
-                let b = self.blobs.iter().find(|b| b.num == blob).ok_or_else(|| bad("blob file is gone"))?;
-                let buf = b.read(start, (end - start) as u32)?;
+                let buf = self.blob_read(blob, start, (end - start) as u32)?;
                 st.opaque_reads += 1;
                 for w in &wanted[i..=j] {
                     let a = (w.1 - start) as usize;
@@ -1537,12 +1652,12 @@ impl Db {
         if let Some(p) = self.pieces.get(&id) {
             return Ok(p);
         }
-        let b = self.blob_for_piece(id)?;
-        let i = (id - b.cat.piece_lo) as usize;
-        let t = self.tblock(b, PIECES, i / ID_BLOCK)?;
-        let TBlock::Pieces(v) = &*t else { return corrupt("blob block of the wrong kind") };
-        let e = *v.get(i % ID_BLOCK).ok_or_else(|| bad(format!("missing piece {id}")))?;
-        let c = b.read(e.off, e.clen)?;
+        let r = self.run_for_piece(id)?;
+        let i = (id - r.cat.plo) as usize;
+        let t = self.ixb(r, K_PIECES, i / IDS)?;
+        let IxBlock::Pieces(v) = &*t else { return corrupt("index block of the wrong kind") };
+        let e = *v.get(i % IDS).ok_or_else(|| bad(format!("missing piece {id}")))?;
+        let c = self.blob_read(e.file, e.off, e.clen)?;
         let d = crate::segment::decompress(&c, e.rawlen as usize)?;
         if d.len() != e.rawlen as usize {
             return corrupt("piece has the wrong size");
@@ -1770,7 +1885,8 @@ impl Db {
             opaques: self.next_opaque() as usize,
             segments: self.segs.len(),
             level0: self.segs.values().filter(|s| s.cat.level == 0).count(),
-            blobs: self.blobs.len(),
+            runs: self.runs.len(),
+            blobs: self.blob_files.len(),
             wal_bytes: self.wal.bytes,
             mem_bytes: self.mem.bytes,
             tools: self.sd.tools.len(),
@@ -1790,13 +1906,17 @@ impl Db {
             st.catalog_bytes += c.bytes();
         }
         st.index_bytes = st.seg_file_bytes - st.frame_bytes;
-        for b in &self.blobs {
-            st.blob_file_bytes += b.file_bytes;
-            st.opaque_bytes += b.cat.opaque_bytes;
-            st.piece_bytes += b.cat.piece_bytes;
-            st.piece_raw_bytes += b.cat.piece_raw_bytes;
-            st.opaques_dropped += b.cat.n_dropped as usize;
-            st.catalog_bytes += b.cat.bytes();
+        for r in &self.runs {
+            st.index_file_bytes += r.file_bytes;
+            st.opaque_bytes += r.cat.opaque_bytes;
+            st.piece_bytes += r.cat.piece_bytes;
+            st.piece_raw_bytes += r.cat.piece_raw_bytes;
+            st.opaques_dropped += r.cat.n_dropped as usize;
+            st.catalog_bytes += r.cat.bytes();
+        }
+        for b in self.blob_files.values() {
+            st.blob_file_bytes += b.len;
+            st.catalog_bytes += 96 + b.path.as_os_str().len();
         }
         st.nodes += self.mem.nodes.len();
         st.node_bytes += self.mem.nodes.iter().map(|n| n.len() as u64).sum::<u64>();
@@ -1816,8 +1936,7 @@ impl Db {
             ("steps", self.stepc.stats()),
             ("blocks", self.blocks.stats()),
             ("directories", self.dirs.stats()),
-            ("request tables", self.reqtabs.stats()),
-            ("blob table blocks", self.tables.stats()),
+            ("index blocks", self.ix.stats()),
             ("pieces", self.pieces.stats()),
         ];
         st
@@ -1900,7 +2019,7 @@ impl Db {
     }
 
     /// Opaque values by kind: (kind, values kept, bytes kept, values not kept, bytes they had).
-    /// Reads every blob table.
+    /// Reads every opaque value table.
     pub fn opaque_kinds(&self) -> Result<Vec<(&'static str, u64, u64, u64, u64)>> {
         let mut out: Vec<(&'static str, u64, u64, u64, u64)> = Vec::new();
         let mut add = |kind: u8, kept: bool, len: u64| {
@@ -1918,9 +2037,9 @@ impl Db {
                 (out[i].3, out[i].4) = (out[i].3 + 1, out[i].4 + len);
             }
         };
-        for b in &self.blobs {
-            for i in 0..b.cat.opaque_blocks.len() {
-                if let TBlock::Opaques(v) = &*self.tblock(b, OPAQUES, i)? {
+        for r in &self.runs {
+            for i in 0..(r.cat.no as usize).div_ceil(IDS) {
+                if let IxBlock::Opaques(v) = r.block(K_OPAQUES, i)? {
                     for o in v {
                         add(o.kind, !o.dropped, o.len as u64);
                     }
@@ -1966,7 +2085,7 @@ impl Db {
 
     /// Drop everything read from files from the caches (sessions taking writes stay).
     pub fn clear_caches(&self) {
-        for c in [&self.cores as &dyn Clear, &self.stepc, &self.dirs, &self.reqtabs, &self.blocks, &self.tables, &self.pieces, &self.skels] {
+        for c in [&self.cores as &dyn Clear, &self.stepc, &self.dirs, &self.blocks, &self.ix, &self.pieces, &self.skels] {
             c.clear_all();
         }
     }

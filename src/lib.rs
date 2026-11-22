@@ -15,6 +15,7 @@ pub mod claude;
 pub mod codec;
 pub mod db;
 pub mod h2h;
+pub mod index;
 pub mod json;
 pub mod layout;
 pub mod manifest;

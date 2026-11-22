@@ -1,15 +1,17 @@
 //! Segment files: written once at a flush or a merge, never changed afterwards.
 //!
 //! A segment holds *parts* of sessions: for each session it touches, the messages
-//! (tree nodes), requests and steps that session gained since its previous part, or all
-//! of them after a merge. Opening a segment reads only its catalog: the session id range,
-//! counts, time range, the tool and field names its steps use, Bloom filters of session
-//! keys and request ids, and where its blocks are. Everything else is read on demand.
+//! (tree nodes), requests and steps that session gained since its previous part, or a run
+//! of its parts joined by a merge. Opening a segment reads only its catalog: the session id
+//! range, counts, time range, the tool and field names its steps use, a Bloom filter of the
+//! sessions it holds, and the first session of each directory block. Everything else is
+//! read on demand; finding a request or a session by its id goes through the index.
 //!
 //! `seg-N.tdb`: magic; each part's messages as one stream cut into fixed-size zstd frames
 //! (each with zstd's content checksum); blocks (zstd, crc32c), being groups of encoded
-//! parts (message metadata and requests in one kind of group, steps in another), the
-//! request id table and the session directory; then the catalog and the footer.
+//! parts (message metadata and requests in one kind of group, steps in another) and the
+//! session directory in blocks of about 64 KB, whose entries say where each part's blocks
+//! are; then the catalog and the footer.
 
 use crate::block::{file, handle, read_block, read_catalog, write_block, write_catalog, BlockRef};
 use crate::bloom::{key_hash, Bloom};
@@ -25,11 +27,9 @@ use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-const SEG_MAGIC: &[u8; 8] = b"TDBSEG04";
-/// Raw bytes per group block of encoded parts.
+const SEG_MAGIC: &[u8; 8] = b"TDBSEG05";
+/// Raw bytes per group block of encoded parts, and per directory block.
 const GROUP: usize = 64 * 1024;
-/// Request ids per block of the request table.
-const REQ_BLOCK: usize = 2048;
 /// Bloom filter bits per key: about 0.2% false positives.
 const BLOOM_BITS: usize = 14;
 
@@ -73,7 +73,7 @@ pub struct StepPart {
 }
 
 /// Where a session's part sits: (block, offset in the decompressed block, length).
-pub type PartRef = (u32, u32, u32);
+pub type PartRef = (BlockRef, u32, u32);
 
 #[derive(Debug, Clone)]
 pub struct DirEnt {
@@ -110,14 +110,10 @@ pub struct SegCat {
     /// Tool and field names; step parts use their positions here as codes.
     pub tools: Vec<Vec<u8>>,
     pub fields: Vec<Vec<u8>>,
-    pub key_bloom: Bloom,
-    pub req_bloom: Bloom,
     /// Over the session ids with a part here.
     pub sess_bloom: Bloom,
-    pub blocks: Vec<BlockRef>,
-    pub dir: u32,
-    /// (first request id, block) per block of the request id table.
-    pub reqtab: Vec<(Box<str>, u32)>,
+    /// (first session, block) per directory block.
+    pub dirs: Vec<(u32, BlockRef)>,
     pub frame_bytes: u64,
     pub node_bytes: u64,
 }
@@ -144,18 +140,11 @@ impl SegCat {
         for f in &self.fields {
             e.bytes(f);
         }
-        self.key_bloom.encode(&mut e);
-        self.req_bloom.encode(&mut e);
         self.sess_bloom.encode(&mut e);
-        e.var(self.blocks.len() as u64);
-        for b in &self.blocks {
-            b.encode(&mut e);
-        }
-        e.var(self.dir as u64);
-        e.var(self.reqtab.len() as u64);
-        for (id, b) in &self.reqtab {
-            e.bytes(id.as_bytes());
-            e.var(*b as u64);
+        e.var(self.dirs.len() as u64);
+        for (s, r) in &self.dirs {
+            e.var(*s as u64);
+            r.encode(&mut e);
         }
         e.var(self.frame_bytes);
         e.var(self.node_bytes);
@@ -176,28 +165,23 @@ impl SegCat {
         for _ in 0..d.var()? {
             c.fields.push(d.bytes()?.to_vec());
         }
-        c.key_bloom = Bloom::decode(&mut d)?;
-        c.req_bloom = Bloom::decode(&mut d)?;
         c.sess_bloom = Bloom::decode(&mut d)?;
         for _ in 0..d.var()? {
-            c.blocks.push(BlockRef::decode(&mut d)?);
-        }
-        c.dir = d.var32()?;
-        for _ in 0..d.var()? {
-            c.reqtab.push((d.string()?.into_boxed_str(), d.var32()?));
+            c.dirs.push((d.var32()?, BlockRef::decode(&mut d)?));
         }
         c.frame_bytes = d.var()?;
         c.node_bytes = d.var()?;
-        if !d.done() || c.dir as usize >= c.blocks.len() || c.reqtab.iter().any(|x| x.1 as usize >= c.blocks.len()) {
+        if !d.done() || c.dirs.windows(2).any(|w| w[0].0 > w[1].0) || (c.sessions > 0) != !c.dirs.is_empty() {
             return corrupt("bad segment catalog");
         }
         Ok(c)
     }
 
-    /// The request table block that would hold `id`.
-    pub fn reqtab_block_for(&self, id: &str) -> Option<u32> {
-        let i = self.reqtab.partition_point(|x| *x.0 <= *id);
-        i.checked_sub(1).map(|i| self.reqtab[i].1)
+    /// Directory blocks that may hold parts of session `s`.
+    pub fn dir_blocks_for(&self, s: u32) -> std::ops::Range<usize> {
+        let a = self.dirs.partition_point(|d| d.0 < s).saturating_sub(1);
+        let b = self.dirs.partition_point(|d| d.0 <= s);
+        a..b.max(a)
     }
 
     pub fn may_hold(&self, s: u32) -> bool {
@@ -206,7 +190,7 @@ impl SegCat {
 
     /// Bytes this catalog takes in memory, roughly.
     pub fn bytes(&self) -> usize {
-        256 + self.key_bloom.bytes() + self.req_bloom.bytes() + self.sess_bloom.bytes() + self.blocks.len() * 24 + self.reqtab.iter().map(|x| x.0.len() + 32).sum::<usize>() + self.tools.iter().chain(&self.fields).map(|x| x.len() + 24).sum::<usize>()
+        256 + self.sess_bloom.bytes() + self.dirs.len() * 40 + self.tools.iter().chain(&self.fields).map(|x| x.len() + 24).sum::<usize>()
     }
 }
 
@@ -376,7 +360,7 @@ fn encode_dir(dir: &[DirEnt]) -> Vec<u8> {
         }
         e.var(x.frame_bytes);
         for (b, o, l) in [x.core, x.steps] {
-            e.var(b as u64);
+            b.encode(&mut e);
             e.var(o as u64);
             e.var(l as u64);
         }
@@ -396,28 +380,12 @@ pub fn decode_dir(b: &[u8]) -> Result<Vec<DirEnt>> {
             *x = d.var32()?;
         }
         let frame_bytes = d.var()?;
-        let core = (d.var32()?, d.var32()?, d.var32()?);
-        let steps = (d.var32()?, d.var32()?, d.var32()?);
+        let core = (BlockRef::decode(&mut d)?, d.var32()?, d.var32()?);
+        let steps = (BlockRef::decode(&mut d)?, d.var32()?, d.var32()?);
         out.push(DirEnt { session, key, first_node: v[0], n_nodes: v[1], first_req: v[2], n_reqs: v[3], first_row: v[4], n_rows: v[5], frame_bytes, core, steps });
     }
     if !d.done() || out.windows(2).any(|w| (w[0].session, w[0].first_req) >= (w[1].session, w[1].first_req)) {
         return corrupt("bad segment directory");
-    }
-    Ok(out)
-}
-
-/// (request id, session, index of the request in its session), sorted by id.
-pub type ReqTab = Vec<(Box<str>, u32, u32)>;
-
-pub fn decode_reqtab(b: &[u8]) -> Result<ReqTab> {
-    let mut d = Dec::new(b);
-    let n = d.var()? as usize;
-    let mut out = Vec::with_capacity(n.min(1 << 22));
-    for _ in 0..n {
-        out.push((d.string()?.into_boxed_str(), d.var32()?, d.var32()?));
-    }
-    if !d.done() {
-        return corrupt("bad request table");
     }
     Ok(out)
 }
@@ -431,7 +399,6 @@ pub struct SegWriter {
     tool_ix: HashMap<Vec<u8>, u32>,
     field_ix: HashMap<Vec<u8>, u32>,
     dir: Vec<DirEnt>,
-    reqs: ReqTab,
     core_buf: Vec<u8>,
     core_waiting: Vec<usize>,
     steps_buf: Vec<u8>,
@@ -455,7 +422,6 @@ impl SegWriter {
             tool_ix: HashMap::new(),
             field_ix: HashMap::new(),
             dir: Vec::new(),
-            reqs: Vec::new(),
             core_buf: Vec::new(),
             core_waiting: Vec::new(),
             steps_buf: Vec::new(),
@@ -507,13 +473,11 @@ impl SegWriter {
             return Ok(());
         }
         let r = write_block(&mut self.f, &mut self.pos, &buf, 3)?;
-        self.cat.blocks.push(r);
-        let b = self.cat.blocks.len() as u32 - 1;
         for i in waiting {
             if steps {
-                self.dir[i].steps.0 = b;
+                self.dir[i].steps.0 = r;
             } else {
-                self.dir[i].core.0 = b;
+                self.dir[i].core.0 = r;
             }
         }
         Ok(())
@@ -528,16 +492,15 @@ impl SegWriter {
         let i = self.dir.len();
         let mut e = Enc::new();
         encode_core(core, &mut e);
-        let core_ref = (0, self.core_buf.len() as u32, e.buf.len() as u32);
+        let core_ref = (BlockRef::default(), self.core_buf.len() as u32, e.buf.len() as u32);
         self.core_buf.extend_from_slice(&e.buf);
         self.core_waiting.push(i);
         let mut e = Enc::new();
         encode_steps(steps, &mut e);
-        let steps_ref = (0, self.steps_buf.len() as u32, e.buf.len() as u32);
+        let steps_ref = (BlockRef::default(), self.steps_buf.len() as u32, e.buf.len() as u32);
         self.steps_buf.extend_from_slice(&e.buf);
         self.steps_waiting.push(i);
-        for (k, r) in core.requests.iter().enumerate() {
-            self.reqs.push((r.id.clone(), session, core.first_req + k as u32));
+        for r in core.requests.iter() {
             let t = steps::parse_time_ms(&r.time);
             if t > 0 {
                 self.cat.time_lo = self.cat.time_lo.min(t);
@@ -582,36 +545,23 @@ impl SegWriter {
     pub fn finish(mut self, mode: SyncMode) -> Result<SegCat> {
         self.seal(false)?;
         self.seal(true)?;
-        self.reqs.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-        for c in self.reqs.chunks(REQ_BLOCK) {
-            let mut e = Enc::new();
-            e.var(c.len() as u64);
-            for (id, s, k) in c {
-                e.bytes(id.as_bytes());
-                e.var(*s as u64);
-                e.var(*k as u64);
+        // the directory in blocks of about GROUP bytes, each starting at a new entry
+        let mut a = 0;
+        while a < self.dir.len() {
+            let mut b = a;
+            let mut size = 0;
+            while b < self.dir.len() && (b == a || size < GROUP) {
+                size += 64 + self.dir[b].key.0.len() + self.dir[b].key.1.len();
+                b += 1;
             }
-            let r = write_block(&mut self.f, &mut self.pos, &e.buf, 3)?;
-            self.cat.blocks.push(r);
-            self.cat.reqtab.push((c[0].0.clone(), self.cat.blocks.len() as u32 - 1));
-        }
-        let r = write_block(&mut self.f, &mut self.pos, &encode_dir(&self.dir), 3)?;
-        self.cat.blocks.push(r);
-        self.cat.dir = self.cat.blocks.len() as u32 - 1;
-        let mut kb = Bloom::new(self.dir.len(), BLOOM_BITS);
-        for d in &self.dir {
-            kb.add(key_hash(&key_bytes(&d.key.0, &d.key.1)));
-        }
-        let mut rb = Bloom::new(self.reqs.len(), BLOOM_BITS);
-        for (id, _, _) in &self.reqs {
-            rb.add(key_hash(id.as_bytes()));
+            let r = write_block(&mut self.f, &mut self.pos, &encode_dir(&self.dir[a..b]), 3)?;
+            self.cat.dirs.push((self.dir[a].session, r));
+            a = b;
         }
         let mut sb = Bloom::new(self.dir.len(), BLOOM_BITS);
         for d in &self.dir {
             sb.add(key_hash(&d.session.to_le_bytes()));
         }
-        self.cat.key_bloom = kb;
-        self.cat.req_bloom = rb;
         self.cat.sess_bloom = sb;
         if self.cat.time_lo == i64::MAX {
             self.cat.time_lo = 0;
@@ -689,9 +639,21 @@ impl Segment {
         &self.path
     }
 
-    pub fn block(&self, i: u32) -> Result<Vec<u8>> {
-        let r = self.cat.blocks.get(i as usize).ok_or_else(|| crate::codec::Error::Corrupt(format!("segment {} has no block {i}", self.num)))?;
+    pub fn block(&self, r: &BlockRef) -> Result<Vec<u8>> {
+        if r.off + r.clen as u64 > self.file_bytes {
+            return corrupt(format!("segment {} has no block at {}", self.num, r.off));
+        }
         read_block(&*handle(self.uid, &self.path)?, r, &format!("segment {}", self.num))
+    }
+
+    /// Directory block `i`.
+    pub fn dir_block(&self, i: usize) -> Result<Vec<DirEnt>> {
+        let (first, r) = self.cat.dirs.get(i).ok_or_else(|| crate::codec::Error::Corrupt(format!("segment {} has no directory block {i}", self.num)))?;
+        let d = decode_dir(&self.block(r)?)?;
+        if d.first().map(|x| x.session) != Some(*first) {
+            return corrupt(format!("segment {}: directory block {i} does not start where the catalog says", self.num));
+        }
+        Ok(d)
     }
 
     /// Frames `first..=last` of a part's stream, decompressed: from the cache, or with one

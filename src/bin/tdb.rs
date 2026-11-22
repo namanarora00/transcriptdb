@@ -412,7 +412,7 @@ fn stats(a: &Args) {
     let mem_line = format!(
         "memory after open: catalogs {} for {} files, sessions taking writes {} ({}), unflushed {}",
         mb(st.catalog_bytes as u64),
-        st.segments + st.blobs,
+        st.segments + st.runs + st.blobs,
         mb(st.active_bytes as u64),
         st.active_sessions,
         mb(st.mem_bytes as u64)
@@ -426,23 +426,25 @@ fn stats(a: &Args) {
     }
     let n = all.len();
     let opaque_text: u64 = st.opaque_bytes * 4 / 3;
-    let data = st.seg_file_bytes + st.blob_file_bytes;
+    let data = st.store_bytes();
     println!("sessions {}  requests {}  messages in requests {}  stored messages (tree nodes) {}", st.sessions, st.requests, msgs, st.nodes);
     println!("distinct message text: {} ({} message bytes + about {} of base64 opaque values)", mb(st.node_bytes + opaque_text), mb(st.node_bytes), mb(opaque_text));
     println!(
-        "on disk: segments {} + blob files {} = {}; {} segment(s) ({} from flushes not merged yet), {} blob file(s); log {}",
+        "on disk: segments {} + index {} + blob files {} = {}; {} segment(s) ({} from flushes not merged yet), {} index run(s), {} blob file(s); log {}",
         mb(st.seg_file_bytes),
+        mb(st.index_file_bytes),
         mb(st.blob_file_bytes),
         mb(data),
         st.segments,
         st.level0,
+        st.runs,
         st.blobs,
         mb(st.wal_bytes)
     );
     println!("  message frames {}  ({:.2}x smaller than the {} they hold)", mb(st.frame_bytes), st.node_bytes as f64 / st.frame_bytes.max(1) as f64, mb(st.node_bytes));
     println!("  opaque values {} raw ({} values kept, {} not kept)", mb(st.opaque_bytes), st.opaques - st.opaques_dropped, st.opaques_dropped);
     println!("  shared pieces {} compressed from {} ({} pieces: skeletons, system, tools, markers)", mb(st.piece_bytes), mb(st.piece_raw_bytes), st.pieces);
-    println!("  index {}", mb(st.index_bytes));
+    println!("  segment blocks, directories and catalogs {}; index runs {}", mb(st.index_bytes), mb(st.index_file_bytes));
     println!("  all data files: {} for {} of distinct text ({:.3} bytes per byte)", mb(data), mb(st.node_bytes + opaque_text), data as f64 / (st.node_bytes + opaque_text).max(1) as f64);
     if a.get("opaque").is_some() {
         let total = data.max(1) as f64;
@@ -605,11 +607,11 @@ fn head_to_head(a: &Args) {
         println!("{}", h2h::load(&db, &mut pg).expect("load"));
     }
     let st = db.stats();
-    let engine_bytes = st.seg_file_bytes + st.blob_file_bytes;
+    let engine_bytes = st.store_bytes();
     let sizes = h2h::pg_sizes(&mut pg).expect("sizes");
     let pg_total: u64 = sizes.iter().map(|x| x.1).sum();
     println!("\n== size on disk");
-    println!("  TranscriptDB store: {} (segments {}, blob files {})", mb(engine_bytes), mb(st.seg_file_bytes), mb(st.blob_file_bytes));
+    println!("  TranscriptDB store: {} (segments {}, index {}, blob files {})", mb(engine_bytes), mb(st.seg_file_bytes), mb(st.index_file_bytes), mb(st.blob_file_bytes));
     println!("  PostgreSQL tables with indexes and TOAST: {} ({})", mb(pg_total), sizes.iter().map(|(n, b)| format!("{n} {}", mb(*b))).collect::<Vec<_>>().join(", "));
     println!("  PostgreSQL / TranscriptDB: {:.2}x", pg_total as f64 / engine_bytes as f64);
     let reps = a.num("reps", 5) as usize;
@@ -782,7 +784,7 @@ fn crash_child(a: &Args) {
     let run = a.num("run", 0);
     // small flushes, frequent merges into small segments, sessions leaving memory after one
     // idle flush and tiny caches: kills land in every part of the write path
-    let opts = Options { sync: a.sync(), flush_bytes: 384 << 10, merge_at: 3, seg_bytes: 1 << 20, idle_flushes: 1, cache_bytes: 4 << 20, ..Options::default() };
+    let opts = Options { sync: a.sync(), flush_bytes: 384 << 10, merge_at: 3, seg_bytes: 1 << 20, idle_flushes: 1, cache_bytes: 4 << 20, blob_bytes: 512 << 10, run_bytes: 256 << 10, ..Options::default() };
     let mut db = Db::open(a.store(), opts).expect("open store");
     {
         let mut l = std::io::stdout().lock();
@@ -1017,7 +1019,7 @@ fn probe(a: &Args) {
     let rss_query = peak_rss();
     let hits = transcriptdb::query::exec::render(&db, &res.table, 1).map(|(_, c)| c.first().and_then(|r| r.first()).cloned().unwrap_or_default()).unwrap_or_default();
     println!(
-        "PROBE {open_s:.4} {} {rss_open} {:.3} {:.3} {rss_reads} {q_s:.3} {rss_query} {} {} {} {hits} {:.3} {:.3}",
+        "PROBE {open_s:.4} {} {rss_open} {:.3} {:.3} {rss_reads} {q_s:.3} {rss_query} {} {} {} {hits} {:.3} {:.3} {}",
         st.catalog_bytes,
         q(&mut cold.clone(), 0.5),
         q(&mut cold, 0.99),
@@ -1025,7 +1027,8 @@ fn probe(a: &Args) {
         st.level0,
         st.blobs,
         q(&mut warm.clone(), 0.5),
-        q(&mut warm, 0.99)
+        q(&mut warm, 0.99),
+        st.runs
     );
 }
 
@@ -1049,7 +1052,7 @@ fn growth(a: &Args) {
     let (mut raw, mut woken) = (0u64, 0u64);
     let mut acc = transcriptdb::db::MergeStats::default();
     let exe = std::env::current_exe().expect("own path");
-    println!("round  sessions  requests   raw in    store  | open s  catalogs  RSS open  RSS reads | cold med   p99 | warm med   p99 ms | query s  RSS query | segs (L0) blobs | rewritten | ingest MB/s");
+    println!("round  sessions  requests   raw in    store  | open s  catalogs  RSS open  RSS reads | cold med   p99 | warm med   p99 ms | query s  RSS query | segs (L0) runs blobs | rewritten | ingest MB/s");
     for round in 0..rounds {
         let target = base << round;
         let t = Instant::now();
@@ -1109,17 +1112,17 @@ fn growth(a: &Args) {
         let line = text.lines().find(|l| l.starts_with("PROBE ")).unwrap_or_else(|| panic!("probe failed: {}", String::from_utf8_lossy(&out.stderr)));
         let f: Vec<&str> = line.split_whitespace().skip(1).collect();
         db = Db::open(&dir, opts.clone()).expect("open store again");
-        let store = st.seg_file_bytes + st.blob_file_bytes;
+        let store = st.store_bytes();
         let rewritten = (acc.flushed + acc.bytes_out) as f64 / store.max(1) as f64;
         let n = |i: usize| -> f64 { f[i].parse().unwrap_or(0.0) };
         println!(
-            "{round:>5}  {:>8}  {:>8}  {:>8}  {:>7}  | {:>6.3}  {:>8}  {:>8}  {:>9} | {:>8.3} {:>5.3} | {:>8.3} {:>5.3}    | {:>7.3}  {:>9} | {:>4} ({}) {:>5} | {:>8.2}x | {:>6.0}",
+            "{round:>5}  {:>8}  {:>8}  {:>8}  {:>7}  | {:>6.3}  {:>8}  {:>8}  {:>9} | {:>8.3} {:>5.3} | {:>8.3} {:>5.3}    | {:>7.3}  {:>9} | {:>4} ({}) {:>4} {:>5} | {:>8.2}x | {:>6.0}",
             st.sessions,
             st.requests,
             mb(raw),
             mb(store),
             n(0),
-            mb(n(1) as u64),
+            format!("{:.1} KB", n(1) / 1e3),
             mb(n(2) as u64),
             mb(n(5) as u64),
             n(3),
@@ -1130,11 +1133,12 @@ fn growth(a: &Args) {
             mb(n(7) as u64),
             f[8],
             f[9],
+            f[14],
             f[10],
             rewritten,
             round_raw as f64 / 1e6 / ingest_s
         );
     }
     let st = db.stats();
-    println!("sessions woken after their data was flushed and merged: {woken}; merges {}; bytes written by flushes {} and merges {} for a store of {}", acc.merges, mb(acc.flushed), mb(acc.bytes_out), mb(st.seg_file_bytes + st.blob_file_bytes));
+    println!("sessions woken after their data was flushed and merged: {woken}; merges {}; bytes written by flushes {} and merges {} for a store of {}", acc.merges, mb(acc.flushed), mb(acc.bytes_out), mb(st.store_bytes()));
 }

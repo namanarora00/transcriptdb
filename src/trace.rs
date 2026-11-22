@@ -119,7 +119,7 @@ pub fn index_page(db: &Db) -> String {
         st.sessions,
         st.requests,
         st.steps,
-        bytes(st.seg_file_bytes + st.blob_file_bytes)
+        bytes(st.store_bytes())
     );
     let mut order: Vec<u32> = (0..db.session_count() as u32).collect();
     order.sort_by_key(|&s| std::cmp::Reverse(db.steps(s).rows.len()));

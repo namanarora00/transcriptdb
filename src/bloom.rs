@@ -40,6 +40,22 @@ impl Bloom {
         self.bits.len() * 8
     }
 
+    pub fn k(&self) -> u32 {
+        self.k
+    }
+
+    /// The bits alone, little-endian (for filters stored at fixed sizes).
+    pub fn raw(&self) -> Vec<u8> {
+        self.bits.iter().flat_map(|w| w.to_le_bytes()).collect()
+    }
+
+    pub fn from_raw(b: &[u8], k: u32) -> Result<Bloom> {
+        if !b.len().is_multiple_of(8) || k == 0 {
+            return corrupt("bloom filter of a bad size");
+        }
+        Ok(Bloom { bits: b.as_chunks::<8>().0.iter().map(|c| u64::from_le_bytes(*c)).collect(), k })
+    }
+
     pub fn encode(&self, e: &mut Enc) {
         e.var(self.k as u64);
         e.var(self.bits.len() as u64);

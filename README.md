@@ -36,44 +36,53 @@ plus a session id, an agent id (empty for the main agent) and a request id.
    (`src/wal.rs`). `Db::commit` writes and syncs it (`F_FULLFSYNC` on macOS by default); only
    then does the request count as saved. In-memory state only ever changes by applying a log
    record, live or during recovery, so recovery rebuilds exactly the same state.
-7. **Flush** (`src/segment.rs`, `src/blob.rs`). Every 64 MB, the in-memory part becomes an
-   immutable level-0 segment and a blob file. The segment holds a *part* of each session it
-   touched: the new nodes laid out *main line first* (`src/layout.rs`) and cut into 64 KB zstd
-   frames, plus the session's new requests and steps, encoded into compressed blocks. The blob
-   file holds the new pieces and opaque values, with dense id ranges. The manifest
+7. **Flush** (`src/segment.rs`, `src/blob.rs`, `src/index.rs`). Every 64 MB (`--flush-mb`), the in-memory
+   part becomes an immutable level-0 segment and an index run, and its values are appended to a blob
+   file. The segment holds a *part* of each session it touched: the new nodes laid out *main
+   line first* (`src/layout.rs`) and cut into 64 KB zstd frames, plus the session's new requests
+   and steps, encoded into compressed blocks. The new pieces and opaque values go to the end of
+   the last blob file (a new one once it passes 1 GB), grouped by session in the order requests
+   read them. The index run holds what the flush added, findable by hash (pieces, opaque values,
+   request ids, session keys) and by id (where each piece and opaque value is). The manifest
    (`src/manifest.rs`) is replaced atomically (write, sync, rename, sync the directory) and old
    log files are deleted.
-8. **Merge.** Once four level-0 segments wait, they are merged with the level-1 segments whose
-   session ranges they touch (and the last level-1 segment before brand-new sessions, while it
-   is under 256 MB). Each session is rewritten whole, main line first over its whole tree, into
-   level-1 segments split by size and partitioned by session id, so finished sessions settle
-   and are not rewritten again. Blob files are never rewritten. `Db::compact` merges everything.
+8. **Merge.** Index runs merge first: four neighbours of one size tier at a time, up to 1 GB, so
+   a lookup reads a few runs whatever the store's size. Then, once four level-0 segments wait,
+   they are merged: each session's run of consecutive parts in them is rewritten as one part,
+   main line first over that part of its tree, into level-1 segments split by size. Merged
+   segments merge again four of one size tier at a time, up to 256 MB, so each byte is rewritten
+   about once per tier. Blob files are never rewritten. `Db::compact` merges every segment.
 9. **Recovery** (`Db::open`). Reads the manifest, deletes files it does not list (a crash during
-   a flush or merge), reads each file's catalog, replays the log after the checkpoint and cuts a
-   torn last record.
+   a flush or merge), cuts blob files back to the length the manifest gives them (a flush that
+   appended and did not finish), reads each segment's and index run's catalog, replays the log
+   after the checkpoint and cuts a torn last record.
 
 ## What stays in memory
 
-Memory does not grow with the stored data; it is fixed parts plus one small catalog per file:
+Memory hardly grows with the stored data: fixed parts plus one small catalog per file, with
+nothing per key or per block in it.
 
 - **Catalogs.** Per segment: its session id range, counts, time range, the tool and field names
-  its steps use, Bloom filters of session ids, session keys and request ids (14 bits per key,
-  about 0.2% false positives), where its blocks are, and the first request id of each request
-  table block. Per blob file: its id ranges, a Bloom filter of content hashes, and where each
-  table block is. Opening a store reads the manifest and these catalogs, nothing else. This is
-  the one part that grows with the data: about 2 bytes per stored request, mostly Bloom filters
-  (3–5 MB for 1.4 million requests in the growth test).
+  its steps use, a Bloom filter of the sessions it holds (14 bits per session part), and the
+  first session of each 64 KB directory block. Per index run: counts, offsets, its piece and
+  opaque id ranges, and the first key of each fence page (one per two million keys). Per blob
+  file: its length. Opening a store reads the manifest and these catalogs, nothing else: 17.8 KB
+  for the 9 files of every Claude Code log on this Mac, and 67 KB at 1.4 million synthetic
+  requests (see Growth); the session filters are the one part that grows, 2 bytes per session part.
 - **Sessions taking writes.** A session's message tree index, pending tool calls and step tails
   stay in memory while it takes writes, and leave two flushes after its last write. A session
   that wakes up later is read back from its parts.
 - **Unflushed data** (up to 64 MB), and **caches with fixed budgets** (256 MB in all by default)
-  for sessions, steps, blocks, directories, request tables, blob tables and pieces.
+  for sessions, steps, segment blocks, directory blocks, index blocks and pieces.
 
 A session is a self-contained unit: its messages, requests and steps (with its own dictionary of
 input values; tool and field names are shared) live in its parts and are read on demand. A
 request is addressed as (session, index in the session). Finding a session by key, a request by
-id, or an existing piece or opaque value by hash asks the Bloom filters first and reads only the
-files that may hold it.
+id, or an existing piece or opaque value by hash asks the index: in each run, newest first, one
+fence page says which key page could hold the key, that page's own Bloom filter (2048 keys, 14
+bits each) says whether it may, and only then is the page read. Every part of a run has a fixed
+width, so blocks are found by arithmetic. A hit on a request id or session key is checked against
+the stored id, so a hash collision would stop with an error rather than mix two requests up.
 
 "Main line first" weighs each node by the number of requests that pass through it and writes
 the tree depth first, heaviest child first. The main line is then one run, and each side branch
@@ -168,41 +177,41 @@ parallel workers, JIT off, C collation. PostgreSQL is reached over loopback TCP,
 pays a client round trip (about 0.1 ms) that the in-process engine does not; that matters for the
 sub-millisecond rows below.
 
-Measured 2026-11-21 (after the catalog and merge layout) on 200 log files: 156 sessions, 15,663
-requests, 20,248 steps, 118 MB of distinct message text. Every answer matched (16 of 16 queries, 756
-of 756 reads). Each query best of 7; a second run on the final file formats gave the same TranscriptDB times
-within 0.15 ms. The earlier best-of-three run on the old layout had
-the same picture; against it, one-thread times here are within about 20%, with the smallest queries
-(under 0.1 ms) up to 50% slower from reading each session through the cache.
+Measured 2026-11-22 (on the layout with the index and appended blob files) on 200 log files: 146
+sessions, 18,533 requests, 21,477 steps, 133 MB of distinct message text (the logs grew since the
+2026-11-21 run, so the 200 files sampled differ). Every answer matched (16 of 16 queries, 746 of 746
+reads). Each query best of 7. The samples differ, so this is not a like-for-like comparison with the
+2026-11-21 run on the previous layout (156 sessions, 15,663 requests); most one-thread times are within
+10% of it, the largest change being most edited files (0.54 against 0.37 ms).
 
 | | TranscriptDB | PostgreSQL |
 |---|---|---|
-| Disk (tables, indexes, TOAST) | 62.3 MB | 145.7 MB (2.34x) |
+| Disk (tables, indexes, TOAST) | 67.5 MB | 168.4 MB (2.49x) |
 
 | Query | TDB, 1 thread | TDB, 8 threads | PostgreSQL | PG / TDB (1 thread) |
 |---|---|---|---|---|
-| Bash, then Edit, then Bash; no Read between | 0.61 ms | 0.27 ms | 192 ms | 316x |
-| Bash fails, only test files edited, Bash passes | 0.62 ms | 0.28 ms | 351 ms | 571x |
-| 3 Read/Grep turns in a row, then Edit | 0.18 ms | 0.12 ms | 12.8 ms | 70x |
-| Bash fails, then passes the next turn | 0.40 ms | 0.18 ms | 11.6 ms | 29x |
-| Edit, then Bash within 3 turns | 0.24 ms | 0.14 ms | 8.8 ms | 37x |
-| Write a file, later Read the same file | 0.47 ms | 0.40 ms | 1.54 ms | 3.3x |
-| 3 failing turns in a row | 0.35 ms | 0.17 ms | 11.1 ms | 32x |
-| WebSearch, then WebFetch the next turn | 0.09 ms | 0.10 ms | 10.8 ms | 116x |
-| Steps per tool, top 10 | 0.22 ms | 0.26 ms | 0.68 ms | 3.1x |
-| Failure rate per tool | 0.25 ms | 0.28 ms | 1.74 ms | 6.9x |
-| Bash steps and failures per week | 0.28 ms | 0.32 ms | 1.63 ms | 5.9x |
-| Sessions with the most failed steps | 0.09 ms | 0.12 ms | 0.87 ms | 9.5x |
-| Most edited files | 0.37 ms | 0.39 ms | 0.47 ms | 1.3x |
-| Average output size per tool | 0.24 ms | 0.28 ms | 1.86 ms | 7.8x |
-| Sessions using browser tools, per day | 0.10 ms | 0.12 ms | 2.55 ms | 27x |
-| Commands running `git commit` | 13.6 ms | 4.1 ms | 18.1 ms | 1.3x |
+| Bash, then Edit, then Bash; no Read between | 0.67 ms | 0.22 ms | 197 ms | 293x |
+| Bash fails, only test files edited, Bash passes | 0.75 ms | 0.29 ms | 398 ms | 528x |
+| 3 Read/Grep turns in a row, then Edit | 0.20 ms | 0.13 ms | 13.0 ms | 64x |
+| Bash fails, then passes the next turn | 0.42 ms | 0.19 ms | 11.6 ms | 27x |
+| Edit, then Bash within 3 turns | 0.26 ms | 0.13 ms | 8.8 ms | 34x |
+| Write a file, later Read the same file | 0.37 ms | 0.38 ms | 1.82 ms | 4.9x |
+| 3 failing turns in a row | 0.37 ms | 0.17 ms | 11.3 ms | 31x |
+| WebSearch, then WebFetch the next turn | 0.07 ms | 0.08 ms | 10.9 ms | 161x |
+| Steps per tool, top 10 | 0.23 ms | 0.26 ms | 0.80 ms | 3.5x |
+| Failure rate per tool | 0.26 ms | 0.30 ms | 1.85 ms | 7.1x |
+| Bash steps and failures per week | 0.29 ms | 0.33 ms | 1.75 ms | 6.0x |
+| Sessions with the most failed steps | 0.10 ms | 0.11 ms | 0.99 ms | 10x |
+| Most edited files | 0.54 ms | 0.53 ms | 0.70 ms | 1.3x |
+| Average output size per tool | 0.25 ms | 0.28 ms | 1.96 ms | 7.9x |
+| Sessions using browser tools, per day | 0.07 ms | 0.10 ms | 2.52 ms | 36x |
+| Commands running `git commit` | 14.2 ms | 3.3 ms | 18.9 ms | 1.3x |
 
 | Read (median / p95 per item) | TranscriptDB | PostgreSQL |
 |---|---|---|
-| A request's messages in order | 0.35 / 1.5 ms | 1.04 / 3.6 ms |
-| 20 steps with their call and result messages | 0.10 / 0.22 ms | 0.41 / 1.1 ms |
-| A whole session's messages | 0.27 / 1.4 ms | 0.79 / 3.7 ms |
+| A request's messages in order | 0.46 / 1.5 ms | 1.31 / 3.9 ms |
+| 20 steps with their call and result messages | 0.10 / 0.23 ms | 0.42 / 1.4 ms |
+| A whole session's messages | 0.31 / 1.8 ms | 0.92 / 8.5 ms |
 
 Every query is faster on one thread, so the design's bar ("each query faster") is met on this
 sample; the closest are `git commit` and most edited files (1.3x each). The first run of the
@@ -254,22 +263,22 @@ tdb growth --store DIR     # grow a synthetic store 1x..16x; open time, memory, 
 `check-rebuild.sh` writes its store outside the repo (`$TMPDIR/transcriptdb-check`) and deletes it
 at the end unless `KEEP=1`. Both it and the crash test exit non-zero on any failure.
 
-## Measured (2026-11-21, every Claude Code log on one Mac, Apple Silicon, 10 cores)
+## Measured (2026-11-22, every Claude Code log on one Mac, Apple Silicon, 10 cores)
 
 | | Result |
 |---|---|
-| Request lines in the logs | 157,253 (126,886 distinct ids; resumed sessions repeat requests) |
+| Request lines in the logs | 157,400 (127,033 distinct ids; resumed sessions repeat requests) |
 | Rebuilt from the logs, equal to `requestDigest` | all but 20 (a message is missing from the log) |
-| Ingest | 126,866 requests, 157.1 GB of bodies in 228 s; store write path 1.04 GB/s |
-| Store size | 561.0 MB: frames 191.6 MB, blob files 330.7 MB (signatures 156.5 MB, images 156.3 MB, pieces 13.8 MB, tables), other segment bytes 38.8 MB; 280x smaller than the bodies |
-| Store size with `--drop thinking,images` | 240.2 MB; 124,444 requests equal the log's body with those values blanked, the rest byte for byte |
-| Open | 10–17 ms; 0.4 MB of catalogs for 17–20 files is all that is read |
-| Storage runs per request | as ingested (with automatic merges): 95.7% one, max 4; after `compact`: 98.8% one, max 3 |
-| Rebuild check | 126,866 of 126,866 byte for byte (126,938 on a later ingest); 157 GB rebuilt on 10 threads at 9.2 GB/s (median of 3 on a quiet machine, alternating with the previous blob format, which gave 9.3; 6.1–7.5 GB/s while other work kept the load at 7–9) |
-| Rebuild one request (mean 1.23 MB), warm | median 0.43 ms, p95 1.9 ms, p99 3.5 ms |
-| 40 messages in a row / whole session | median 0.11 ms / 0.31 ms |
+| Ingest | 127,013 requests, 157.3 GB of bodies in 219 s; store write path 1.08 GB/s |
+| Store size | 571.1 MB: frames 191.9 MB, blob files 335.1 MB (opaque values 321.3 MB, pieces 13.9 MB), index runs 8.6 MB, other segment bytes 35.5 MB; 275x smaller than the bodies (the previous layout: 569 MB on the same logs) |
+| Store size with `--drop thinking,images` | 249.8 MB (index runs 8.8 MB, blob files 14.0 MB); 124,792 requests equal the log's body with those values blanked, the other 2,254 byte for byte, none different |
+| Open | 4–11 ms; 17.8 KB of catalogs for 9 files (1 segment, 7 index runs, 1 blob file) is all that is read; 2.6 MB resident after open |
+| Storage runs per request | as ingested (with automatic merges): 95.8% one, max 4; after `compact`: 98.8% one, max 3 |
+| Rebuild check | 127,013 of 127,013 byte for byte; 157 GB rebuilt on 10 threads at 9.6 GB/s (the previous layout: 9.2–9.3 GB/s on a quiet machine, 6.1–7.5 GB/s while other work kept the load at 7–9) |
+| Rebuild one request (mean 1.24 MB), warm | median 0.40 ms, p95 1.8 ms, p99 2.6 ms |
+| 40 messages in a row / whole session | median 0.10 ms / 0.27 ms |
 | Steps | every step of 1,063 sessions; engine and reference agree on every distinct step; 0 wrong `prev`, 0 results without a call |
-| Crash test | 1,000 SIGKILLs during writes, flushes and merges: 12,499 acknowledged, 0 lost, 0 wrong bytes, steps all match; recovery removed 1,944 files left by interrupted flushes and merges |
+| Crash test | 1,000 SIGKILLs during writes, flushes, appends to blob files and merges of segments and index runs: 11,496 acknowledged, 0 lost, 0 wrong bytes, steps all match; recovery removed 1,023 files left by interrupted flushes and merges |
 | Queries vs reference (2026-11-21) | 100 generated queries, 758 real sessions up to 120 steps: engine = brute force in every session (337,573 matches); 300 on synthetic: same |
 
 ### Growth (synthetic sessions, 1x to 16x)
@@ -280,22 +289,29 @@ of sessions pause after 30 requests and take the rest a round later, after their
 and merged. After each round a fresh process opens the store, does 2,000 random request rebuilds
 (cold: the first 200; warm: the last 1,000) and one query over every step. Cache budget 256 MB.
 
-| Sessions | Requests | Store | Open | Catalogs | Memory after open | Random read, cold / warm (median) | Query over all steps | Memory after the query | Bytes written / store | Ingest |
-|---|---|---|---|---|---|---|---|---|---|---|
-| 2,000 | 87 k | 109 MB | 15 ms | 0.3 MB | 3.0 MB | 0.07 / 0.06 ms | 0.03 s | 101 MB | 1.83x | 475 MB/s |
-| 4,000 | 177 k | 222 MB | 16 ms | 0.6 MB | 3.4 MB | 0.08 / 0.06 ms | 0.06 s | 165 MB | 1.85x | 479 MB/s |
-| 8,000 | 354 k | 445 MB | 15 ms | 1.1 MB | 4.5 MB | 0.10 / 0.06 ms | 0.13 s | 233 MB | 2.25x | 436 MB/s |
-| 16,000 | 708 k | 892 MB | 10 ms | 2.3 MB | 5.8 MB | 0.12 / 0.08 ms | 0.43 s | 247 MB | 2.24x | 455 MB/s |
-| 32,000 | 1.42 M | 1.78 GB | 14 ms | 4.5 MB | 8.3 MB | 0.47 / 0.33 ms | 1.06 s | 260 MB | 2.68x | 397 MB/s |
+| Sessions | Requests | Store | Open | Catalogs | Memory after open | Random read, cold / warm (median) | Query over all steps | Memory after the query | Index runs | Bytes written / store | Ingest |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| 2,000 | 87 k | 112 MB | 19 ms | 6.8 KB | 2.4 MB | 0.15 / 0.07 ms | 0.03 s | 101 MB | 3 | 1.90x | 488 MB/s |
+| 4,000 | 177 k | 228 MB | 12 ms | 11.3 KB | 2.5 MB | 0.15 / 0.09 ms | 0.06 s | 163 MB | 6 | 1.91x | 479 MB/s |
+| 8,000 | 354 k | 457 MB | 9 ms | 18.9 KB | 2.5 MB | 0.22 / 0.19 ms | 0.18 s | 235 MB | 9 | 2.30x | 438 MB/s |
+| 16,000 | 708 k | 915 MB | 18 ms | 39.0 KB | 2.7 MB | 0.32 / 0.27 ms | 0.52 s | 259 MB | 14 | 2.32x | 427 MB/s |
+| 32,000 | 1.42 M | 1.83 GB | 11 ms | 67.4 KB | 2.7 MB | 0.50 / 0.36 ms | 1.03 s | 278 MB | 20 | 2.75x | 388 MB/s |
 
-Open time stays flat, memory with a query running stays at the cache budget, ingest holds, and
-merges wrote 2.7 bytes for every byte stored (flushes included). Catalogs grow with the data, about
-3 bytes per request (Bloom filters). Random reads slow down once the sessions no longer fit the
-cache: at 32,000 sessions most reads decode the session's part from disk (about 0.3–0.5 ms); that
-is the cold cost, not a curve that keeps rising. The query reads every session, so it grows with
-the data. An earlier version of this layout lost ingest speed with the number of blob files (121
-MB/s at 32,000 sessions): each new value was looked up in every blob file's filter, and each false
-positive loaded and sorted a whole table. Tables in small blocks and 14-bit filters fixed that.
+Open time and memory after open stay flat (2.4–2.7 MB), memory with a query running stays near
+the cache budget, ingest holds, and merges wrote 2.75 bytes for every byte stored (flushes
+included). Catalogs grow only with the number of session parts, 2 bytes each for the segments'
+session filters: 67 KB at 32,000 sessions, where the previous layout held 4.5 MB (3 bytes per
+request, nearly all Bloom filters over request ids and content hashes, one set per file, and one
+blob file per flush: 284 of them here, against 1 now). Index runs grow with the log of the index's
+size, up to three waiting per size tier. On synthetic data the store is 2.7% bigger than before
+(index entries have a fixed width and are not compressed; on the real logs, 0.3%).
+
+Random reads slow down once the sessions no longer fit the cache: most reads then decode the
+session's part from disk (about 0.3–0.5 ms); that is the cold cost, not a curve that keeps rising.
+Read times move with whatever else the machine is doing (this run had a load of 2–3 from other
+work): the old and new layouts run back to back on the first three rounds gave warm medians of
+0.057 / 0.074 / 0.140 ms (old) and 0.056 / 0.059 / 0.091 ms (new). The query reads every session,
+so it grows with the data.
 
 Against the Python proof of concept (48-session sample): size per byte of distinct text 0.50 vs
 0.51; rebuild median 0.41 vs 0.85 ms; replay 0.29 vs 0.41 ms. The proof of concept's
@@ -332,12 +348,16 @@ tdb h2h           --store DIR [--pg 127.0.0.1:5455] [--no-load x] [--reps 5] [--
 ## On disk
 
 ```
-MANIFEST              live segment and blob files, id counters, checkpoint, first live log (crc32c)
+MANIFEST              live segments, index runs (in id order) and blob files (with the length each
+                      is durable at), id counters, checkpoint, first live log (crc32c)
 wal-NNNNNN.log        [len][crc32c][record]...
 seg-NNNNNN.tdb        frames per session part | blocks: groups of parts (messages + requests,
-                      steps), request id table (2048 ids a block), session directory | catalog | footer
-blob-NNNNNN.tdb       opaque values (raw) and pieces (zstd) | tables in blocks: by id (1024 a block),
-                      hash index (2048 a block) | catalog | footer
+                      steps) | session directory in 64 KB blocks, each entry saying where its
+                      part's blocks are | catalog | footer
+idx-NNNNNN.tdb        key pages (2048 sorted (kind, hash, value) keys + their Bloom filter, each
+                      with a crc32c) | fence pages (first key of 1024 pages) | piece table and
+                      opaque value table (1024 a block, by id) | catalog | footer
+blob-NNNNNN.dat       pieces (zstd, one frame each) and opaque values (raw), appended per flush
 LOCK                  held with flock while a process has the store open
 ```
 
@@ -347,10 +367,10 @@ LOCK                  held with flock while a process has the store open
    search with an index so substring tests stop scanning every distinct value.
 2. Queries that skip whole segments from their catalogs (time range, tool names) before reading
    any session.
-3. Flat catalog memory: Bloom filters and block lists loaded on demand (partitioned, as RocksDB
-   does) instead of held for every file; and one hash index for finding existing pieces and
-   opaque values, merged like the segments, instead of one filter per blob file (blob files
-   grow by one per flush, so per-file checks grow with the data).
-4. Sessions that woke up keep extra parts until a merge reaches their segments; segments at the
+3. Sessions that woke up keep extra parts until a merge reaches their segments; segments at the
    size cap are never merged again, so a periodic pass should fold those parts back.
-5. A bigger head-to-head on the full logs, and a multi-terabyte run on an external disk.
+4. Merges run inside the flush that triggers them; a background thread would keep writes going
+   while a big merge runs (index merges are capped at 1 GB and segment merges at 256 MB).
+5. A bigger head-to-head on the full logs, and a multi-terabyte run on an external disk (the
+   index's filters are about 1.8 bytes per key and are read through the cache, so at that size
+   ingest speed depends on how much of them the cache holds).
