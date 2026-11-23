@@ -241,6 +241,9 @@ pub struct SessionSteps {
     pub light: bool,
     /// Per field: how many values it has (kept in a copy without them).
     pub counts: Vec<(u32, u32)>,
+    /// In a `light` copy: the fields whose values it does hold (see
+    /// [`SessionSteps::with_fields`]), ascending.
+    pub kept: Vec<u32>,
 }
 
 /// Step positions grouped by shape code: code `c`'s are `pos[start[c]..start[c + 1]]`, ascending.
@@ -291,8 +294,18 @@ impl SessionSteps {
 
     /// Values of field `f` in this session.
     pub fn field_dict(&self, f: u32) -> Option<&Dict> {
-        assert!(!self.light, "input values read from a copy of a session's steps without them");
+        assert!(!self.light || self.kept.contains(&f), "input values read from a copy of a session's steps without them");
         self.vals.iter().find(|x| x.0 == f).map(|x| &x.1)
+    }
+
+    /// A copy holding the values of fields `keep` only (ascending): what a query whose tests
+    /// read just those fields needs. A session's commands and file contents are most of its
+    /// steps' bytes, so many more such copies fit the cache than whole ones.
+    pub fn with_fields(&self, keep: &[u32]) -> SessionSteps {
+        let mut c = self.without_values();
+        c.vals = self.vals.iter().filter(|(f, _)| keep.contains(f)).cloned().collect();
+        c.kept = keep.to_vec();
+        c
     }
 
     /// A copy without the input values: rows, field codes, shape codes, tool set, turns and
@@ -324,7 +337,7 @@ impl SessionSteps {
     }
 
     pub fn value_count(&self, f: u32) -> usize {
-        if self.light {
+        if self.light && !self.kept.contains(&f) {
             return self.counts.iter().find(|x| x.0 == f).map_or(0, |x| x.1 as usize);
         }
         self.field_dict(f).map_or(0, |d| d.len())

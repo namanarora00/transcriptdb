@@ -943,7 +943,7 @@ impl Exec<'_> {
         // a scan reads it (with the session's steps without their values)
         let (fcode, fname) = pl.field.clone().unwrap();
         let mut cur: Option<(u32, Arc<crate::steps::SessionSteps>)> = None;
-        let mut block: Option<(u64, Arc<StatBlock>)> = None;
+        let mut held_text: Arc<Vec<u8>>;
         let mut held: Option<(u32, Option<Arc<crate::steps::SessionSteps>>)> = None;
         let mut memo: HashMap<(u32, u32), (u64, u64)> = HashMap::new();
         for li in longs_to_visit {
@@ -972,12 +972,8 @@ impl Exec<'_> {
                             }
                             None => {
                                 let (r, off) = pi.steps;
-                                if block.as_ref().is_none_or(|b| b.0 != r.off) {
-                                    block = Some((r.off, db.stat_step_block(num, &r).map_err(qe)?));
-                                }
-                                let b = block.as_ref().unwrap().1.post();
-                                let a = off as usize + l.voff as usize;
-                                b.get(a..a + l.vlen as usize).ok_or_else(|| QError::new("internal: summary value past its block"))?
+                                held_text = db.summary_text(num, l.part, &r, off, l.voff, l.vlen).map_err(qe)?;
+                                &held_text
                             }
                         };
                         let fb = pl.field_bits(FieldArg::Short(text), self.now)?;

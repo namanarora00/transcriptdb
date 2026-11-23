@@ -464,6 +464,23 @@ impl Sp {
         }
     }
 
+    /// The input fields whose values testing a step reads, added to `out` (store field
+    /// codes); false when that cannot be said (a test evaluated per step reads the whole
+    /// step).
+    pub fn value_fields(&self, out: &mut Vec<u32>) -> bool {
+        match self {
+            Sp::Const(_) | Sp::Tool(_) | Sp::Session { .. } => true,
+            Sp::Field { f, .. } | Sp::Present { f, .. } => {
+                out.extend(f.iter());
+                true
+            }
+            // one reading only a step's own columns (`failed`, `time`...) reads no values
+            Sp::Generic(_) => !self.reads_values(),
+            Sp::And(v) | Sp::Or(v) => v.iter().all(|x| x.value_fields(out)),
+            Sp::Not(x) => x.value_fields(out),
+        }
+    }
+
     pub fn test(&self, db: &Db, s: u32, ss: &SessionSteps, pos: u32, now: i64) -> Result<bool, QError> {
         Ok(match self {
             Sp::Const(b) => *b,

@@ -159,6 +159,9 @@ pub struct Compiled {
     pub shape_masks: Box<[Option<u64>; 256]>,
     /// Whether a test reads input values (else sessions' steps are read without them).
     pub reads_values: bool,
+    /// The fields whose values the tests read, when that is known: sessions' steps are then
+    /// read with those fields' values only.
+    pub value_fields: Option<Vec<u32>>,
 }
 
 pub fn compile_pattern(db: &Db, p: &Pattern, pre: &Sp, now: i64) -> Result<Compiled, QError> {
@@ -208,7 +211,13 @@ pub fn compile_pattern(db: &Db, p: &Pattern, pre: &Sp, now: i64) -> Result<Compi
         }
     }
     let reads_values = elems.iter().chain(&excl).any(|t| t.sp.reads_values());
-    Ok(Compiled { spec, elems, excl, vars, eq, shape_masks, reads_values })
+    let mut fields = Vec::new();
+    let value_fields = elems.iter().chain(&excl).all(|t| t.sp.value_fields(&mut fields)).then(|| {
+        fields.sort_unstable();
+        fields.dedup();
+        fields
+    });
+    Ok(Compiled { spec, elems, excl, vars, eq, shape_masks, reads_values, value_fields })
 }
 
 /// Partition key of a step for an equality constraint: the dictionary code, or the full
@@ -232,7 +241,12 @@ pub fn eq_key(db: &Db, s: u32, pos: u32, field: &str) -> Result<Option<EqKey>, Q
 
 /// Matches of a compiled pattern in one session.
 pub fn session_matches(db: &Db, c: &Compiled, s: u32, now: i64, scanned: &AtomicUsize) -> Result<Option<Vec<Match>>, QError> {
-    let ss_arc = if c.reads_values { db.try_steps(s) } else { db.light_steps(s) }.map_err(|e| QError::new(e.to_string()))?;
+    let ss_arc = match (&c.value_fields, c.reads_values) {
+        (_, false) => db.light_steps(s),
+        (Some(f), true) => db.steps_with_fields(s, f),
+        (None, true) => db.try_steps(s),
+    }
+    .map_err(|e| QError::new(e.to_string()))?;
     let ss = &*ss_arc;
     if ss.rows.is_empty() {
         return Ok(None);
@@ -252,6 +266,11 @@ pub fn session_matches(db: &Db, c: &Compiled, s: u32, now: i64, scanned: &Atomic
     let r = session_matches_in(db, c, s, ss, now, &mut sc);
     if c.eq.is_none() || r.is_err() {
         sc.masks[..n].fill(0);
+    } else if !sc.wrote_others {
+        // every mask written is of a step in `active`
+        for &p in &sc.active {
+            sc.masks[p as usize] = 0;
+        }
     } else {
         let by = ss.by_shape();
         for code in 0..=255u8 {
@@ -283,6 +302,9 @@ struct Scratch {
     at: Vec<u32>,
     fill: Vec<u32>,
     flat: Vec<(u32, u64)>,
+    sparse: matcher::SparseWork,
+    /// A step outside `active` had its mask written (one hitting only exclusions).
+    wrote_others: bool,
 }
 
 thread_local! {
@@ -321,7 +343,8 @@ fn merge_runs(active: &mut Vec<u32>, runs: &mut Vec<(u32, u32)>, merged: &mut Ve
 }
 
 fn session_matches_in(db: &Db, c: &Compiled, s: u32, ss: &steps::SessionSteps, now: i64, sc: &mut Scratch) -> Result<Option<Vec<Match>>, QError> {
-    let Scratch { masks, active, runs, merged, keys, by_code, seen, gx, at, fill, flat } = sc;
+    let Scratch { masks, active, runs, merged, keys, by_code, seen, gx, at, fill, flat, sparse, wrote_others } = sc;
+    *wrote_others = false;
     let masks: &mut [u64] = &mut masks[..ss.rows.len()];
     // masks by shape code: whole groups of steps at once where tool and outcome decide every
     // test, step by step elsewhere; `active` gets the steps passing some element, as one
@@ -367,6 +390,8 @@ fn session_matches_in(db: &Db, c: &Compiled, s: u32, ss: &steps::SessionSteps, n
                     let a = active.len() as u32;
                     active.extend_from_slice(ps);
                     runs.push((a, active.len() as u32));
+                } else {
+                    *wrote_others = true;
                 }
             }
             None => {
@@ -386,6 +411,8 @@ fn session_matches_in(db: &Db, c: &Compiled, s: u32, ss: &steps::SessionSteps, n
                     masks[pos as usize] = m;
                     if m as u32 != 0 {
                         active.push(pos);
+                    } else if m != 0 {
+                        *wrote_others = true;
                     }
                 }
                 runs.push((a, active.len() as u32));
@@ -476,7 +503,7 @@ fn session_matches_in(db: &Db, c: &Compiled, s: u32, ss: &steps::SessionSteps, n
                     }
                 }
                 for v in 0..seen.len() {
-                    matcher::run_sparse(&c.spec, &turns, gx, &xs, &flat[at[v] as usize..at[v + 1] as usize], &mut out);
+                    matcher::run_sparse(&c.spec, &turns, gx, &xs, &flat[at[v] as usize..at[v + 1] as usize], sparse, &mut out);
                 }
             } else {
                 let mut key_of: Vec<u32> = vec![u32::MAX; masks.len()];

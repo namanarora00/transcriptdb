@@ -442,6 +442,12 @@ pub struct Db {
     stepc: Cache<u32, SessionSteps>,
     /// Sessions' steps without their input values, for queries that read none.
     lightc: Cache<u32, SessionSteps>,
+    /// Sessions' steps with the values of only the fields queries tested.
+    fieldc: Cache<u32, SessionSteps>,
+    /// Texts of step values that summaries read from step blocks, by (segment, part,
+    /// offset in the part): a search confirms each candidate on its text, and its
+    /// candidates are spread over far more step blocks than fit a cache.
+    textc: Cache<(u32, u32, u32), Vec<u8>>,
     pieces: Cache<u32, Vec<u8>>,
     /// Per piece kind, the last few pieces stored, with how many pieces reading each one
     /// needs first: new pieces of that kind are compressed against one of them when that pays.
@@ -592,14 +598,16 @@ impl Db {
             dirs: Cache::sharded(cb / 16, 16),
             blocks: Cache::sharded(cb / 8, 16),
             ix: Cache::sharded(cb / 8, 16),
-            cores: Cache::new(cb / 4),
-            stepc: Cache::new(cb / 6),
-            lightc: Cache::new(cb / 12),
+            cores: Cache::new(cb * 3 / 16),
+            stepc: Cache::new(cb / 8),
+            lightc: Cache::new(cb / 16),
+            fieldc: Cache::new(cb / 16),
+            textc: Cache::sharded(cb / 32, 16),
             pieces: Cache::sharded(cb / 16, 16),
             piece_bases: HashMap::new(),
             skels: Cache::sharded(cb / 32, 16),
             statc: Cache::new(cb / 12),
-            longc: Cache::sharded(cb / 16, 16),
+            longc: Cache::sharded(cb / 32, 16),
             live_masks: Mutex::new(HashMap::new()),
             active: HashMap::new(),
             busy: BTreeSet::new(),
@@ -975,6 +983,7 @@ impl Db {
         self.cores.remove(&s);
         self.stepc.remove(&s);
         self.lightc.remove(&s);
+        self.fieldc.remove(&s);
         let mut ss = Arc::unwrap_or_clone(steps);
         // per node: last step at or above it on its path
         let mut last_at = vec![NONE; core.nodes.len()];
@@ -1776,7 +1785,7 @@ impl Db {
             return corrupt("merge with unflushed sessions");
         }
         self.key_ix.clear();
-        for c in [&self.cores as &dyn Clear, &self.stepc, &self.lightc, &self.dirs, &self.blocks, &self.statc, &self.longc] {
+        for c in [&self.cores as &dyn Clear, &self.stepc, &self.lightc, &self.fieldc, &self.dirs, &self.blocks, &self.statc, &self.longc, &self.textc] {
             c.clear_all();
         }
         let mut bytes_out = 0;
@@ -2310,6 +2319,8 @@ impl Db {
             ("sessions", self.cores.stats()),
             ("steps", self.stepc.stats()),
             ("steps without values", self.lightc.stats()),
+            ("steps with some fields' values", self.fieldc.stats()),
+            ("step values read by summaries", self.textc.stats()),
             ("step summaries", self.statc.stats()),
             ("long input values", self.longc.stats()),
             ("blocks", self.blocks.stats()),
@@ -2342,6 +2353,48 @@ impl Db {
     /// field codes, turns and shapes only.
     pub fn light_steps(&self, s: u32) -> Result<Arc<SessionSteps>> {
         self.load_light_steps(s)
+    }
+
+    /// A session's steps with at least the values of fields `fields` (ascending store
+    /// field codes): the whole steps when they are at hand, else a copy holding only the
+    /// fields queries have asked for so far.
+    pub fn steps_with_fields(&self, s: u32, fields: &[u32]) -> Result<Arc<SessionSteps>> {
+        if fields.is_empty() {
+            return self.load_light_steps(s);
+        }
+        if let Some(a) = self.active.get(&s) {
+            return Ok(a.steps.clone());
+        }
+        if let Some(c) = self.stepc.get(&s) {
+            return Ok(c);
+        }
+        let mut keep = fields.to_vec();
+        if let Some(c) = self.fieldc.get(&s) {
+            if fields.iter().all(|f| c.kept.contains(f)) {
+                return Ok(c);
+            }
+            keep.extend_from_slice(&c.kept);
+            keep.sort_unstable();
+            keep.dedup();
+        }
+        let ss = self.read_steps(s)?.with_fields(&keep);
+        let size = ss.bytes();
+        Ok(self.fieldc.insert(s, Arc::new(ss), size))
+    }
+
+    /// The text of a step value a summary points at: `vlen` bytes at `voff` in part
+    /// `part`'s step data, which starts at `off` in block `r` of segment `num`. Kept after
+    /// the first read.
+    pub fn summary_text(&self, num: u32, part: u32, r: &BlockRef, off: u32, voff: u32, vlen: u32) -> Result<Arc<Vec<u8>>> {
+        let key = (num, part, voff);
+        if let Some(t) = self.textc.get(&key) {
+            return Ok(t);
+        }
+        let b = self.stat_step_block(num, r)?;
+        let a = off as usize + voff as usize;
+        let t = b.post().get(a..a + vlen as usize).ok_or_else(|| bad("summary value past its block"))?.to_vec();
+        let size = 64 + t.len();
+        Ok(self.textc.insert(key, Arc::new(t), size))
     }
 
     /// Tool and field names.
@@ -2736,7 +2789,7 @@ impl Db {
 
     /// Drop everything read from files from the caches (sessions taking writes stay).
     pub fn clear_caches(&self) {
-        for c in [&self.cores as &dyn Clear, &self.stepc, &self.lightc, &self.dirs, &self.blocks, &self.ix, &self.pieces, &self.skels, &self.statc, &self.longc] {
+        for c in [&self.cores as &dyn Clear, &self.stepc, &self.lightc, &self.dirs, &self.blocks, &self.ix, &self.pieces, &self.skels, &self.statc, &self.longc, &self.fieldc, &self.textc] {
             c.clear_all();
         }
     }

@@ -241,13 +241,14 @@ fn turn(sp: &Spec, before: &[Th], d: u32, gx: u64, steps: impl Iterator<Item = (
 /// turn between). `gx` holds
 /// each turn's exclusion hits over all its steps; `xs[x]` counts, per turn, the turns on
 /// its path from the root up to it hitting exclusion `x`.
-pub fn run_sparse(sp: &Spec, t: &Turns, gx: &[u64], xs: &[Vec<u32>], steps: &[(u32, u64)], out: &mut Vec<Match>) {
+pub fn run_sparse(sp: &Spec, t: &Turns, gx: &[u64], xs: &[Vec<u32>], steps: &[(u32, u64)], w: &mut SparseWork, out: &mut Vec<Match>) {
     if steps.is_empty() || sp.n == 0 {
         return;
     }
     let last_elem = sp.n - 1;
+    let SparseWork { vt, pool, sets, stack, before, new } = w;
     // visited turns with their steps, in preorder (parents first)
-    let mut vt: Vec<(u32, usize, usize)> = Vec::new();
+    vt.clear();
     let mut a = 0;
     while a < steps.len() {
         let g = t.of[steps[a].0 as usize];
@@ -258,13 +259,13 @@ pub fn run_sparse(sp: &Spec, t: &Turns, gx: &[u64], xs: &[Vec<u32>], steps: &[(u
         vt.push((g, a, b));
         a = b;
     }
-    vt.sort_by_key(|x| t.tin[x.0 as usize]);
+    if vt.len() > 1 {
+        vt.sort_by_key(|x| t.tin[x.0 as usize]);
+    }
     // threads alive after each visited turn: sets[i] = pool[range]
-    let mut pool: Vec<Th> = Vec::new();
-    let mut sets: Vec<(u32, u32)> = Vec::with_capacity(vt.len());
-    let mut stack: Vec<usize> = Vec::new();
-    let mut before: Vec<Th> = Vec::new();
-    let mut new: Vec<Th> = Vec::new();
+    pool.clear();
+    sets.clear();
+    stack.clear();
     for (vi, &(g, a, b)) in vt.iter().enumerate() {
         while stack.last().is_some_and(|&p| !t.is_ancestor(vt[p].0, g)) {
             stack.pop();
@@ -291,9 +292,21 @@ pub fn run_sparse(sp: &Spec, t: &Turns, gx: &[u64], xs: &[Vec<u32>], steps: &[(u
                 }
             }
         }
-        turn(sp, &before, d, gx[g as usize], steps[a..b].iter().copied(), &mut new, out);
+        turn(sp, before, d, gx[g as usize], steps[a..b].iter().copied(), new, out);
         sets.push((pool.len() as u32, new.len() as u32));
-        pool.extend_from_slice(&new);
+        pool.extend_from_slice(new);
         stack.push(vi);
     }
+}
+
+/// Working arrays of [`run_sparse`], kept by its caller between calls: it runs once per
+/// value of a compared field, most of them with a handful of steps.
+#[derive(Default)]
+pub struct SparseWork {
+    vt: Vec<(u32, usize, usize)>,
+    pool: Vec<Th>,
+    sets: Vec<(u32, u32)>,
+    stack: Vec<usize>,
+    before: Vec<Th>,
+    new: Vec<Th>,
 }
