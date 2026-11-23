@@ -812,8 +812,10 @@ fn crash_child(a: &Args) {
     let run = a.num("run", 0);
     // small flushes, frequent merges into small segments, sessions leaving memory after one
     // idle flush and tiny caches: kills land in every part of the write path; merges of over
-    // 1.6 MB of messages train a dictionary (at a low level, to keep kills frequent)
-    let opts = Options { sync: a.sync(), flush_bytes: 384 << 10, merge_at: 3, seg_bytes: 128 << 10, idle_flushes: 1, cache_bytes: 4 << 20, blob_bytes: 512 << 10, run_bytes: 256 << 10, merge_level: 3, threads: 2, ..Options::default() };
+    // 1.6 MB of messages train a dictionary (at a low level, to keep kills frequent). Sizes are
+    // small because requests store little once thinking and images are blanked: full-size
+    // merges must happen for folds and rewrites to be killed too.
+    let opts = Options { sync: a.sync(), flush_bytes: 128 << 10, merge_at: 3, seg_bytes: 32 << 10, idle_flushes: 1, cache_bytes: 4 << 20, blob_bytes: 32 << 10, run_bytes: 64 << 10, merge_level: 3, threads: 2, ..Options::default() };
     let mut db = Db::open(a.store(), opts).expect("open store");
     {
         let mut l = std::io::stdout().lock();

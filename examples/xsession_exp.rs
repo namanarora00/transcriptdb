@@ -2,11 +2,13 @@
 //! stored (in storage order) are compressed in 64 KB frames at level 19 with a 1 MB
 //! dictionary trained the way a merge trains it (A); then with every message an earlier
 //! session already has left out of the frames (B, as if it were a reference to the earlier
-//! copy); then with all messages in the frames but the messages two or more sessions hold
-//! appended to the trained dictionary, capped at MB megabytes (C). Prints sizes and decode
-//! times only.
+//! copy); then with all messages in the frames and messages appended to the trained
+//! dictionary (C): for each MB given, 1-99 appends the messages two or more sessions hold, up
+//! to MB megabytes; 100 + M appends M megabytes of messages sampled evenly over all sessions;
+//! 0 appends as many bytes of messages only one session holds (a control). Prints sizes and
+//! decode times (through a prepared dictionary) only.
 //!
-//!   cargo run --release --example xsession_exp -- STORE [MB,MB,...]
+//!   cargo run --release --example xsession_exp -- STORE [MB,MB,...]   # e.g. 2,0,104,108
 
 use std::collections::HashMap;
 use std::time::Instant;
@@ -172,7 +174,7 @@ fn main() {
         let (c, fc) = compress(&all, &d2);
         let ct = t.elapsed().as_secs_f64();
         println!(
-            "C dictionary + {:.2} MB of shared messages: frames {:.2} MB + dictionary {:.2} MB = {:.2} MB (A: {:.2}); compress {ct:.1}s; decode {:.1} us/frame",
+            "C dictionary + {:.2} MB of messages: frames {:.2} MB + dictionary {:.2} MB = {:.2} MB (A: {:.2}); compress {ct:.1}s; decode {:.1} us/frame",
             extra.len() as f64 / 1e6,
             c as f64 / 1e6,
             dz(&d2) as f64 / 1e6,

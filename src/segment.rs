@@ -11,8 +11,9 @@
 //! (each with zstd's content checksum); blocks (zstd, crc32c), being groups of encoded
 //! parts (message metadata and requests in one kind of group, steps in another) and the
 //! session directory in blocks of about 64 KB, whose entries say where each part's blocks
-//! are; in a merged segment, the zstd dictionary its frames were compressed with (trained
-//! by the merge on its input); then the catalog and the footer.
+//! are; in a merged segment, the zstd dictionary its frames and step blocks were compressed
+//! with (trained by the merge on its input, then some of the input's messages); then the
+//! catalog and the footer.
 //!
 //! A frame compressed with a dictionary is decompressed into a buffer that holds the
 //! dictionary's bytes right before it (one per thread for the last two segments it read),
