@@ -18,7 +18,7 @@
 //! dictionary's bytes right before it (one per thread for the last two segments it read),
 //! so that zstd copies matches into the dictionary as matches into earlier output.
 
-use crate::block::{file, handle, read_block, read_catalog, write_block, write_catalog, BlockRef};
+use crate::block::{file, handle, read_block, read_catalog, read_packed, write_block, write_catalog, write_packed, BlockRef};
 use crate::bloom::{key_hash, Bloom};
 use crate::codec::{corrupt, Dec, Enc, Result};
 use crate::record::ReqRec;
@@ -776,7 +776,11 @@ impl SegWriter {
         if waiting.is_empty() {
             return Ok(());
         }
-        let r = write_block(&mut self.f, &mut self.pos, &buf, self.codec.block_level)?;
+        // step blocks of a segment with a dictionary use it too (about 12% smaller)
+        let r = match &self.cdict {
+            Some(cd) if steps => write_packed(&mut self.f, &mut self.pos, &frame_compressor(self.codec.level, Some(cd))?.compress(&buf)?, buf.len())?,
+            _ => write_block(&mut self.f, &mut self.pos, &buf, self.codec.block_level)?,
+        };
         for i in waiting {
             if steps {
                 self.dir[i].steps.0 = r;
@@ -989,6 +993,9 @@ impl Drop for DictBuf {
 
 /// Dictionary buffers per thread, most recently used last.
 const DICT_BUFS: usize = 2;
+/// Room after the dictionary in such a buffer, in frames: enough for a frame or for most
+/// blocks of step parts (about 64 KB); bigger blocks are decoded without it.
+const DICT_ROOM_FRAMES: usize = 4;
 
 thread_local! {
     static DICT_BUF: RefCell<Vec<DictBuf>> = const { RefCell::new(Vec::new()) };
@@ -1038,8 +1045,14 @@ impl Segment {
         Ok(Some(d))
     }
 
-    /// Frame `src` of this segment decompressed with its dictionary.
+    /// Frame or block `src` of this segment decompressed with its dictionary.
     fn decompress_dict(&self, src: &[u8], cap: usize) -> Result<Vec<u8>> {
+        let room = DICT_ROOM_FRAMES * self.cat.frame_size as usize;
+        if cap > room {
+            // a block bigger than the room after the dictionary: rare, decoded the slow way
+            let d = self.dict()?.ok_or_else(|| crate::codec::Error::Corrupt("segment has no dictionary".into()))?;
+            return Ok(zstd::bulk::Decompressor::with_dictionary(&d)?.decompress(src, cap)?);
+        }
         DICT_BUF.with(|bufs| {
             let mut bufs = bufs.borrow_mut();
             match bufs.iter().position(|b| b.uid == self.uid) {
@@ -1052,7 +1065,7 @@ impl Segment {
                     if bufs.len() >= DICT_BUFS {
                         bufs.remove(0);
                     }
-                    bufs.push(DictBuf::new(self.uid, &d, self.cat.frame_size as usize));
+                    bufs.push(DictBuf::new(self.uid, &d, room));
                 }
             }
             let b = bufs.last_mut().unwrap();
@@ -1068,6 +1081,22 @@ impl Segment {
             return corrupt(format!("segment {} has no block at {}", self.num, r.off));
         }
         read_block(&*handle(self.uid, &self.path)?, r, &format!("segment {}", self.num))
+    }
+
+    /// A block of step parts: compressed with the segment's dictionary when it has one.
+    pub fn step_block(&self, r: &BlockRef) -> Result<Vec<u8>> {
+        if self.cat.dict.is_none() {
+            return self.block(r);
+        }
+        if r.off + r.clen as u64 > self.file_bytes {
+            return corrupt(format!("segment {} has no block at {}", self.num, r.off));
+        }
+        let c = read_packed(&*handle(self.uid, &self.path)?, r, &format!("segment {}", self.num))?;
+        let raw = self.decompress_dict(&c, r.rawlen as usize)?;
+        if raw.len() != r.rawlen as usize {
+            return corrupt(format!("segment {}: block has the wrong size", self.num));
+        }
+        Ok(raw)
     }
 
     /// Directory block `i`.

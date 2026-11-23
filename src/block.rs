@@ -31,19 +31,29 @@ impl BlockRef {
 
 /// Compress `raw` and write it at `*pos`.
 pub fn write_block(w: &mut impl Write, pos: &mut u64, raw: &[u8], level: i32) -> Result<BlockRef> {
-    let c = zstd::bulk::compress(raw, level)?;
-    w.write_all(&c)?;
-    let r = BlockRef { off: *pos, clen: c.len() as u32, rawlen: raw.len() as u32, crc: crc32c::crc32c(&c) };
+    write_packed(w, pos, &zstd::bulk::compress(raw, level)?, raw.len())
+}
+
+/// Write a block compressed by the caller (`rawlen` bytes once decompressed) at `*pos`.
+pub fn write_packed(w: &mut impl Write, pos: &mut u64, c: &[u8], rawlen: usize) -> Result<BlockRef> {
+    w.write_all(c)?;
+    let r = BlockRef { off: *pos, clen: c.len() as u32, rawlen: rawlen as u32, crc: crc32c::crc32c(c) };
     *pos += c.len() as u64;
     Ok(r)
 }
 
-pub fn read_block(f: &File, r: &BlockRef, what: &str) -> Result<Vec<u8>> {
+/// A block's compressed bytes, checksum checked.
+pub fn read_packed(f: &File, r: &BlockRef, what: &str) -> Result<Vec<u8>> {
     let mut c = vec![0u8; r.clen as usize];
     f.read_exact_at(&mut c, r.off)?;
     if crc32c::crc32c(&c) != r.crc {
         return corrupt(format!("{what}: block checksum mismatch"));
     }
+    Ok(c)
+}
+
+pub fn read_block(f: &File, r: &BlockRef, what: &str) -> Result<Vec<u8>> {
+    let c = read_packed(f, r, what)?;
     let raw = crate::segment::decompress(&c, r.rawlen as usize)?;
     if raw.len() != r.rawlen as usize {
         return corrupt(format!("{what}: block has the wrong size"));

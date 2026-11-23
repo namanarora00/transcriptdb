@@ -385,9 +385,9 @@ pub struct Db {
 const DICT_MIN_RAW: u64 = 1600 << 10;
 
 /// Recent pieces per kind that a new piece may be compressed against.
-const PIECE_BASES: usize = 4;
+const PIECE_BASES: usize = 32;
 /// Most pieces that reading one piece may need first.
-const PIECE_CHAIN: u8 = 8;
+const PIECE_CHAIN: u8 = 32;
 
 fn piece_hash(kind: u8, b: &[u8]) -> u128 {
     xxh3_128_with_seed(b, kind as u64)
@@ -619,6 +619,15 @@ impl Db {
         Ok(self.blocks.insert((seg.num, r.off), Arc::new(raw), n))
     }
 
+    fn step_block(&self, seg: &Segment, r: &BlockRef) -> Result<Arc<Vec<u8>>> {
+        if let Some(x) = self.blocks.get(&(seg.num, r.off)) {
+            return Ok(x);
+        }
+        let raw = seg.step_block(r)?;
+        let n = raw.len();
+        Ok(self.blocks.insert((seg.num, r.off), Arc::new(raw), n))
+    }
+
     fn ixb(&self, run: &Run, kind: u8, i: usize) -> Result<Arc<IxBlock>> {
         let k = (run.num, kind, i as u32);
         if let Some(t) = self.ix.get(&k) {
@@ -802,7 +811,7 @@ impl Db {
         let mut ss = SessionSteps::default();
         let mut fs: Vec<(u32, FieldVal)> = Vec::new();
         for (seg, d) in &parts {
-            let raw = self.block(seg, &d.steps.0)?;
+            let raw = self.step_block(seg, &d.steps.0)?;
             let (a, b) = (d.steps.1 as usize, (d.steps.1 + d.steps.2) as usize);
             let p = decode_steps(raw.get(a..b).ok_or_else(|| bad("step part past its block"))?)?;
             if p.first as usize != ss.rows.len() {

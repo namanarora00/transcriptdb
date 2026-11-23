@@ -56,9 +56,8 @@ fn train(streams: &[Vec<u8>], size: usize) -> Vec<u8> {
     for s in streams {
         for f in frames(s) {
             if k.is_multiple_of(stride) {
-                let take = &f[..f.len().min(16 << 10)];
-                buf.extend_from_slice(take);
-                sizes.push(take.len());
+                buf.extend_from_slice(f);
+                sizes.push(f.len());
             }
             k += 1;
         }
@@ -131,10 +130,37 @@ fn main() {
     // largest first: biggest saving per dictionary byte is a message many sessions hold
     let mut by_gain: Vec<&(u128, &[u8])> = shared.iter().collect();
     by_gain.sort_by_key(|x| std::cmp::Reverse((holders[&x.0] as usize - 1) * x.1.len()));
+    // control: as many bytes of messages only one session holds, spread over all of them
+    let single: Vec<&[u8]> = sess.iter().flat_map(|v| v.iter()).filter(|(k, _)| holders[k] == 1).map(|(_, m)| &m[..]).collect();
     for cap in caps {
         let mut d2 = dict.clone();
         let mut extra = Vec::new();
-        for (_, m) in &by_gain {
+        if cap == 0 {
+            let step = (single.len() / 2000).max(1);
+            for m in single.iter().step_by(step) {
+                if extra.len() + m.len() <= shared_bytes {
+                    extra.extend_from_slice(m);
+                }
+            }
+            print!("(control, messages one session holds) ");
+        }
+        if cap >= 100 {
+            // cap - 100 MB of messages sampled evenly over all sessions, whatever they hold
+            let want = (cap - 100) << 20;
+            let step = (bytes / want.max(1)).max(1);
+            let (mut acc, mut next) = (0usize, 0usize);
+            for v in &sess {
+                for (_, m) in v {
+                    if acc >= next && extra.len() + m.len() <= want {
+                        extra.extend_from_slice(m);
+                        next = acc + step.saturating_sub(1) * m.len().max(1);
+                    }
+                    acc += m.len();
+                }
+            }
+            print!("(messages sampled evenly) ");
+        }
+        for (_, m) in by_gain.iter().filter(|_| cap > 0 && cap < 100) {
             if extra.len() + m.len() > cap << 20 {
                 continue;
             }
