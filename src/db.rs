@@ -17,7 +17,9 @@
 //! demand. Shared pieces and opaque values are appended to blob files. The index finds a
 //! piece or opaque value by hash or by id, a request by its id and a session by its key;
 //! each flush adds an index run and runs merge by size tiers, so a lookup reads a few runs.
-//! Flushes write level-0 segments; merges combine segments by size tiers up to a cap. A
+//! Flushes write level-0 segments (zstd level 3); merges combine segments by size tiers up
+//! to a cap, writing frames and blocks at a higher level (19) with a zstd dictionary trained
+//! on what they merge, compressed on several threads. A
 //! session that takes writes again after its data reached the cap is folded back into one
 //! part by a later merge into full-size segments (`Db::merge`); the parts it replaces
 //! stay in their segments, unread, until half of a segment is such parts and it is rewritten.
@@ -30,7 +32,7 @@ use crate::codec::{corrupt, Error, Result};
 use crate::layout;
 use crate::manifest::{Dead, Manifest};
 use crate::record::*;
-use crate::segment::{decode_core, decode_steps, key_bytes, seg_path, CorePart, DirEnt, SegNode, SegWriter, Segment, StepPart};
+use crate::segment::{decode_core, decode_steps, key_bytes, seg_path, Codec, CorePart, DirEnt, SegNode, SegWriter, Segment, StepPart};
 use crate::split::{self, HoleKind, Keep, OpaqueEnc, OpaqueHole, OpaqueKind, Skeleton};
 use crate::steps::{self, FieldVal, SessionSteps, StepDicts, StepRow};
 use crate::wal::{self, SyncMode, WalWriter};
@@ -71,6 +73,14 @@ pub struct Options {
     /// A merge into full-size segments folds a session into one part when it has gone quiet
     /// or would otherwise be left in more parts than this; 0 turns folding off.
     pub max_parts: usize,
+    /// zstd level for what merges into full-size segments (and `compact`) write; flushes and
+    /// smaller merges use `level`. Also the level of new shared pieces.
+    pub merge_level: i32,
+    /// Most bytes of the zstd dictionary such a merge trains on its input and compresses its
+    /// output's frames with (about 1% of the messages merged, up to this); 0 for none.
+    pub dict_bytes: usize,
+    /// Threads compressing frames in merges.
+    pub threads: usize,
 }
 
 impl Default for Options {
@@ -90,6 +100,9 @@ impl Default for Options {
             blob_bytes: 1 << 30,
             run_bytes: 1 << 30,
             max_parts: 4,
+            merge_level: 19,
+            dict_bytes: 1 << 20,
+            threads: std::thread::available_parallelism().map_or(4, |n| n.get()),
         }
     }
 }
@@ -262,6 +275,8 @@ pub struct Stats {
     pub node_bytes: u64,
     /// Compressed frames holding those messages.
     pub frame_bytes: u64,
+    /// zstd dictionaries the merged segments' frames were compressed with.
+    pub dict_bytes: u64,
     pub piece_raw_bytes: u64,
     pub piece_bytes: u64,
     pub opaque_bytes: u64,
@@ -321,6 +336,9 @@ pub struct Db {
     cores: Cache<u32, SessionCore>,
     stepc: Cache<u32, SessionSteps>,
     pieces: Cache<u32, Vec<u8>>,
+    /// Per piece kind, the last few pieces stored, with how many pieces reading each one
+    /// needs first: new pieces of that kind are compressed against one of them when that pays.
+    piece_bases: HashMap<u8, Vec<(u32, u8)>>,
     skels: Cache<u32, Skeleton>,
     active: HashMap<u32, Active>,
     /// Sessions that took writes in the last `idle_flushes` flushes, as of the last flush
@@ -338,6 +356,14 @@ pub struct Db {
     pub recovery: RecoveryReport,
     pub merge_stats: MergeStats,
 }
+
+/// Messages a merge needs (bytes) to train a dictionary and write at `merge_level`.
+const DICT_MIN_RAW: u64 = 1600 << 10;
+
+/// Recent pieces per kind that a new piece may be compressed against.
+const PIECE_BASES: usize = 4;
+/// Most pieces that reading one piece may need first.
+const PIECE_CHAIN: u8 = 8;
 
 fn piece_hash(kind: u8, b: &[u8]) -> u128 {
     xxh3_128_with_seed(b, kind as u64)
@@ -453,6 +479,7 @@ impl Db {
             cores: Cache::new(cb / 4),
             stepc: Cache::new(cb / 4),
             pieces: Cache::sharded(cb / 16, 16),
+            piece_bases: HashMap::new(),
             skels: Cache::sharded(cb / 32, 16),
             active: HashMap::new(),
             busy: BTreeSet::new(),
@@ -1193,7 +1220,8 @@ impl Db {
     }
 
     /// Write nodes `nodes` and requests `reqs` of a session as one part, main line first.
-    fn core_part(&self, w: &mut SegWriter, core: &SessionCore, nodes: std::ops::Range<u32>, reqs: std::ops::Range<u32>) -> Result<CorePart> {
+    /// A session part's metadata and its message stream (frames not written yet).
+    fn core_part(&self, core: &SessionCore, nodes: std::ops::Range<u32>, reqs: std::ops::Range<u32>) -> Result<(CorePart, Vec<u8>)> {
         let (first, n) = (nodes.start, nodes.end - nodes.start);
         let first_req = reqs.start;
         let tips = core.requests[reqs.start as usize..reqs.end as usize].iter().map(|r| r.tip);
@@ -1209,8 +1237,7 @@ impl Db {
         if stream.len() > u32::MAX as usize {
             return Err(Error::BadRequest("a session part is over 4 GiB".into()));
         }
-        let frames = w.frames(&stream)?;
-        Ok(CorePart { frames, raw_len: stream.len() as u64, nodes, first_node: first, first_req, requests: core.requests[reqs.start as usize..reqs.end as usize].to_vec() })
+        Ok((CorePart { frames: Vec::new(), raw_len: stream.len() as u64, nodes, first_node: first, first_req, requests: core.requests[reqs.start as usize..reqs.end as usize].to_vec() }, stream))
     }
 
     /// Write everything in memory to files (a new segment and index run; values appended
@@ -1241,12 +1268,31 @@ impl Db {
                     (bn, 0)
                 }
             };
-            let mut bw = BlobAppend::open(&self.dir, bn, len, self.opts.level)?;
+            let mut bw = BlobAppend::open(&self.dir, bn, len)?;
             let start = bw.pos();
-            for (kind, h, raw) in &self.mem.pieces {
-                let (off, clen) = bw.piece(raw)?;
-                pents.push(PieceEnt { kind: *kind, hash: *h, file: bn, off, clen, rawlen: raw.len() as u32 });
+            // system prompts and tool lists change a little at a time: each new piece is
+            // compressed against a recent whole piece of its kind when that at least halves it
+            let first = self.manifest.pieces;
+            let mut bases = std::mem::take(&mut self.piece_bases);
+            for (i, (kind, h, raw)) in self.mem.pieces.iter().enumerate() {
+                let ids = bases.entry(*kind).or_default();
+                let mut cand: Vec<(u32, Vec<u8>)> = Vec::with_capacity(ids.len());
+                for &(id, depth) in ids.iter() {
+                    if depth < PIECE_CHAIN {
+                        cand.push((id, if id >= first { self.mem.pieces[(id - first) as usize].2.to_vec() } else { self.piece(id)?.to_vec() }));
+                    }
+                }
+                let refs: Vec<(u32, &[u8])> = cand.iter().map(|(id, b)| (*id, &b[..])).collect();
+                let (base, c) = blob::pack_piece(raw, &refs, self.opts.merge_level)?;
+                let (off, clen) = bw.packed(&c)?;
+                pents.push(PieceEnt { kind: *kind, hash: *h, file: bn, off, clen, rawlen: raw.len() as u32, base });
+                let depth = if base == 0 { 0 } else { ids.iter().find(|x| x.0 == base - 1).map_or(PIECE_CHAIN, |x| x.1 + 1) };
+                ids.push((first + i as u32, depth));
+                if ids.len() > PIECE_BASES {
+                    ids.remove(0);
+                }
             }
+            self.piece_bases = bases;
             // values in the order requests read them: by session, then by message
             let mut order = Vec::with_capacity(n);
             let mut placed = vec![false; n];
@@ -1302,12 +1348,13 @@ impl Db {
         // messages, requests and steps of every session that took writes
         let num = man.next_file;
         man.next_file += 1;
-        let mut w = SegWriter::create(&self.dir, num, self.opts.frame_size, self.opts.level, 0, self.seq)?;
+        let mut w = SegWriter::create(&self.dir, num, self.opts.frame_size, Codec::plain(self.opts.level), 0, self.seq)?;
         let mut written: Vec<(u32, CorePart)> = Vec::new();
         for &s in &self.mem.touched {
             let a = &self.active[&s];
             let (core, ss) = (&a.core, &a.steps);
-            let cp = self.core_part(&mut w, core, core.flushed_nodes..core.nodes.len() as u32, core.flushed_reqs..core.requests.len() as u32)?;
+            let (mut cp, stream) = self.core_part(core, core.flushed_nodes..core.nodes.len() as u32, core.flushed_reqs..core.requests.len() as u32)?;
+            cp.frames = w.frames(&stream)?;
             let sp = self.step_part(&mut w, ss, ss.flushed..ss.rows.len() as u32);
             w.add(s, core.key.clone(), &cp, &sp)?;
             written.push((s, cp));
@@ -1378,7 +1425,7 @@ impl Db {
         }
         let l0: BTreeSet<u32> = self.segs.values().filter(|s| s.cat.level == 0).map(|s| s.num).collect();
         if l0.len() >= self.opts.merge_at {
-            self.merge(l0, true)?;
+            self.merge(l0, true, false)?;
         }
         loop {
             let mut tiers: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
@@ -1386,13 +1433,13 @@ impl Db {
                 tiers.entry(tier(sg.file_bytes, 20)).or_default().push(sg.num);
             }
             if let Some((_, group)) = tiers.into_iter().find(|(_, v)| v.len() >= self.opts.merge_at) {
-                self.merge(group.into_iter().take(self.opts.merge_at).collect(), true)?;
+                self.merge(group.into_iter().take(self.opts.merge_at).collect(), true, false)?;
                 continue;
             }
             // half or more of the segment is parts that folds replaced: rewrite it without them
             let gc = self.manifest.dead.iter().find(|(n, d)| self.segs.get(n).is_some_and(|sg| sg.cat.level > 0 && d.bytes.saturating_mul(2) >= sg.file_bytes)).map(|x| x.0);
             let Some(n) = gc else { break };
-            self.merge(BTreeSet::from([n]), false)?;
+            self.merge(BTreeSet::from([n]), false, false)?;
             self.merge_stats.reclaims += 1;
         }
         Ok(())
@@ -1449,7 +1496,12 @@ impl Db {
     /// that it replaces are counted as dead in their segments, which are rewritten once
     /// half dead. Folding only there means a folded session is written once at full size
     /// rather than climbing the size tiers again, and a session still taking writes waits.
-    fn merge(&mut self, inputs: BTreeSet<u32>, fold: bool) -> Result<()> {
+    ///
+    /// The same merges, and every merge when `last` is set (`compact`) or when an input was
+    /// already written that way, write at `merge_level` with a dictionary trained on the
+    /// input: about 4 times the CPU of level 3, paid once per byte. Smaller merges, and any
+    /// merge of under 1.6 MB of messages (too little for a dictionary), write as flushes do.
+    fn merge(&mut self, inputs: BTreeSet<u32>, fold: bool, last: bool) -> Result<()> {
         if inputs.is_empty() {
             return Ok(());
         }
@@ -1464,7 +1516,15 @@ impl Db {
                 }
             }
         }
-        let fold = fold && bytes_in >= self.opts.seg_bytes;
+        let full = bytes_in >= self.opts.seg_bytes;
+        let fold = fold && full;
+        let raw_in: u64 = inputs.iter().filter_map(|n| self.segs.get(n)).map(|s| s.cat.node_bytes).sum();
+        let last = (last || full || inputs.iter().any(|n| self.segs.get(n).is_some_and(|s| s.cat.dict.is_some()))) && raw_in >= DICT_MIN_RAW;
+        let codec = if last {
+            Codec { level: self.opts.merge_level, block_level: self.opts.merge_level, dict: self.train_dict(&sessions, &inputs)?, threads: self.opts.threads }
+        } else {
+            Codec::plain(self.opts.level)
+        };
         let mut man = self.manifest.clone();
         let mut outputs: Vec<u32> = Vec::new();
         let mut w: Option<SegWriter> = None;
@@ -1500,7 +1560,7 @@ impl Db {
                 let num = man.next_file;
                 man.next_file += 1;
                 outputs.push(num);
-                w = Some(SegWriter::create(&self.dir, num, self.opts.frame_size, self.opts.level, 1, self.manifest.checkpoint)?);
+                w = Some(SegWriter::create(&self.dir, num, self.opts.frame_size, codec.clone(), 1, self.manifest.checkpoint)?);
             }
             let core = self.load_core(s)?;
             let ss = self.load_steps(s)?;
@@ -1516,9 +1576,9 @@ impl Db {
             let wr = w.as_mut().unwrap();
             for (a, b) in runs {
                 let (pa, pb) = (&parts[a].1, &parts[b - 1].1);
-                let cp = self.core_part(wr, &core, pa.first_node..pb.first_node + pb.n_nodes, pa.first_req..pb.first_req + pb.n_reqs)?;
+                let (cp, stream) = self.core_part(&core, pa.first_node..pb.first_node + pb.n_nodes, pa.first_req..pb.first_req + pb.n_reqs)?;
                 let sp = self.step_part(wr, &ss, pa.first_row..pb.first_row + pb.n_rows);
-                wr.add(s, core.key.clone(), &cp, &sp)?;
+                wr.add_stream(s, core.key.clone(), cp, stream, sp)?;
             }
         }
         if let Some(w) = w {
@@ -1564,10 +1624,39 @@ impl Db {
     }
 
     /// Flush, then merge every segment into level 1: each session stored whole, main line first.
+    /// A zstd dictionary for what a merge writes: trained on frames spread evenly over the
+    /// merge's input, about 100 times the dictionary's size of them. Empty when the input is
+    /// too small for one to pay (under about 1.6 MB of messages) or training fails.
+    fn train_dict(&self, sessions: &BTreeSet<u32>, inputs: &BTreeSet<u32>) -> Result<Vec<u8>> {
+        let raw: u64 = inputs.iter().filter_map(|n| self.segs.get(n)).map(|s| s.cat.node_bytes).sum();
+        let size = (raw / 100).min(self.opts.dict_bytes as u64) as usize;
+        if raw < DICT_MIN_RAW || size == 0 {
+            return Ok(Vec::new());
+        }
+        let stride = (raw / (size as u64 * 100)).max(1);
+        let (mut data, mut sizes) = (Vec::new(), Vec::new());
+        let mut k = 0u64;
+        for &s in sessions {
+            let core = self.load_core(s)?;
+            for ch in core.chunks.iter().filter(|c| inputs.contains(&c.seg)) {
+                let sg = self.segs.get(&ch.seg).ok_or_else(|| bad("segment is gone"))?;
+                for f in 0..ch.frames.len() {
+                    if k.is_multiple_of(stride) {
+                        let fr = sg.frames(&ch.frames, ch.raw_len, f, f)?;
+                        data.extend_from_slice(&fr[0]);
+                        sizes.push(fr[0].len());
+                    }
+                    k += 1;
+                }
+            }
+        }
+        Ok(zstd::dict::from_continuous(&data, &sizes, size).unwrap_or_default())
+    }
+
     pub fn compact(&mut self) -> Result<()> {
         self.flush()?;
         let all: BTreeSet<u32> = self.segs.keys().copied().collect();
-        self.merge(all, false)
+        self.merge(all, false, true)
     }
 
     // ------------------------------------------------------------------ reads
@@ -1761,7 +1850,14 @@ impl Db {
         let IxBlock::Pieces(v) = &*t else { return corrupt("index block of the wrong kind") };
         let e = *v.get(i % IDS).ok_or_else(|| bad(format!("missing piece {id}")))?;
         let c = self.blob_read(e.file, e.off, e.clen)?;
-        let d = crate::segment::decompress(&c, e.rawlen as usize)?;
+        let d = if e.base == 0 {
+            crate::segment::decompress(&c, e.rawlen as usize)?
+        } else {
+            if e.base > id {
+                return corrupt(format!("piece {id} is compressed against a later piece"));
+            }
+            blob::unpack(&c, Some(&self.piece(e.base - 1)?), e.rawlen as usize)?
+        };
         if d.len() != e.rawlen as usize {
             return corrupt("piece has the wrong size");
         }
@@ -2005,6 +2101,7 @@ impl Db {
             st.steps += c.steps as usize;
             st.node_bytes += c.node_bytes;
             st.frame_bytes += c.frame_bytes;
+            st.dict_bytes += c.dict.map_or(0, |r| r.clen as u64);
             st.seg_file_bytes += sg.file_bytes;
             st.catalog_bytes += c.bytes();
         }
@@ -2160,6 +2257,96 @@ impl Db {
             add(*kind, p.is_some(), *len as u64);
         }
         out.sort_by_key(|x| std::cmp::Reverse(x.2 + x.4));
+        Ok(out)
+    }
+
+    /// Every opaque value in id order: (id, kind, enc, payload; `None` when not kept).
+    /// For size measurements: reads every value.
+    pub fn each_opaque(&self, mut f: impl FnMut(u64, u8, u8, Option<&[u8]>)) -> Result<()> {
+        for r in &self.runs {
+            for i in 0..(r.cat.no as usize).div_ceil(IDS) {
+                if let IxBlock::Opaques(v) = r.block(K_OPAQUES, i)? {
+                    for (j, o) in v.iter().enumerate() {
+                        let p = if o.dropped { None } else { Some(self.blob_read(o.file, o.off, o.len)?) };
+                        f(r.cat.olo + (i * IDS + j) as u64, o.kind, o.enc, p.as_deref());
+                    }
+                }
+            }
+        }
+        for (k, (enc, kind, _, p, _)) in self.mem.opaques.iter().enumerate() {
+            f(self.manifest.opaques + k as u64, *kind, *enc, p.as_deref());
+        }
+        Ok(())
+    }
+
+    /// Segment bytes by what they hold: (frames, message/request blocks, step blocks,
+    /// directory blocks, raw bytes of those three kinds of block, the rest: magic, catalogs
+    /// and footers). For size measurements: reads every directory block.
+    pub fn segment_split(&self) -> Result<[u64; 8]> {
+        let mut t = [0u64; 8];
+        for sg in self.segs.values() {
+            t[0] += sg.cat.frame_bytes;
+            let (mut core, mut steps) = (BTreeMap::new(), BTreeMap::new());
+            for (k, (_, r)) in sg.cat.dirs.iter().enumerate() {
+                t[3] += r.clen as u64;
+                t[6] += r.rawlen as u64;
+                for d in sg.dir_block(k)? {
+                    core.insert(d.core.0.off, d.core.0);
+                    steps.insert(d.steps.0.off, d.steps.0);
+                }
+            }
+            for r in core.values() {
+                t[1] += r.clen as u64;
+                t[4] += r.rawlen as u64;
+            }
+            for r in steps.values() {
+                t[2] += r.clen as u64;
+                t[5] += r.rawlen as u64;
+            }
+            t[7] += sg.file_bytes;
+        }
+        t[7] -= t[0] + t[1] + t[2] + t[3];
+        Ok(t)
+    }
+
+    /// Every shared piece in id order: (id, kind, raw bytes, stored bytes, id + 1 of the piece
+    /// it is compressed against or 0). For size measurements.
+    pub fn each_piece(&self, mut f: impl FnMut(u32, u8, &[u8], u32, u32)) -> Result<()> {
+        for r in &self.runs {
+            for i in 0..(r.cat.np as usize).div_ceil(IDS) {
+                if let IxBlock::Pieces(v) = r.block(K_PIECES, i)? {
+                    for (j, e) in v.iter().enumerate() {
+                        let id = r.cat.plo + (i * IDS + j) as u32;
+                        f(id, e.kind, &self.piece(id)?, e.clen, e.base);
+                    }
+                }
+            }
+        }
+        for (k, (kind, _, b)) in self.mem.pieces.iter().enumerate() {
+            f(self.manifest.pieces + k as u32, *kind, b, b.len() as u32, 0);
+        }
+        Ok(())
+    }
+
+    /// A session's messages as stored, in storage order: (node id, parent, hash, stored
+    /// bytes with opaque values cut out, (offset, opaque id) per cut value). For size
+    /// measurements.
+    #[allow(clippy::type_complexity)]
+    pub fn stored_nodes(&self, s: u32) -> Result<Vec<(u32, u32, u128, Vec<u8>, Vec<(u32, u64)>)>> {
+        let core = self.load_core(s)?;
+        let mut ids: Vec<u32> = (0..core.nodes.len() as u32).collect();
+        ids.sort_by_key(|&i| match core.nodes[i as usize].loc {
+            Loc::Seg { chunk, off } => (0u8, chunk, off),
+            Loc::Mem(m) => (1u8, 0, m),
+        });
+        let mut cache = HashMap::new();
+        let mut out = Vec::with_capacity(ids.len());
+        for id in ids {
+            let nm = &core.nodes[id as usize];
+            let mut b = Vec::with_capacity(nm.len as usize);
+            self.stored_bytes(&core, nm, &mut cache, &mut b)?;
+            out.push((id, nm.parent, nm.hash, b, nm.holes.as_deref().map(|h| h.to_vec()).unwrap_or_default()));
+        }
         Ok(out)
     }
 

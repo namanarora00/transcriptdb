@@ -585,6 +585,66 @@ pub fn run_reads(db: &Db, pg: &mut Pg, n: usize, seed: u64) -> R<Vec<ReadOutcome
     Ok(res)
 }
 
+/// Where PostgreSQL's bytes are: per table its heap (with free space and visibility maps),
+/// TOAST (with its index) and indexes; then how much of the message table the opaque values
+/// cost, found by loading copies of it with each kind blanked (same rows, same order) and
+/// comparing heap + TOAST. Returns printable lines.
+pub fn pg_split(pg: &mut Pg) -> R<Vec<String>> {
+    let mut out = Vec::new();
+    let rows = pg
+        .query(
+            "SELECT c.relname, pg_relation_size(c.oid, 'main'), pg_relation_size(c.oid, 'fsm') + pg_relation_size(c.oid, 'vm'),
+                    coalesce(pg_total_relation_size(nullif(c.reltoastrelid, 0)), 0), pg_indexes_size(c.oid)
+             FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+             WHERE n.nspname = 'public' AND c.relkind = 'r' ORDER BY pg_total_relation_size(c.oid) DESC",
+        )
+        .map_err(pe)?;
+    let num = |v: &Option<String>| v.as_deref().unwrap_or("0").parse::<u64>().unwrap_or(0);
+    let mb = |b: u64| format!("{:.1} MB", b as f64 / 1e6);
+    for r in &rows {
+        out.push(format!(
+            "{:<11} heap {:>9}  maps {:>8}  TOAST {:>9}  indexes {:>9}",
+            r[0].clone().unwrap_or_default(),
+            mb(num(&r[1])),
+            mb(num(&r[2])),
+            mb(num(&r[3])),
+            mb(num(&r[4]))
+        ));
+    }
+    let r = pg
+        .query("SELECT count(*), sum(octet_length(body)), sum(pg_column_size(body)), count(*) FILTER (WHERE pg_column_compression(body) IS NOT NULL) FROM messages")
+        .map_err(pe)?;
+    out.push(format!("messages: {} rows, {} of text, {} as stored (pg_column_size), {} rows compressed", num(&r[0][0]), mb(num(&r[0][1])), mb(num(&r[0][2])), num(&r[0][3])));
+    // canonical messages have sorted keys, so an image's data comes right before its media type
+    const B64: &str = "[A-Za-z0-9+/=]{64,}";
+    let kinds = [
+        ("thinking signatures", format!("\"signature\":\"{B64}\""), "\"signature\":\"\""),
+        ("images", format!("\"data\":\"{B64}\"(?=,\"media_type\":\"image/)"), "\"data\":\"\""),
+        ("other data (documents, redacted)", format!("\"data\":\"{B64}\"(?!,\"media_type\":\"image/)"), "\"data\":\"\""),
+    ];
+    let base = |pg: &mut Pg, t: &str| -> R<u64> {
+        let r = pg.query(&format!("SELECT pg_relation_size('{t}', 'main') + coalesce(pg_total_relation_size(nullif((SELECT reltoastrelid FROM pg_class WHERE relname = '{t}'), 0)), 0)")).map_err(pe)?;
+        Ok(num(&r[0][0]))
+    };
+    let full = base(pg, "messages")?;
+    let mut all = String::from("body");
+    for (i, (name, pat, rep)) in kinds.iter().enumerate() {
+        let r = pg.query(&format!("SELECT count(*), coalesce(sum(length(m[1])), 0) FROM messages, regexp_matches(body, '({pat})', 'g') AS m")).map_err(pe)?;
+        let (n, text) = (num(&r[0][0]), num(&r[0][1]));
+        let t = format!("m_blank{i}");
+        pg.exec(&format!("DROP TABLE IF EXISTS {t}; CREATE TABLE {t} AS SELECT id, regexp_replace(body, '{pat}', '{rep}', 'g') AS body FROM messages ORDER BY id")).map_err(pe)?;
+        let without = base(pg, &t)?;
+        pg.exec(&format!("DROP TABLE {t}")).map_err(pe)?;
+        all = format!("regexp_replace({all}, '{pat}', '{rep}', 'g')");
+        out.push(format!("  {name}: {n} values, {} of base64 text; heap + TOAST {} with them, {} without: they cost {}", mb(text), mb(full), mb(without), mb(full.saturating_sub(without))));
+    }
+    pg.exec(&format!("DROP TABLE IF EXISTS m_blank; CREATE TABLE m_blank AS SELECT id, {all} AS body FROM messages ORDER BY id")).map_err(pe)?;
+    let without = base(pg, "m_blank")?;
+    pg.exec("DROP TABLE m_blank").map_err(pe)?;
+    out.push(format!("  all of them blanked: heap + TOAST {}; opaque values cost {}", mb(without), mb(full.saturating_sub(without))));
+    Ok(out)
+}
+
 /// PostgreSQL bytes per table (with indexes and TOAST).
 pub fn pg_sizes(pg: &mut Pg) -> R<Vec<(String, u64)>> {
     let rows = pg

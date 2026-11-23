@@ -3,6 +3,10 @@
 # Needs PostgreSQL (Homebrew postgresql@18). Creates a throwaway cluster and store under
 # $WORK (default $TMPDIR/transcriptdb-h2h), runs the comparison, then stops PostgreSQL and
 # deletes both (KEEP=1 keeps them). Prints counts, sizes and times only.
+#   DROP=thinking,images   build the store without those values (PostgreSQL then gets the same
+#                          blanked messages)
+#   H2H_ARGS="--split x"   extra arguments for `tdb h2h` (`--split x` prints where PostgreSQL's
+#                          bytes are, `--sizes-only x` skips the queries)
 set -euo pipefail
 cd "$(dirname "$0")/.."
 command -v cargo >/dev/null || export PATH="/opt/homebrew/opt/rustup/bin:$HOME/.cargo/bin:$PATH"
@@ -35,6 +39,6 @@ trap cleanup EXIT
 # PostgreSQL on macOS refuses to start without a valid LC_ALL
 LC_ALL=en_US.UTF-8 "$PGBIN/pg_ctl" -D "$WORK/pg" -l "$WORK/pg.log" -w start >/dev/null
 "$PGBIN/psql" -h 127.0.0.1 -p "$PORT" -U tdb -d postgres -qc "CREATE DATABASE h2h"
-./target/release/tdb ingest-claude --store "$WORK/store" --max-files "$FILES" --seed 7 --sync os
+./target/release/tdb ingest-claude --store "$WORK/store" --max-files "$FILES" --seed 7 --sync os ${DROP:+--drop "$DROP"}
 ./target/release/tdb compact --store "$WORK/store"
-./target/release/tdb h2h --store "$WORK/store" --pg "127.0.0.1:$PORT" --reps 7 --reads 300
+./target/release/tdb h2h --store "$WORK/store" --pg "127.0.0.1:$PORT" --reps 7 --reads 300 ${H2H_ARGS:-}

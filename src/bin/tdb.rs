@@ -8,6 +8,11 @@
 //!   tdb bench         --store DIR [--n 300] [--seed S]
 //!   tdb crash-test    --store DIR [--kills 1000] [--seed S] [--sync full|fsync|os]
 //!   tdb growth        --store DIR [--rounds 5] [--base 300] [--wake 0.1] [--cache-mb 256] [--flush-mb 64] [--seg-mb 256] [--max-parts 4]
+//!   tdb ceiling       --store DIR [--out DIR]
+//!   tdb h2h           --store DIR [--pg ADDR] [--split x] [--sizes-only x]
+//!
+//! Writing commands take --merge-level 19 --dict-kb 1024 --zstd-threads N (full-size merges
+//! and compact: zstd level, dictionary size, compression threads).
 //!
 //! Real logs are read from `--logs` (default `~/.claude/projects`) at run time only.
 //! Output is counts, sizes and times; no log content is printed.
@@ -80,6 +85,9 @@ impl Args {
             sync: self.sync(),
             flush_bytes: (self.num("flush-mb", 64) as usize) << 20,
             level: self.num("level", 3) as i32,
+            merge_level: self.num("merge-level", Options::default().merge_level as u64) as i32,
+            dict_bytes: (self.num("dict-kb", (Options::default().dict_bytes >> 10) as u64) as usize) << 10,
+            threads: self.num("zstd-threads", Options::default().threads as u64) as usize,
             frame_size: (self.num("frame-kb", 64) as usize) << 10,
             keep: self.keep(),
             cache_bytes: (self.num("cache-mb", 256) as usize) << 20,
@@ -633,6 +641,15 @@ fn head_to_head(a: &Args) {
     println!("  TranscriptDB store: {} (segments {}, index {}, blob files {})", mb(engine_bytes), mb(st.seg_file_bytes), mb(st.index_file_bytes), mb(st.blob_file_bytes));
     println!("  PostgreSQL tables with indexes and TOAST: {} ({})", mb(pg_total), sizes.iter().map(|(n, b)| format!("{n} {}", mb(*b))).collect::<Vec<_>>().join(", "));
     println!("  PostgreSQL / TranscriptDB: {:.2}x", pg_total as f64 / engine_bytes as f64);
+    if a.get("split").is_some() {
+        println!("\n== where PostgreSQL's bytes are");
+        for l in h2h::pg_split(&mut pg).expect("split") {
+            println!("  {l}");
+        }
+    }
+    if a.get("sizes-only").is_some() {
+        return;
+    }
     let reps = a.num("reps", 5) as usize;
     let out = h2h::run_queries(&db, &mut pg, reps).expect("queries");
     println!("\n== queries over {} steps in {} sessions (best of {reps}; TranscriptDB on 1 thread and on 8)", (0..db.session_count() as u32).map(|s| db.steps(s).rows.len()).sum::<usize>(), db.session_count());
@@ -802,8 +819,9 @@ fn crash_child(a: &Args) {
     let seed = a.num("seed", 1);
     let run = a.num("run", 0);
     // small flushes, frequent merges into small segments, sessions leaving memory after one
-    // idle flush and tiny caches: kills land in every part of the write path
-    let opts = Options { sync: a.sync(), flush_bytes: 384 << 10, merge_at: 3, seg_bytes: 128 << 10, idle_flushes: 1, cache_bytes: 4 << 20, blob_bytes: 512 << 10, run_bytes: 256 << 10, ..Options::default() };
+    // idle flush and tiny caches: kills land in every part of the write path; merges of over
+    // 1.6 MB of messages train a dictionary (at a low level, to keep kills frequent)
+    let opts = Options { sync: a.sync(), flush_bytes: 384 << 10, merge_at: 3, seg_bytes: 128 << 10, idle_flushes: 1, cache_bytes: 4 << 20, blob_bytes: 512 << 10, run_bytes: 256 << 10, merge_level: 3, threads: 2, ..Options::default() };
     let mut db = Db::open(a.store(), opts).expect("open store");
     {
         let mut l = std::io::stdout().lock();
@@ -1012,12 +1030,145 @@ fn main() {
         "crash-test" => crash_test(&a),
         "growth" => growth(&a),
         "probe" => probe(&a),
+        "ceiling" => ceiling(&a),
         _ => {
-            eprintln!("usage: tdb <ingest-claude|check-claude|stats|compact|bench|crash-test> --store DIR [options]");
+            eprintln!("usage: tdb <ingest-claude|check-claude|stats|compact|bench|crash-test|ceiling|h2h|...> --store DIR [options]");
             std::process::exit(2);
         }
     }
     let _ = Path::new(".");
+}
+
+/// Where a store's bytes are, and the store's distinct data written out as plain streams
+/// (`--out DIR`) for an archiver to compress as hard as it can: messages once each across
+/// all sessions (stored form, and with opaque values put back), opaque values raw by kind,
+/// tree structure, request columns and shared pieces. Prints sizes only.
+fn ceiling(a: &Args) {
+    use transcriptdb::codec::Enc;
+    let db = Db::open(a.store(), a.opts()).expect("open store");
+    let st = db.stats();
+    let seg = db.segment_split().expect("segment split");
+    println!("store {} = segments {} + index runs {} + blob files {}", mb(st.store_bytes()), mb(st.seg_file_bytes), mb(st.index_file_bytes), mb(st.blob_file_bytes));
+    println!("  frames {} ({} of stored messages)", mb(seg[0]), mb(st.node_bytes));
+    println!("  message/request blocks {} (raw {}), step blocks {} (raw {}), directory blocks {} (raw {}), catalogs and footers {}", mb(seg[1]), mb(seg[4]), mb(seg[2]), mb(seg[5]), mb(seg[3]), mb(seg[6]), mb(seg[7]));
+    println!("  pieces {} (raw {}, {} pieces)", mb(st.piece_bytes), mb(st.piece_raw_bytes), st.pieces);
+    for (k, n, b, nd, bd) in db.opaque_kinds().expect("opaque kinds") {
+        println!("  opaque {k}: {n} values {} raw ({} as base64){}", mb(b), mb(b.div_ceil(3) * 4), if nd > 0 { format!("; {nd} not kept ({})", mb(bd)) } else { String::new() });
+    }
+    println!("  blob file bytes other than pieces and opaque values {}", mb(st.blob_file_bytes - st.piece_bytes - st.opaque_bytes));
+    let mut pk: std::collections::BTreeMap<u8, [u64; 4]> = Default::default();
+    db.each_piece(|_, kind, raw, clen, base| {
+        let e = pk.entry(kind).or_default();
+        let w = if base == 0 { 0 } else { 2 };
+        e[w] += 1;
+        e[w + 1] += clen as u64;
+        let _ = raw;
+    })
+    .expect("pieces");
+    for (k, e) in pk {
+        println!("  pieces of kind {k}: {} whole ({}), {} against an earlier piece ({})", e[0], mb(e[1]), e[2], mb(e[3]));
+    }
+    let Some(out) = a.get("out") else { return };
+    let out = PathBuf::from(out);
+    std::fs::create_dir_all(&out).expect("create --out");
+    let create = |n: &str| std::io::BufWriter::new(std::fs::File::create(out.join(n)).expect("create stream file"));
+    // opaque values raw, by kind
+    let names = ["other", "signature", "image", "document", "redacted", "thinking"];
+    let mut ofiles: Vec<_> = names.iter().map(|n| create(&format!("opq-{n}.bin"))).collect();
+    let mut olens: Vec<Enc> = names.iter().map(|_| Enc::new()).collect();
+    db.each_opaque(|_, kind, _, p| {
+        if let Some(p) = p {
+            let k = (kind as usize).min(names.len() - 1);
+            ofiles[k].write_all(p).unwrap();
+            olens[k].var(p.len() as u64);
+        }
+    })
+    .expect("opaque values");
+    for (i, n) in names.iter().enumerate() {
+        std::fs::write(out.join(format!("opq-{n}.len")), &olens[i].buf).unwrap();
+    }
+    let mut pieces = create("pieces.bin");
+    let mut plens = Enc::new();
+    db.each_piece(|_, kind, b, _, _| {
+        pieces.write_all(b).unwrap();
+        plens.u8(kind);
+        plens.var(b.len() as u64);
+    })
+    .expect("pieces");
+    std::fs::write(out.join("pieces.len"), &plens.buf).unwrap();
+    // messages once each, in storage order, sessions in id order
+    let (mut stored, mut full) = (create("msgs.bin"), create("full.bin"));
+    let (mut tree, mut holes) = (Enc::new(), Enc::new());
+    let (mut rid, mut rtime, mut rmeta, mut rrest, mut rlayout) = (Enc::new(), Enc::new(), Enc::new(), Enc::new(), Enc::new());
+    let mut seen: HashMap<u128, u32> = HashMap::new();
+    let (mut n_nodes, mut n_distinct, mut stored_bytes, mut full_bytes) = (0u64, 0u64, 0u64, 0u64);
+    let mut last_opaque = 0u64;
+    for s in 0..db.session_count() as u32 {
+        let nodes = db.stored_nodes(s).expect("read session");
+        let ids: Vec<u32> = nodes.iter().map(|n| n.0).collect();
+        let msgs = db.read_messages(s, &ids, &mut ReadStats::default()).expect("read messages");
+        let mut pos_of = vec![0u32; nodes.len()];
+        for (p, n) in nodes.iter().enumerate() {
+            pos_of[n.0 as usize] = p as u32;
+        }
+        tree.var(nodes.len() as u64);
+        for (p, (n, m)) in nodes.iter().zip(&msgs).enumerate() {
+            n_nodes += 1;
+            tree.var(if n.1 == u32::MAX { 0 } else { (p as u32 - pos_of[n.1 as usize]) as u64 });
+            match seen.get(&n.2) {
+                Some(&g) => tree.var(g as u64 + 1),
+                None => {
+                    seen.insert(n.2, n_distinct as u32);
+                    n_distinct += 1;
+                    tree.var(0);
+                    tree.var(n.3.len() as u64);
+                    stored.write_all(&n.3).unwrap();
+                    full.write_all(m).unwrap();
+                    stored_bytes += n.3.len() as u64;
+                    full_bytes += m.len() as u64;
+                    holes.var(n.4.len() as u64);
+                    let mut prev = 0u32;
+                    for &(o, id) in &n.4 {
+                        holes.var((o - prev) as u64);
+                        prev = o;
+                        holes.var(id.wrapping_sub(last_opaque).wrapping_add(1) & 0xffff_ffff);
+                        last_opaque = id;
+                    }
+                }
+            }
+        }
+        for ri in db.session_requests(s) {
+            let r = db.request(ri).expect("request");
+            rid.bytes(r.id.as_bytes());
+            rtime.bytes(r.time.as_bytes());
+            rmeta.bytes(&r.meta);
+            rrest.var(if r.tip == u32::MAX { 0 } else { pos_of[r.tip as usize] as u64 + 1 });
+            rrest.var(r.n_msgs as u64);
+            for v in [r.skeleton, r.system, r.tools] {
+                rrest.var(v as u64);
+            }
+            rrest.var(r.notes.len() as u64);
+            for n in r.notes.iter() {
+                rrest.var(n.target as u64);
+                rrest.var(n.offset as u64);
+                rrest.var(n.text as u64);
+            }
+            match &r.layout {
+                None => rlayout.u8(0),
+                Some(g) => {
+                    rlayout.u8(1);
+                    rlayout.var(g.len() as u64);
+                    for x in g.iter() {
+                        rlayout.bytes(x);
+                    }
+                }
+            }
+        }
+    }
+    for (n, e) in [("tree.bin", tree), ("holes.bin", holes), ("req-id.bin", rid), ("req-time.bin", rtime), ("req-meta.bin", rmeta), ("req-rest.bin", rrest), ("req-layout.bin", rlayout)] {
+        std::fs::write(out.join(n), &e.buf).unwrap();
+    }
+    println!("wrote {}: {} nodes, {} distinct messages ({} stored form, {} with opaque values as text)", out.display(), n_nodes, n_distinct, mb(stored_bytes), mb(full_bytes));
 }
 
 /// Highest resident memory of this process so far, in bytes.

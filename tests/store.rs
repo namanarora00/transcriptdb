@@ -490,3 +490,41 @@ fn woken_sessions_fold_back_into_one_part() {
     check(&db);
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+fn merged_frames_use_a_trained_dictionary_and_pieces_chain() {
+    let dir = tmpdir("dict");
+    // enough distinct message text for a dictionary (about 1% of it, at least 16 KB)
+    let reqs = traffic(21, 90, 60);
+    // merges only in `compact`, at a low level (the level does not change the format)
+    let o = Options { seg_bytes: 384 << 10, merge_at: 1 << 20, merge_level: 3, ..opts(2 << 20) };
+    let mut db = Db::open(&dir, o.clone()).unwrap();
+    for (i, q) in reqs.iter().enumerate() {
+        put(&mut db, q);
+        if i % 50 == 0 {
+            db.commit().unwrap();
+        }
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    let flushed = db.stats();
+    assert_eq!(flushed.dict_bytes, 0, "flushes write frames without a dictionary");
+    assert!(flushed.node_bytes >= 2 << 20, "test data too small for a dictionary: {} bytes", flushed.node_bytes);
+    db.compact().unwrap();
+    let st = db.stats();
+    assert!(st.segments >= 3, "small segments should give several merged segments");
+    assert!(st.dict_bytes > 0, "merged segments should carry a dictionary");
+    assert!(st.frame_bytes < flushed.frame_bytes, "dictionary frames {} should be smaller than flushed ones {}", st.frame_bytes, flushed.frame_bytes);
+    assert!(st.piece_bytes * 3 < st.piece_raw_bytes, "pieces compressed against earlier ones");
+    check_all(&db, &reqs);
+    drop(db);
+    // reopened, and read from several threads at once, each going back and forth between
+    // more segments than it keeps dictionary buffers for
+    let db = Db::open(&dir, o).unwrap();
+    std::thread::scope(|sc| {
+        for part in reqs.chunks(reqs.len().div_ceil(4)) {
+            let db = &db;
+            sc.spawn(move || check_all(db, part));
+        }
+    });
+}

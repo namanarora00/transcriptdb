@@ -6,7 +6,7 @@ description = "A storage and query engine for agent transcripts"
 publish = false
 
 [dependencies]
-zstd = "0.13"
+zstd = { version = "0.13", features = ["experimental"] }
 sha2 = { version = "0.10", features = ["asm"] }
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 crc32c = "0.6"

@@ -29,7 +29,7 @@ use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-const MAGIC: &[u8; 8] = b"TDBIDX01";
+const MAGIC: &[u8; 8] = b"TDBIDX02";
 
 pub const NS_PIECE: u8 = 0;
 pub const NS_OPAQUE: u8 = 1;
@@ -44,7 +44,7 @@ pub const FENCES: usize = 1024;
 const FENCE_W: usize = 17;
 /// Entries per block of the piece and opaque tables.
 pub const IDS: usize = 1024;
-const PIECE_W: usize = 37;
+const PIECE_W: usize = 41;
 const OPAQUE_W: usize = 34;
 /// Bloom filter bits per key: about 0.2% false positives.
 const BLOOM_BITS: usize = 14;
@@ -81,6 +81,8 @@ pub struct PieceEnt {
     pub off: u64,
     pub clen: u32,
     pub rawlen: u32,
+    /// Id + 1 of the piece this one was compressed against (as a raw dictionary); 0 for none.
+    pub base: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -103,9 +105,10 @@ impl PieceEnt {
         b.extend_from_slice(&self.off.to_le_bytes());
         b.extend_from_slice(&self.clen.to_le_bytes());
         b.extend_from_slice(&self.rawlen.to_le_bytes());
+        b.extend_from_slice(&self.base.to_le_bytes());
     }
     fn get(b: &[u8]) -> PieceEnt {
-        PieceEnt { kind: b[0], hash: u128_at(b, 1), file: u32_at(b, 17), off: u64_at(b, 21), clen: u32_at(b, 29), rawlen: u32_at(b, 33) }
+        PieceEnt { kind: b[0], hash: u128_at(b, 1), file: u32_at(b, 17), off: u64_at(b, 21), clen: u32_at(b, 29), rawlen: u32_at(b, 33), base: u32_at(b, 37) }
     }
 }
 
@@ -647,7 +650,7 @@ mod tests {
         }
         for i in 0..np {
             let id = plo + i;
-            w.piece(&PieceEnt { kind: 1, hash: h(id as u64), file: 7, off: id as u64 * 10, clen: 5, rawlen: 9 }).unwrap();
+            w.piece(&PieceEnt { kind: 1, hash: h(id as u64), file: 7, off: id as u64 * 10, clen: 5, rawlen: 9, base: 0 }).unwrap();
         }
         for i in 0..no {
             let id = olo + i;
