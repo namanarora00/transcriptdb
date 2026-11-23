@@ -1,7 +1,7 @@
 //! `tdb`: command-line tool for the TranscriptDB storage core.
 //!
-//!   tdb ingest-claude --store DIR [--logs DIR] [--max-files N] [--seed S] [--threads N] [--sync full|fsync|os]
-//!                     [--drop documents,other]
+//!   tdb ingest-claude --store DIR [--logs DIR] [--max-files N] [--seed S] [--born-before SECS] [--threads N]
+//!                     [--sync full|fsync|os] [--drop documents,other]
 //!   tdb check-claude  --store DIR [--logs DIR] [--threads N] [--drop ...as at ingest]
 //!   tdb stats         --store DIR
 //!   tdb compact       --store DIR
@@ -11,8 +11,9 @@
 //!   tdb ceiling       --store DIR [--out DIR]
 //!   tdb h2h           --store DIR [--pg ADDR] [--split x] [--sizes-only x]
 //!
-//! Writing commands take --merge-level 19 --dict-kb 1024 --zstd-threads N (full-size merges
-//! and compact: zstd level, dictionary size, compression threads).
+//! Writing commands take --merge-level 19 --dict-kb 1024 --dict-content-kb 8192 --zstd-threads N
+//! (full-size merges and compact: zstd level, trained dictionary size, messages added to
+//! the dictionary, compression threads).
 //!
 //! Thinking (text, signatures, redacted thinking) and images are never stored: they are
 //! replaced by empty strings at ingest. `--drop` blanks documents and other base64 too.
@@ -90,6 +91,7 @@ impl Args {
             level: self.num("level", 3) as i32,
             merge_level: self.num("merge-level", Options::default().merge_level as u64) as i32,
             dict_bytes: (self.num("dict-kb", (Options::default().dict_bytes >> 10) as u64) as usize) << 10,
+            dict_content: (self.num("dict-content-kb", (Options::default().dict_content >> 10) as u64) as usize) << 10,
             threads: self.num("zstd-threads", Options::default().threads as u64) as usize,
             frame_size: (self.num("frame-kb", 64) as usize) << 10,
             keep: self.keep(),
@@ -115,6 +117,12 @@ fn q(v: &mut [f64], p: f64) -> f64 {
 
 fn select_files(a: &Args) -> Vec<PathBuf> {
     let mut files = claude::log_files(&a.logs());
+    // `--born-before SECS`: only log files created before then, so a sample stays the same
+    // set of files when new sessions start (the shuffle below depends on how many there are)
+    if let Some(t) = a.get("born-before") {
+        let t = std::time::UNIX_EPOCH + Duration::from_secs(t.parse().expect("--born-before takes seconds since the epoch"));
+        files.retain(|f| std::fs::metadata(f).and_then(|m| m.created()).is_ok_and(|c| c < t));
+    }
     if let Some(n) = a.get("max-files") {
         let mut r = Rng::new(a.num("seed", 7));
         for i in (1..files.len()).rev() {

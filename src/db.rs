@@ -83,6 +83,10 @@ pub struct Options {
     /// Most bytes of the zstd dictionary such a merge trains on its input and compresses its
     /// output's frames with (about 1% of the messages merged, up to this); 0 for none.
     pub dict_bytes: usize,
+    /// Most bytes of the merge's own messages, sampled evenly, added after the trained
+    /// dictionary (about 1/12 of the messages merged, up to this). Every thread reading a
+    /// segment keeps a copy of its dictionary, so this costs memory per reading thread.
+    pub dict_content: usize,
     /// Threads compressing frames in merges.
     pub threads: usize,
 }
@@ -106,6 +110,7 @@ impl Default for Options {
             max_parts: 4,
             merge_level: 19,
             dict_bytes: 1 << 20,
+            dict_content: 8 << 20,
             threads: std::thread::available_parallelism().map_or(4, |n| n.get()),
         }
     }
@@ -1668,30 +1673,52 @@ impl Db {
     /// A zstd dictionary for what a merge writes: trained on frames spread evenly over the
     /// merge's input, about 100 times the dictionary's size of them. Empty when the input is
     /// too small for one to pay (under about 1.6 MB of messages) or training fails.
+    /// The dictionary for a merge into a full-size segment: one trained on the input (zstd's
+    /// trainer, about 1% of the messages, at most `dict_bytes`), then the input's own
+    /// messages sampled evenly (about 1/12 of them, at most `dict_content`). The trainer
+    /// keeps short common strings; whole messages give the long matches it cannot (on the
+    /// full logs, 8 MB of them make frames and dictionary 6% smaller).
     fn train_dict(&self, sessions: &BTreeSet<u32>, inputs: &BTreeSet<u32>) -> Result<Vec<u8>> {
         let raw: u64 = inputs.iter().filter_map(|n| self.segs.get(n)).map(|s| s.cat.node_bytes).sum();
         let size = (raw / 100).min(self.opts.dict_bytes as u64) as usize;
         if raw < DICT_MIN_RAW || size == 0 {
             return Ok(Vec::new());
         }
+        let content = (raw / 12).min(self.opts.dict_content as u64);
         let stride = (raw / (size as u64 * 100)).max(1);
-        let (mut data, mut sizes) = (Vec::new(), Vec::new());
-        let mut k = 0u64;
+        let (mut data, mut sizes, mut extra) = (Vec::new(), Vec::new(), Vec::new());
+        let (mut k, mut at, mut next) = (0u64, 0u64, 0u64);
         for &s in sessions {
             let core = self.load_core(s)?;
             for ch in core.chunks.iter().filter(|c| inputs.contains(&c.seg)) {
                 let sg = self.segs.get(&ch.seg).ok_or_else(|| bad("segment is gone"))?;
                 for f in 0..ch.frames.len() {
-                    if k.is_multiple_of(stride) {
+                    let sample = k.is_multiple_of(stride);
+                    // whole frames of messages every raw / content bytes
+                    let take = content > 0 && at >= next && (extra.len() as u64) < content;
+                    if sample || take {
                         let fr = sg.frames(&ch.frames, ch.raw_len, f, f)?;
-                        data.extend_from_slice(&fr[0]);
-                        sizes.push(fr[0].len());
+                        if sample {
+                            data.extend_from_slice(&fr[0]);
+                            sizes.push(fr[0].len());
+                        }
+                        if take {
+                            let n = fr[0].len().min((content as usize).saturating_sub(extra.len()));
+                            extra.extend_from_slice(&fr[0][..n]);
+                            next = at + (raw / content).max(1) * sg.cat.frame_size as u64;
+                        }
                     }
+                    at += sg.cat.frame_size as u64;
                     k += 1;
                 }
             }
         }
-        Ok(zstd::dict::from_continuous(&data, &sizes, size).unwrap_or_default())
+        let mut dict = zstd::dict::from_continuous(&data, &sizes, size).unwrap_or_default();
+        if !dict.is_empty() {
+            // content nearest the end of a dictionary is the cheapest for a frame to point at
+            dict.extend_from_slice(&extra);
+        }
+        Ok(dict)
     }
 
     pub fn compact(&mut self) -> Result<()> {

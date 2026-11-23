@@ -594,6 +594,9 @@ fn frame_compressor<'a>(level: i32, dict: Option<&'a zstd::dict::EncoderDictiona
     if dict.is_some() {
         // the segment says which dictionary; the id would only repeat it in every frame
         c.set_parameter(CParameter::DictIdFlag(false))?;
+        // use the prepared dictionary's tables in place: copying them (the default for
+        // inputs this size) costs every compressing thread their size again
+        c.set_parameter(CParameter::ForceAttachDict(zstd::zstd_safe::DictAttachPref::ForceAttach))?;
     }
     Ok(c)
 }
@@ -991,8 +994,10 @@ impl Drop for DictBuf {
     }
 }
 
-/// Dictionary buffers per thread, most recently used last.
+/// Dictionary buffers per thread, most recently used last, and the most bytes they may
+/// hold together (a full-size segment's dictionary is about 9 MB, so one of those fits).
 const DICT_BUFS: usize = 2;
+const DICT_BUF_BYTES: usize = 12 << 20;
 /// Room after the dictionary in such a buffer, in frames: enough for a frame or for most
 /// blocks of step parts (about 64 KB); bigger blocks are decoded without it.
 const DICT_ROOM_FRAMES: usize = 4;
@@ -1062,7 +1067,7 @@ impl Segment {
                 }
                 None => {
                     let d = self.dict()?.ok_or_else(|| crate::codec::Error::Corrupt("segment has no dictionary".into()))?;
-                    if bufs.len() >= DICT_BUFS {
+                    while !bufs.is_empty() && (bufs.len() >= DICT_BUFS || bufs.iter().map(|b| b.len).sum::<usize>() + d.len() + room > DICT_BUF_BYTES) {
                         bufs.remove(0);
                     }
                     bufs.push(DictBuf::new(self.uid, &d, room));
