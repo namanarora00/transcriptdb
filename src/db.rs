@@ -2,9 +2,13 @@
 //!
 //! Write path for one request: split the body ([`crate::split`]), walk the messages
 //! down the session's tree comparing hashes, keep only the messages the session has
-//! not sent before as new nodes, cut opaque values out of those, intern the skeleton,
-//! system, tools and cache-marker pieces, then append one log record. The record is
-//! durable once [`Db::commit`] returns; that is the moment a request counts as saved.
+//! not sent before as new nodes, blank thinking and images in those (they are never
+//! stored) and cut the other opaque values out, intern the skeleton, system, tools and
+//! cache-marker pieces, then append one log record. The record is durable once
+//! [`Db::commit`] returns; that is the moment a request counts as saved. Nothing per
+//! message or request is stored that the data itself gives back: node hashes are worked
+//! out again from the stored bytes when a session wakes, and there is no request digest
+//! (`tdb check-claude` checks rebuilds against Claude Code's own `requestDigest`).
 //!
 //! Everything in memory that is not yet in a file can be rebuilt from the log, because
 //! that state only ever changes by applying a log record ([`Db::apply`]), both live and
@@ -53,8 +57,8 @@ pub struct Options {
     pub level: i32,
     /// Check, before logging, that the split pieces join back to the exact body.
     pub verify_split: bool,
-    /// Which opaque values (thinking, images, documents) to keep. Values not kept are
-    /// stored as kind, hash and size; their requests rebuild with `""` in their place.
+    /// Which opaque values to keep besides those never kept (thinking and images). Values
+    /// not kept are replaced by `""` at ingest, and their requests rebuild that way.
     pub keep: Keep,
     /// Memory for sessions, blocks and tables read from files.
     pub cache_bytes: usize,
@@ -117,8 +121,6 @@ pub struct Put<'a> {
     pub time: &'a str,
     pub meta: &'a [u8],
     pub body: &'a [u8],
-    /// sha256 of `body`, if the caller already has it (saves hashing twice).
-    pub digest: Option<[u8; 32]>,
 }
 
 /// A stored request: its session in the high 32 bits, its index in the session below.
@@ -152,7 +154,6 @@ const UNSET: Loc = Loc::Mem(u32::MAX);
 struct NodeMeta {
     parent: u32,
     len: u32,
-    hash: u128,
     loc: Loc,
     holes: Option<Box<[(u32, u64)]>>,
 }
@@ -189,17 +190,42 @@ impl SessionCore {
 struct Active {
     core: Arc<SessionCore>,
     steps: Arc<SessionSteps>,
+    /// (parent, key) -> child. A node's key is the xxh3 of its message as stored (values
+    /// not kept blanked, kept ones in place); messages that came with values since blanked
+    /// are found by the hash of the message as it came too.
     children: HashMap<(u32, u128), u32>,
+    /// Nodes read back from segments when the session woke, by parent: hashes are not
+    /// stored, so their keys are worked out from their bytes the first time a walk passes
+    /// their parent (which then goes in `keyed`).
+    stored_kids: Vec<u32>,
+    keyed: std::collections::HashSet<u32>,
     /// Flush count when it last took a write.
     last: u64,
+}
+
+impl Active {
+    fn new(core: Arc<SessionCore>, steps: Arc<SessionSteps>, last: u64) -> Active {
+        let mut stored_kids: Vec<u32> = (0..core.nodes.len() as u32).collect();
+        stored_kids.sort_by_key(|&i| core.nodes[i as usize].parent);
+        Active { core, steps, children: HashMap::new(), stored_kids, keyed: Default::default(), last }
+    }
+
+    /// Stored children of `parent` whose keys are not known yet.
+    fn unkeyed(&self, parent: u32) -> &[u32] {
+        if self.keyed.contains(&parent) {
+            return &[];
+        }
+        let nodes = &self.core.nodes;
+        let a = self.stored_kids.partition_point(|&i| nodes[i as usize].parent < parent);
+        let b = self.stored_kids.partition_point(|&i| nodes[i as usize].parent <= parent);
+        &self.stored_kids[a..b]
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
 enum OLoc {
     Mem(u32),
     Blob { blob: u32, off: u64, len: u32 },
-    /// Not kept: `len` is the length the payload had.
-    Dropped { len: u32 },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -214,8 +240,8 @@ struct Mem {
     nodes: Vec<Box<[u8]>>,
     /// Pieces with ids from `Manifest::pieces` on.
     pieces: Vec<(u8, u128, Arc<[u8]>)>,
-    /// Opaque values with ids from `Manifest::opaques` on; `None` payload = not kept.
-    opaques: Vec<(u8, u8, u128, Option<Box<[u8]>>, u32)>,
+    /// Opaque values with ids from `Manifest::opaques` on: (enc, kind, hash, payload).
+    opaques: Vec<(u8, u8, u128, Box<[u8]>)>,
     piece_ix: HashMap<u128, u32>,
     opaque_ix: HashMap<u128, u64>,
     req_ix: HashMap<Box<str>, ReqId>,
@@ -265,8 +291,6 @@ pub struct Stats {
     pub requests: usize,
     pub pieces: usize,
     pub opaques: usize,
-    /// Opaque values stored as kind, hash and size only.
-    pub opaques_dropped: usize,
     pub segments: usize,
     pub level0: usize,
     pub runs: usize,
@@ -710,9 +734,8 @@ impl Db {
     /// [`Db::opaque_meta`], keeping the table blocks it needs in `tables` for the next call.
     fn opaque_meta_in(&self, id: u64, tables: &mut HashMap<(u32, u32), Arc<IxBlock>>) -> Result<OpaqueMeta> {
         if id >= self.manifest.opaques {
-            let (enc, _, hash, payload, len) = self.mem.opaques.get((id - self.manifest.opaques) as usize).ok_or_else(|| bad(format!("missing opaque value {id}")))?;
-            let loc = if payload.is_some() { OLoc::Mem((id - self.manifest.opaques) as u32) } else { OLoc::Dropped { len: *len } };
-            return Ok(OpaqueMeta { enc: *enc, hash: *hash, loc });
+            let (enc, _, hash, _) = self.mem.opaques.get((id - self.manifest.opaques) as usize).ok_or_else(|| bad(format!("missing opaque value {id}")))?;
+            return Ok(OpaqueMeta { enc: *enc, hash: *hash, loc: OLoc::Mem((id - self.manifest.opaques) as u32) });
         }
         let r = self.run_for_opaque(id)?;
         let i = (id - r.cat.olo) as usize;
@@ -727,8 +750,7 @@ impl Db {
         };
         let IxBlock::Opaques(v) = &*t else { return corrupt("index block of the wrong kind") };
         let o = *v.get(i % IDS).ok_or_else(|| bad(format!("missing opaque value {id}")))?;
-        let loc = if o.dropped { OLoc::Dropped { len: o.len } } else { OLoc::Blob { blob: o.file, off: o.off, len: o.len } };
-        Ok(OpaqueMeta { enc: o.enc, hash: o.hash, loc })
+        Ok(OpaqueMeta { enc: o.enc, hash: o.hash, loc: OLoc::Blob { blob: o.file, off: o.off, len: o.len } })
     }
 
     // ------------------------------------------------------------------ sessions
@@ -753,10 +775,10 @@ impl Db {
             let chunk = core.chunks.len() as u32;
             core.chunks.push(Chunk { seg: seg.num, frames: p.frames.into(), raw_len: p.raw_len });
             let end = core.nodes.len() + p.nodes.len();
-            core.nodes.resize(end, NodeMeta { parent: NONE, len: 0, hash: 0, loc: UNSET, holes: None });
+            core.nodes.resize(end, NodeMeta { parent: NONE, len: 0, loc: UNSET, holes: None });
             for n in p.nodes {
                 let slot = core.nodes.get_mut(n.id as usize).ok_or_else(|| bad(format!("session {s}: node {} outside its part", n.id)))?;
-                *slot = NodeMeta { parent: n.parent, len: n.len, hash: n.hash, loc: Loc::Seg { chunk, off: n.off }, holes: if n.holes.is_empty() { None } else { Some(n.holes.into_boxed_slice()) } };
+                *slot = NodeMeta { parent: n.parent, len: n.len, loc: Loc::Seg { chunk, off: n.off }, holes: if n.holes.is_empty() { None } else { Some(n.holes.into_boxed_slice()) } };
             }
             core.requests.extend(p.requests);
         }
@@ -823,10 +845,6 @@ impl Db {
         self.cores.remove(&s);
         self.stepc.remove(&s);
         let mut ss = Arc::unwrap_or_clone(steps);
-        let mut children = HashMap::with_capacity(core.nodes.len());
-        for (i, n) in core.nodes.iter().enumerate() {
-            children.insert((n.parent, n.hash), i as u32);
-        }
         // per node: last step at or above it on its path
         let mut last_at = vec![NONE; core.nodes.len()];
         for (pos, r) in ss.rows.iter().enumerate() {
@@ -849,7 +867,7 @@ impl Db {
         }
         ss.calls.clear();
         self.key_ix.insert(core.key.clone(), s);
-        self.active.insert(s, Active { core, steps: Arc::new(ss), children, last: self.flushes });
+        self.active.insert(s, Active::new(core, Arc::new(ss), self.flushes));
         Ok(())
     }
 
@@ -869,29 +887,17 @@ impl Db {
         Ok(id)
     }
 
-    fn opaque_dropped(&self, id: u64, m: &Mutation) -> Result<bool> {
-        if id >= self.next_opaque() {
-            return Ok(m.opaques.iter().any(|o| o.id == id && o.dropped.is_some()));
-        }
-        Ok(matches!(self.opaque_meta(id)?.loc, OLoc::Dropped { .. }))
-    }
-
     fn opaque_id(&self, oh: OpaqueHole, m: &mut Mutation, pending: &mut HashMap<u128, u64>) -> Result<u64> {
-        let keep = self.opts.keep.keeps(oh.kind);
         let h = opaque_hash(oh.enc as u8, &oh.payload);
         let found = match pending.get(&h) {
             Some(&i) => Some(i),
             None => self.find_by_hash(1, h)?,
         };
         if let Some(i) = found {
-            // a copy already stored is reused, unless it was not kept and this one is
-            if !keep || !self.opaque_dropped(i, m)? {
-                return Ok(i);
-            }
+            return Ok(i);
         }
         let id = self.next_opaque() + m.opaques.len() as u64;
-        let (payload, dropped) = if keep { (oh.payload, None) } else { (Vec::new(), Some(oh.payload.len() as u32)) };
-        m.opaques.push(NewOpaque { id, enc: oh.enc as u8, kind: oh.kind as u8, hash: h, payload, dropped });
+        m.opaques.push(NewOpaque { id, enc: oh.enc as u8, kind: oh.kind as u8, hash: h, payload: oh.payload });
         pending.insert(h, id);
         Ok(id)
     }
@@ -908,7 +914,6 @@ impl Db {
         if self.opts.verify_split && split::join(&sp)? != p.body {
             return Err(Error::BadRequest("split pieces do not join back to the body".into()));
         }
-        let digest = p.digest.unwrap_or_else(|| sha256(p.body));
         let key = (p.session.to_string(), p.agent.to_string());
         let existing = match self.key_ix.get(&key) {
             Some(&s) => Some(s),
@@ -936,35 +941,69 @@ impl Db {
                 system: NONE,
                 tools: NONE,
                 notes: Box::new([]),
-                digest,
                 layout: sp.layout.as_ref().map(|g| g.iter().map(|x| x.clone().into_boxed_slice()).collect()),
             },
         };
         let mut pp = HashMap::new();
         let mut po = HashMap::new();
 
-        // walk the session tree
+        // walk the session tree: by the hash of each message as it came, else by its key (the
+        // hash of the message as stored, values not kept blanked); keys learned on the way
+        // are added to the session after the record is applied
         let act = existing.map(|i| &self.active[&i]);
         let mut next = act.map(|a| a.core.nodes.len() as u32).unwrap_or(0);
         let mut parent = NONE;
         let mut creating = act.is_none();
-        for msg in &sp.messages {
+        let mut learned: HashMap<(u32, u128), u32> = HashMap::new();
+        let mut keyed = Vec::new();
+        // values not kept are blanked; cache markers after them move back by what was removed
+        let mut blanked: Vec<Vec<crate::json::Span>> = vec![Vec::new(); sp.messages.len()];
+        for (i, msg) in sp.messages.iter().enumerate() {
             let h = xxh3_128(&msg.bytes);
             if !creating {
-                if let Some(&c) = act.unwrap().children.get(&(parent, h)) {
+                let a = act.unwrap();
+                let find = |k: &(u32, u128), learned: &HashMap<(u32, u128), u32>| a.children.get(k).or_else(|| learned.get(k)).copied();
+                if let Some(c) = find(&(parent, h), &learned) {
                     parent = c;
+                    if !msg.notes.is_empty() {
+                        blanked[i] = split::blanked_spans(&msg.bytes, &self.opts.keep)?;
+                    }
+                    continue;
+                }
+                let spans = split::blanked_spans(&msg.bytes, &self.opts.keep)?;
+                let k = if spans.is_empty() { h } else { xxh3_128(&split::remove_spans(&msg.bytes, &spans)) };
+                let mut found = if k == h { None } else { find(&(parent, k), &learned) };
+                let kids = a.unkeyed(parent);
+                if found.is_none() && !kids.is_empty() && !keyed.contains(&parent) {
+                    let (mut buf, mut at) = (Vec::new(), Vec::with_capacity(kids.len()));
+                    self.read_nodes(&a.core, kids, &mut buf, &mut at, &mut ReadStats::default())?;
+                    for (&kid, &(x, y)) in kids.iter().zip(&at) {
+                        learned.insert((parent, xxh3_128(&buf[x..y])), kid);
+                    }
+                    keyed.push(parent);
+                    found = learned.get(&(parent, k)).copied();
+                }
+                if let Some(c) = found {
+                    learned.insert((parent, h), c);
+                    parent = c;
+                    blanked[i] = spans;
                     continue;
                 }
                 creating = true;
             }
-            let (cut, holes) = split::cut_opaque(&msg.bytes, &self.opts.keep)?;
-            let mut hl = Vec::with_capacity(holes.len());
-            for oh in holes {
+            let cut = split::cut_opaque(&msg.bytes, &self.opts.keep)?;
+            let k = if cut.blanked.is_empty() { h } else { xxh3_128(&split::remove_spans(&msg.bytes, &cut.blanked)) };
+            if k != h {
+                learned.insert((parent, h), next);
+            }
+            let mut hl = Vec::with_capacity(cut.holes.len());
+            for oh in cut.holes {
                 let off = oh.offset;
                 let oid = self.opaque_id(oh, &mut m, &mut po)?;
                 hl.push((off, oid));
             }
-            m.nodes.push(NewNode { id: next, parent, hash: h, bytes: cut, holes: hl });
+            blanked[i] = cut.blanked;
+            m.nodes.push(NewNode { id: next, parent, hash: k, bytes: cut.bytes, holes: hl });
             parent = next;
             next += 1;
         }
@@ -988,7 +1027,7 @@ impl Db {
         for (i, msg) in sp.messages.iter().enumerate() {
             for n in &msg.notes {
                 let t = self.piece_id(PIECE_MARKER, &n.text, &mut m, &mut pp)?;
-                notes.push(ReqNote { target: TARGET_MSG0 + i as u32, offset: n.offset, text: t });
+                notes.push(ReqNote { target: TARGET_MSG0 + i as u32, offset: split::offset_after_blanking(n.offset, &blanked[i]), text: t });
             }
         }
         m.req.notes = notes.into_boxed_slice();
@@ -997,6 +1036,9 @@ impl Db {
         let k = act.map(|a| a.core.requests.len() as u32).unwrap_or(0);
         self.wal.append(&m.encode());
         self.apply(m)?;
+        let a = self.active.get_mut(&sidx).unwrap();
+        a.children.extend(learned);
+        a.keyed.extend(keyed);
         Ok(PutOutcome::Stored(req_id(sidx, k)))
     }
 
@@ -1012,7 +1054,7 @@ impl Db {
             }
             let core = SessionCore { key: (sk, ak), ..SessionCore::default() };
             self.key_ix.insert(core.key.clone(), i);
-            self.active.insert(i, Active { core: Arc::new(core), steps: Arc::new(SessionSteps::default()), children: HashMap::new(), last: self.flushes });
+            self.active.insert(i, Active::new(Arc::new(core), Arc::new(SessionSteps::default()), self.flushes));
             self.next_session += 1;
         } else {
             if s >= self.next_session {
@@ -1032,15 +1074,8 @@ impl Db {
             if o.id != self.next_opaque() {
                 return corrupt("opaque value out of order");
             }
-            let payload = match o.dropped {
-                Some(_) => None,
-                None => {
-                    self.mem.bytes += o.payload.len();
-                    Some(o.payload.into_boxed_slice())
-                }
-            };
-            let len = o.dropped.unwrap_or(payload.as_ref().map_or(0, |p| p.len() as u32));
-            self.mem.opaques.push((o.enc, o.kind, o.hash, payload, len));
+            self.mem.bytes += o.payload.len();
+            self.mem.opaques.push((o.enc, o.kind, o.hash, o.payload.into_boxed_slice()));
             self.mem.opaque_ix.insert(o.hash, o.id);
         }
         let time_ms = steps::parse_time_ms(&m.req.time);
@@ -1058,7 +1093,6 @@ impl Db {
             core.nodes.push(NodeMeta {
                 parent: n.parent,
                 len: n.bytes.len() as u32,
-                hash: n.hash,
                 loc: Loc::Mem(self.mem.nodes.len() as u32),
                 holes: if n.holes.is_empty() { None } else { Some(n.holes.into_boxed_slice()) },
             });
@@ -1084,8 +1118,8 @@ impl Db {
     fn opaque_text_len(&self, id: u64) -> u64 {
         let Ok(om) = self.opaque_meta(id) else { return 0 };
         let n = match om.loc {
-            OLoc::Blob { len, .. } | OLoc::Dropped { len } => len as u64,
-            OLoc::Mem(mi) => self.mem.opaques[mi as usize].3.as_ref().map_or(0, |p| p.len() as u64),
+            OLoc::Blob { len, .. } => len as u64,
+            OLoc::Mem(mi) => self.mem.opaques[mi as usize].3.len() as u64,
         };
         if om.enc == 0 { n.div_ceil(3) * 4 } else { n }
     }
@@ -1231,7 +1265,7 @@ impl Db {
         let mut cache = HashMap::new();
         for id in order {
             let nm = &core.nodes[id as usize];
-            nodes.push(SegNode { id, parent: nm.parent, hash: nm.hash, off: stream.len() as u32, len: nm.len, holes: nm.holes.as_deref().map(|h| h.to_vec()).unwrap_or_default() });
+            nodes.push(SegNode { id, parent: nm.parent, off: stream.len() as u32, len: nm.len, holes: nm.holes.as_deref().map(|h| h.to_vec()).unwrap_or_default() });
             self.stored_bytes(core, nm, &mut cache, &mut stream)?;
         }
         if stream.len() > u32::MAX as usize {
@@ -1256,9 +1290,9 @@ impl Db {
         let lo = self.manifest.opaques;
         let n = self.mem.opaques.len();
         let mut pents = Vec::with_capacity(self.mem.pieces.len());
-        let mut oents: Vec<OpaqueEnt> = self.mem.opaques.iter().map(|(enc, kind, h, _, len)| OpaqueEnt { enc: *enc, kind: *kind, dropped: true, hash: *h, file: 0, off: 0, len: *len }).collect();
+        let mut oents: Vec<OpaqueEnt> = self.mem.opaques.iter().map(|(enc, kind, h, p)| OpaqueEnt { enc: *enc, kind: *kind, hash: *h, file: 0, off: 0, len: p.len() as u32 }).collect();
         let mut blob_len = None;
-        if !self.mem.pieces.is_empty() || self.mem.opaques.iter().any(|o| o.3.is_some()) {
+        if !self.mem.pieces.is_empty() || !self.mem.opaques.is_empty() {
             let (bn, len) = match man.blobs.last() {
                 Some(&(bn, len)) if len < self.opts.blob_bytes => (bn, len),
                 _ => {
@@ -1308,10 +1342,8 @@ impl Db {
             }
             order.extend((0..n).filter(|&i| !placed[i]));
             for i in order {
-                if let Some(p) = &self.mem.opaques[i].3 {
-                    let off = bw.opaque(p)?;
-                    oents[i] = OpaqueEnt { dropped: false, file: bn, off, len: p.len() as u32, ..oents[i] };
-                }
+                let off = bw.opaque(&self.mem.opaques[i].3)?;
+                oents[i] = OpaqueEnt { file: bn, off, ..oents[i] };
             }
             let new_len = bw.finish(self.opts.sync)?;
             flushed += new_len - start;
@@ -1691,21 +1723,19 @@ impl Db {
         Ok(())
     }
 
-    fn opaque_payload(&self, om: &OpaqueMeta, st: &mut ReadStats) -> Result<Option<Vec<u8>>> {
+    fn opaque_payload(&self, om: &OpaqueMeta, st: &mut ReadStats) -> Result<Vec<u8>> {
         Ok(match om.loc {
-            OLoc::Dropped { .. } => None,
-            OLoc::Mem(mi) => self.mem.opaques[mi as usize].3.as_ref().map(|p| p.to_vec()),
+            OLoc::Mem(mi) => self.mem.opaques[mi as usize].3.to_vec(),
             OLoc::Blob { blob, off, len } => {
                 st.opaque_reads += 1;
-                Some(self.blob_read(blob, off, len)?)
+                self.blob_read(blob, off, len)?
             }
         })
     }
 
     /// Read nodes of one session, in the order given, with opaque values put back.
-    /// Each node's bytes go to `out`; `spans` gets their ranges. Values not kept are left
-    /// out; `drops` gets (index in `ids`, offset in the full message, text length) for each.
-    fn read_nodes(&self, core: &SessionCore, ids: &[u32], out: &mut Vec<u8>, spans: &mut Vec<(usize, usize)>, drops: &mut Vec<(u32, u32, u32)>, st: &mut ReadStats) -> Result<()> {
+    /// Each node's bytes go to `out`; `spans` gets their ranges.
+    fn read_nodes(&self, core: &SessionCore, ids: &[u32], out: &mut Vec<u8>, spans: &mut Vec<(usize, usize)>, st: &mut ReadStats) -> Result<()> {
         // which frames are needed, read with one call per run of adjacent frames
         let mut need: BTreeSet<(u32, usize)> = BTreeSet::new();
         let mut prev: Option<(u32, u32)> = None;
@@ -1790,7 +1820,7 @@ impl Db {
             }
         }
         let mut tmp = Vec::new();
-        for (k, &id) in ids.iter().enumerate() {
+        for &id in ids {
             let nm = &core.nodes[id as usize];
             let start = out.len();
             match &nm.holes {
@@ -1799,34 +1829,20 @@ impl Db {
                     tmp.clear();
                     self.stored_bytes(core, nm, &mut cache, &mut tmp)?;
                     let mut pos = 0usize;
-                    let mut gone = 0u32;
                     for &(o, oid) in holes.iter() {
                         out.extend_from_slice(&tmp[pos..o as usize]);
                         pos = o as usize;
                         let om = metas[&oid];
                         let enc = if om.enc == 0 { OpaqueEnc::Base64 } else { OpaqueEnc::Text };
                         let p = match fetched.remove(&oid) {
-                            Some(p) => Some(p),
+                            Some(p) => p,
                             None => self.opaque_payload(&om, st)?,
                         };
-                        match p {
-                            None => {
-                                let n = match om.loc {
-                                    OLoc::Dropped { len } => len,
-                                    _ => 0,
-                                };
-                                let len = if om.enc == 0 { n.div_ceil(3) * 4 } else { n };
-                                drops.push((k as u32, (out.len() - start) as u32 + gone, len));
-                                gone += len;
-                            }
-                            Some(p) => {
-                                if opaque_hash(om.enc, &p) != om.hash {
-                                    return corrupt(format!("opaque value {oid} fails its checksum"));
-                                }
-                                split::opaque_text(enc, &p, out);
-                                fetched.insert(oid, p);
-                            }
+                        if opaque_hash(om.enc, &p) != om.hash {
+                            return corrupt(format!("opaque value {oid} fails its checksum"));
                         }
+                        split::opaque_text(enc, &p, out);
+                        fetched.insert(oid, p);
                     }
                     out.extend_from_slice(&tmp[pos..]);
                 }
@@ -1891,13 +1907,11 @@ impl Db {
         Ok(v)
     }
 
-    /// Put cache markers back into `cut`. Their offsets count in the full message; `drops`
-    /// lists (offset, length) of values left out of `cut` before them.
-    fn with_notes(&self, cut: &[u8], notes: &[ReqNote], drops: &[(u32, u32, u32)], out: &mut Vec<u8>) -> Result<()> {
+    /// Put cache markers back into a message, system prompt or tool list.
+    fn with_notes(&self, cut: &[u8], notes: &[ReqNote], out: &mut Vec<u8>) -> Result<()> {
         let mut pos = 0usize;
         for n in notes {
-            let gone: u32 = drops.iter().filter(|d| d.1 < n.offset).map(|d| d.2).sum();
-            let o = n.offset.checked_sub(gone).ok_or_else(|| bad("cache note inside a value not kept"))? as usize;
+            let o = n.offset as usize;
             if o < pos || o > cut.len() {
                 return corrupt("cache note out of range");
             }
@@ -1928,8 +1942,7 @@ impl Db {
         let path = Self::path(&core, r.tip, r.n_msgs)?;
         let mut mbuf = Vec::new();
         let mut spans = Vec::with_capacity(path.len());
-        let mut drops = Vec::new();
-        self.read_nodes(&core, &path, &mut mbuf, &mut spans, &mut drops, st)?;
+        self.read_nodes(&core, &path, &mut mbuf, &mut spans, st)?;
         let skel = self.skeleton(r.skeleton)?;
         let notes = &r.notes[..];
         let of = |t: u32| -> &[ReqNote] {
@@ -1947,16 +1960,14 @@ impl Db {
                             None if i > 0 => out.push(b','),
                             None => {}
                         }
-                        let d0 = drops.partition_point(|d| (d.0 as usize) < i);
-                        let d1 = drops.partition_point(|d| (d.0 as usize) <= i);
-                        self.with_notes(&mbuf[a..b], of(TARGET_MSG0 + i as u32), &drops[d0..d1], out)?;
+                        self.with_notes(&mbuf[a..b], of(TARGET_MSG0 + i as u32), out)?;
                     }
                     if let Some(g) = &r.layout {
                         out.extend_from_slice(&g[spans.len()]);
                     }
                 }
-                HoleKind::System => self.with_notes(&self.piece(r.system)?, of(TARGET_SYSTEM), &[], out)?,
-                HoleKind::Tools => self.with_notes(&self.piece(r.tools)?, of(TARGET_TOOLS), &[], out)?,
+                HoleKind::System => self.with_notes(&self.piece(r.system)?, of(TARGET_SYSTEM), out)?,
+                HoleKind::Tools => self.with_notes(&self.piece(r.tools)?, of(TARGET_TOOLS), out)?,
             }
             Ok(())
         })
@@ -1965,19 +1976,6 @@ impl Db {
     pub fn rebuild(&self, ri: ReqId) -> Result<Vec<u8>> {
         let mut out = Vec::new();
         self.rebuild_into(ri, &mut out, &mut ReadStats::default())?;
-        Ok(out)
-    }
-
-    /// Rebuild and check the result against the hash taken when the request arrived.
-    pub fn rebuild_checked(&self, ri: ReqId) -> Result<Vec<u8>> {
-        if self.request_has_dropped(ri)? {
-            return Err(Error::BadRequest("the request held values the store did not keep".into()));
-        }
-        let out = self.rebuild(ri)?;
-        let r = self.request(ri)?;
-        if sha256(&out) != r.digest {
-            return corrupt(format!("request {} does not rebuild to its digest", r.id));
-        }
         Ok(out)
     }
 
@@ -2032,7 +2030,7 @@ impl Db {
         let core = self.load_core(s)?;
         let mut buf = Vec::new();
         let mut spans = Vec::new();
-        self.read_nodes(&core, ids, &mut buf, &mut spans, &mut Vec::new(), st)?;
+        self.read_nodes(&core, ids, &mut buf, &mut spans, st)?;
         Ok(spans.into_iter().map(|(a, b)| buf[a..b].to_vec()).collect())
     }
 
@@ -2046,7 +2044,7 @@ impl Db {
         });
         let mut buf = Vec::new();
         let mut spans = Vec::new();
-        self.read_nodes(&core, &ids, &mut buf, &mut spans, &mut Vec::new(), st)?;
+        self.read_nodes(&core, &ids, &mut buf, &mut spans, st)?;
         Ok(buf)
     }
 
@@ -2118,7 +2116,6 @@ impl Db {
             st.opaque_bytes += r.cat.opaque_bytes;
             st.piece_bytes += r.cat.piece_bytes;
             st.piece_raw_bytes += r.cat.piece_raw_bytes;
-            st.opaques_dropped += r.cat.n_dropped as usize;
             st.catalog_bytes += r.cat.bytes();
         }
         for b in self.blob_files.values() {
@@ -2128,15 +2125,10 @@ impl Db {
         st.nodes += self.mem.nodes.len();
         st.node_bytes += self.mem.nodes.iter().map(|n| n.len() as u64).sum::<u64>();
         st.piece_raw_bytes += self.mem.pieces.iter().map(|p| p.2.len() as u64).sum::<u64>();
-        for (_, _, _, p, _) in &self.mem.opaques {
-            match p {
-                Some(p) => st.opaque_bytes += p.len() as u64,
-                None => st.opaques_dropped += 1,
-            }
-        }
+        st.opaque_bytes += self.mem.opaques.iter().map(|o| o.3.len() as u64).sum::<u64>();
         for a in self.active.values() {
             st.steps += a.steps.rows.len() - a.steps.flushed as usize;
-            st.active_bytes += a.core.bytes() + a.steps.bytes() + a.children.len() * 40;
+            st.active_bytes += a.core.bytes() + a.steps.bytes() + a.children.len() * 40 + a.stored_kids.len() * 4 + a.keyed.len() * 8;
         }
         st.caches = vec![
             ("sessions", self.cores.stats()),
@@ -2225,56 +2217,51 @@ impl Db {
         (0..n).map(|k| req_id(s, k)).collect()
     }
 
-    /// Opaque values by kind: (kind, values kept, bytes kept, values not kept, bytes they had).
-    /// Reads every opaque value table.
-    pub fn opaque_kinds(&self) -> Result<Vec<(&'static str, u64, u64, u64, u64)>> {
-        let mut out: Vec<(&'static str, u64, u64, u64, u64)> = Vec::new();
-        let mut add = |kind: u8, kept: bool, len: u64| {
+    /// Opaque values by kind: (kind, values, bytes). Reads every opaque value table.
+    pub fn opaque_kinds(&self) -> Result<Vec<(&'static str, u64, u64)>> {
+        let mut out: Vec<(&'static str, u64, u64)> = Vec::new();
+        let mut add = |kind: u8, len: u64| {
             let name = OpaqueKind::from_u8(kind).name();
             let i = match out.iter().position(|x| x.0 == name) {
                 Some(i) => i,
                 None => {
-                    out.push((name, 0, 0, 0, 0));
+                    out.push((name, 0, 0));
                     out.len() - 1
                 }
             };
-            if kept {
-                (out[i].1, out[i].2) = (out[i].1 + 1, out[i].2 + len);
-            } else {
-                (out[i].3, out[i].4) = (out[i].3 + 1, out[i].4 + len);
-            }
+            (out[i].1, out[i].2) = (out[i].1 + 1, out[i].2 + len);
         };
         for r in &self.runs {
             for i in 0..(r.cat.no as usize).div_ceil(IDS) {
                 if let IxBlock::Opaques(v) = r.block(K_OPAQUES, i)? {
                     for o in v {
-                        add(o.kind, !o.dropped, o.len as u64);
+                        add(o.kind, o.len as u64);
                     }
                 }
             }
         }
-        for (_, kind, _, p, len) in &self.mem.opaques {
-            add(*kind, p.is_some(), *len as u64);
+        for (_, kind, _, p) in &self.mem.opaques {
+            add(*kind, p.len() as u64);
         }
-        out.sort_by_key(|x| std::cmp::Reverse(x.2 + x.4));
+        out.sort_by_key(|x| std::cmp::Reverse(x.2));
         Ok(out)
     }
 
-    /// Every opaque value in id order: (id, kind, enc, payload; `None` when not kept).
-    /// For size measurements: reads every value.
-    pub fn each_opaque(&self, mut f: impl FnMut(u64, u8, u8, Option<&[u8]>)) -> Result<()> {
+    /// Every opaque value in id order: (id, kind, enc, payload). For size measurements:
+    /// reads every value.
+    pub fn each_opaque(&self, mut f: impl FnMut(u64, u8, u8, &[u8])) -> Result<()> {
         for r in &self.runs {
             for i in 0..(r.cat.no as usize).div_ceil(IDS) {
                 if let IxBlock::Opaques(v) = r.block(K_OPAQUES, i)? {
                     for (j, o) in v.iter().enumerate() {
-                        let p = if o.dropped { None } else { Some(self.blob_read(o.file, o.off, o.len)?) };
-                        f(r.cat.olo + (i * IDS + j) as u64, o.kind, o.enc, p.as_deref());
+                        let p = self.blob_read(o.file, o.off, o.len)?;
+                        f(r.cat.olo + (i * IDS + j) as u64, o.kind, o.enc, &p);
                     }
                 }
             }
         }
-        for (k, (enc, kind, _, p, _)) in self.mem.opaques.iter().enumerate() {
-            f(self.manifest.opaques + k as u64, *kind, *enc, p.as_deref());
+        for (k, (enc, kind, _, p)) in self.mem.opaques.iter().enumerate() {
+            f(self.manifest.opaques + k as u64, *kind, *enc, p);
         }
         Ok(())
     }
@@ -2328,11 +2315,11 @@ impl Db {
         Ok(())
     }
 
-    /// A session's messages as stored, in storage order: (node id, parent, hash, stored
-    /// bytes with opaque values cut out, (offset, opaque id) per cut value). For size
+    /// A session's messages as stored, in storage order: (node id, parent, stored bytes
+    /// with opaque values cut out, (offset, opaque id) per cut value). For size
     /// measurements.
     #[allow(clippy::type_complexity)]
-    pub fn stored_nodes(&self, s: u32) -> Result<Vec<(u32, u32, u128, Vec<u8>, Vec<(u32, u64)>)>> {
+    pub fn stored_nodes(&self, s: u32) -> Result<Vec<(u32, u32, Vec<u8>, Vec<(u32, u64)>)>> {
         let core = self.load_core(s)?;
         let mut ids: Vec<u32> = (0..core.nodes.len() as u32).collect();
         ids.sort_by_key(|&i| match core.nodes[i as usize].loc {
@@ -2345,25 +2332,9 @@ impl Db {
             let nm = &core.nodes[id as usize];
             let mut b = Vec::with_capacity(nm.len as usize);
             self.stored_bytes(&core, nm, &mut cache, &mut b)?;
-            out.push((id, nm.parent, nm.hash, b, nm.holes.as_deref().map(|h| h.to_vec()).unwrap_or_default()));
+            out.push((id, nm.parent, b, nm.holes.as_deref().map(|h| h.to_vec()).unwrap_or_default()));
         }
         Ok(out)
-    }
-
-    /// Whether a request held values the store did not keep (so it cannot rebuild exactly).
-    pub fn request_has_dropped(&self, ri: ReqId) -> Result<bool> {
-        let (core, k) = self.core_req(ri)?;
-        let r = &core.requests[k as usize];
-        for id in Self::path(&core, r.tip, r.n_msgs)? {
-            if let Some(h) = &core.nodes[id as usize].holes {
-                for &(_, oid) in h.iter() {
-                    if matches!(self.opaque_meta(oid)?.loc, OLoc::Dropped { .. }) {
-                        return Ok(true);
-                    }
-                }
-            }
-        }
-        Ok(false)
     }
 
     /// How many parts session `s` is stored in.

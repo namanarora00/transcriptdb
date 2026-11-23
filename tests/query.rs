@@ -44,7 +44,7 @@ fn store(name: &str, sessions: &[Vec<String>]) -> (Db, std::path::PathBuf) {
         for b in bodies {
             let id = format!("r{k}");
             let time = format!("{}", 1_700_000_000 + k);
-            db.put(&Put { session: &format!("s{s}"), agent: "", id: &id, time: &time, meta: b"", body: b.as_bytes(), digest: None }).unwrap();
+            db.put(&Put { session: &format!("s{s}"), agent: "", id: &id, time: &time, meta: b"", body: b.as_bytes() }).unwrap();
             k += 1;
         }
     }
@@ -142,7 +142,7 @@ fn generated_queries_match_the_reference() {
     let mut db = Db::open(&dir, opts()).unwrap();
     for s in 0..16 {
         for q in synth::session(5, s, 45) {
-            db.put(&Put { session: &q.session, agent: &q.agent, id: &q.id, time: &q.time, meta: b"", body: &q.body, digest: None }).unwrap();
+            db.put(&Put { session: &q.session, agent: &q.agent, id: &q.id, time: &q.time, meta: b"", body: &q.body }).unwrap();
         }
     }
     db.commit().unwrap();
@@ -164,7 +164,7 @@ fn columnar_summarize_equals_the_general_path() {
     let mut db = Db::open(&dir, opts()).unwrap();
     for s in 0..12 {
         for q in synth::session(8, s, 40) {
-            db.put(&Put { session: &q.session, agent: &q.agent, id: &q.id, time: &q.time, meta: b"", body: &q.body, digest: None }).unwrap();
+            db.put(&Put { session: &q.session, agent: &q.agent, id: &q.id, time: &q.time, meta: b"", body: &q.body }).unwrap();
         }
     }
     db.commit().unwrap();

@@ -32,7 +32,7 @@ use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-const SEG_MAGIC: &[u8; 8] = b"TDBSEG07";
+const SEG_MAGIC: &[u8; 8] = b"TDBSEG08";
 /// Raw bytes per group block of encoded parts, and per directory block.
 const GROUP: usize = 64 * 1024;
 /// Bloom filter bits per key: about 0.2% false positives.
@@ -46,7 +46,6 @@ pub fn seg_path(dir: &Path, num: u32) -> PathBuf {
 pub struct SegNode {
     pub id: u32,
     pub parent: u32,
-    pub hash: u128,
     pub off: u32,
     pub len: u32,
     pub holes: Vec<(u32, u64)>,
@@ -259,7 +258,7 @@ fn u32_from(base: i64, delta: u64) -> Result<u32> {
     u32::try_from(i64_from(base, delta)?).map_err(|_| crate::codec::Error::Corrupt("value out of range".into()))
 }
 
-const CORE_COLS: usize = 16;
+const CORE_COLS: usize = 14;
 
 fn encode_core(p: &CorePart, e: &mut Enc) {
     let mut c: Vec<Enc> = (0..CORE_COLS).map(|_| Enc::new()).collect();
@@ -284,49 +283,47 @@ fn encode_core(p: &CorePart, e: &mut Enc) {
         c[3].var(zz(n.id as i64 - prev - 1));
         prev = n.id as i64;
         c[4].var(if n.parent == u32::MAX { 0 } else { zz(n.id as i64 - n.parent as i64) + 1 });
-        c[5].u128(n.hash);
-        c[6].var(zz(n.off as i64 - at));
-        c[7].var(n.len as u64);
+        c[5].var(zz(n.off as i64 - at));
+        c[6].var(n.len as u64);
         at = n.off as i64 + n.len as i64;
-        c[8].var(n.holes.len() as u64);
+        c[7].var(n.holes.len() as u64);
         let mut po = 0i64;
         for &(o, id) in &n.holes {
-            c[9].var(zz(o as i64 - po));
+            c[8].var(zz(o as i64 - po));
             po = o as i64;
-            c[9].var(zz(id as i64 - last_opaque));
+            c[8].var(zz(id as i64 - last_opaque));
             last_opaque = id as i64;
         }
     }
     let (mut tip, mut nm, mut ps, mut sess) = (0i64, 0i64, [0i64; 3], 0i64);
     for r in &p.requests {
-        c[13].var(zz(r.session as i64 - sess));
+        c[12].var(zz(r.session as i64 - sess));
         sess = r.session as i64;
-        c[10].bytes(r.id.as_bytes());
-        c[11].bytes(r.time.as_bytes());
-        c[12].bytes(&r.meta);
+        c[9].bytes(r.id.as_bytes());
+        c[10].bytes(r.time.as_bytes());
+        c[11].bytes(&r.meta);
         let t = opt_id(r.tip) as i64;
-        c[13].var(zz(t - tip));
+        c[12].var(zz(t - tip));
         tip = t;
-        c[13].var(zz(r.n_msgs as i64 - nm));
+        c[12].var(zz(r.n_msgs as i64 - nm));
         nm = r.n_msgs as i64;
         for (k, v) in [r.skeleton as u64, opt_id(r.system), opt_id(r.tools)].into_iter().enumerate() {
-            c[13].var(zz(v as i64 - ps[k]));
+            c[12].var(zz(v as i64 - ps[k]));
             ps[k] = v as i64;
         }
-        c[14].var(r.notes.len() as u64);
+        c[13].var(r.notes.len() as u64);
         for n in r.notes.iter() {
-            c[14].var(n.target as u64);
-            c[14].var(n.offset as u64);
-            c[14].var(n.text as u64);
+            c[13].var(n.target as u64);
+            c[13].var(n.offset as u64);
+            c[13].var(n.text as u64);
         }
-        c[15].raw(&r.digest);
         match &r.layout {
-            None => c[14].u8(0),
+            None => c[13].u8(0),
             Some(g) => {
-                c[14].u8(1);
-                c[14].var(g.len() as u64);
+                c[13].u8(1);
+                c[13].var(g.len() as u64);
                 for x in g.iter() {
-                    c[14].bytes(x);
+                    c[13].bytes(x);
                 }
             }
         }
@@ -362,50 +359,48 @@ pub fn decode_core(b: &[u8]) -> Result<CorePart> {
         prev = id as i64;
         let pv = c[4].var()?;
         let parent = if pv == 0 { u32::MAX } else { u32_from(id as i64, zz(-unzz(pv - 1)))? };
-        let hash = c[5].u128()?;
-        let off = u32_from(at, c[6].var()?)?;
-        let len = c[7].var32()?;
+        let off = u32_from(at, c[5].var()?)?;
+        let len = c[6].var32()?;
         at = off as i64 + len as i64;
-        let nh = c[8].var()? as usize;
+        let nh = c[7].var()? as usize;
         let mut holes = Vec::with_capacity(nh.min(1 << 16));
         let mut po = 0i64;
         for _ in 0..nh {
-            let o = u32_from(po, c[9].var()?)?;
+            let o = u32_from(po, c[8].var()?)?;
             po = o as i64;
-            let id = i64_from(last_opaque, c[9].var()?)?;
+            let id = i64_from(last_opaque, c[8].var()?)?;
             last_opaque = id;
             holes.push((o, u64::try_from(id).map_err(|_| crate::codec::Error::Corrupt("bad opaque id".into()))?));
         }
-        nodes.push(SegNode { id, parent, hash, off, len, holes });
+        nodes.push(SegNode { id, parent, off, len, holes });
     }
     let mut requests = Vec::with_capacity(nr.min(1 << 20));
     let (mut tip, mut nm, mut ps, mut sess) = (0i64, 0i64, [0i64; 3], 0i64);
     let utf8 = |b: &[u8]| -> Result<Box<str>> { Ok(std::str::from_utf8(b).map_err(|_| crate::codec::Error::Corrupt("string not utf-8".into()))?.into()) };
     for _ in 0..nr {
-        sess = i64_from(sess, c[13].var()?)?;
-        let id = utf8(c[10].bytes()?)?;
-        let time = utf8(c[11].bytes()?)?;
-        let meta = c[12].bytes()?.to_vec().into_boxed_slice();
-        tip = i64_from(tip, c[13].var()?)?;
-        nm = i64_from(nm, c[13].var()?)?;
+        sess = i64_from(sess, c[12].var()?)?;
+        let id = utf8(c[9].bytes()?)?;
+        let time = utf8(c[10].bytes()?)?;
+        let meta = c[11].bytes()?.to_vec().into_boxed_slice();
+        tip = i64_from(tip, c[12].var()?)?;
+        nm = i64_from(nm, c[12].var()?)?;
         let mut v = [0u64; 3];
         for k in 0..3 {
-            ps[k] = i64_from(ps[k], c[13].var()?)?;
+            ps[k] = i64_from(ps[k], c[12].var()?)?;
             v[k] = u64::try_from(ps[k]).map_err(|_| crate::codec::Error::Corrupt("bad piece id".into()))?;
         }
-        let nn = c[14].var()? as usize;
+        let nn = c[13].var()? as usize;
         let mut notes = Vec::with_capacity(nn.min(1 << 16));
         for _ in 0..nn {
-            notes.push(crate::record::ReqNote { target: c[14].var32()?, offset: c[14].var32()?, text: c[14].var32()? });
+            notes.push(crate::record::ReqNote { target: c[13].var32()?, offset: c[13].var32()?, text: c[13].var32()? });
         }
-        let digest: [u8; 32] = c[15].raw(32)?.try_into().unwrap();
-        let layout = match c[14].u8()? {
+        let layout = match c[13].u8()? {
             0 => None,
             1 => {
-                let n = c[14].var()? as usize;
+                let n = c[13].var()? as usize;
                 let mut g = Vec::with_capacity(n.min(1 << 20));
                 for _ in 0..n {
-                    g.push(c[14].bytes()?.to_vec().into_boxed_slice());
+                    g.push(c[13].bytes()?.to_vec().into_boxed_slice());
                 }
                 Some(g.into_boxed_slice())
             }
@@ -423,7 +418,6 @@ pub fn decode_core(b: &[u8]) -> Result<CorePart> {
             system: unopt_id(v[1])?,
             tools: unopt_id(v[2])?,
             notes: notes.into_boxed_slice(),
-            digest,
             layout,
         });
     }

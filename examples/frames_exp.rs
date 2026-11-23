@@ -21,7 +21,7 @@ fn main() {
     for s in 0..db.session_count() as u32 {
         let mut b = Vec::new();
         for n in db.stored_nodes(s).expect("session") {
-            b.extend_from_slice(&n.3);
+            b.extend_from_slice(&n.2);
         }
         streams.push(b);
     }

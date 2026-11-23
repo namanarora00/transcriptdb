@@ -1,7 +1,7 @@
 //! `tdb`: command-line tool for the TranscriptDB storage core.
 //!
 //!   tdb ingest-claude --store DIR [--logs DIR] [--max-files N] [--seed S] [--threads N] [--sync full|fsync|os]
-//!                     [--drop thinking,images,documents,other]
+//!                     [--drop documents,other]
 //!   tdb check-claude  --store DIR [--logs DIR] [--threads N] [--drop ...as at ingest]
 //!   tdb stats         --store DIR
 //!   tdb compact       --store DIR
@@ -13,6 +13,9 @@
 //!
 //! Writing commands take --merge-level 19 --dict-kb 1024 --zstd-threads N (full-size merges
 //! and compact: zstd level, dictionary size, compression threads).
+//!
+//! Thinking (text, signatures, redacted thinking) and images are never stored: they are
+//! replaced by empty strings at ingest. `--drop` blanks documents and other base64 too.
 //!
 //! Real logs are read from `--logs` (default `~/.claude/projects`) at run time only.
 //! Output is counts, sizes and times; no log content is printed.
@@ -73,7 +76,7 @@ impl Args {
     fn threads(&self) -> usize {
         self.num("threads", std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4) as u64) as usize
     }
-    /// `--drop thinking,images,documents,other`: opaque values not to keep.
+    /// `--drop documents,other`: opaque values not to keep besides thinking and images.
     fn keep(&self) -> Keep {
         match self.get("drop") {
             None => Keep::default(),
@@ -191,7 +194,7 @@ fn ingest_claude(a: &Args) {
                 }
                 let t = Instant::now();
                 let out = db
-                    .put(&Put { session: &r.session, agent: &r.agent, id: &r.id, time: &r.time, meta: &r.meta, body, digest: r.digest })
+                    .put(&Put { session: &r.session, agent: &r.agent, id: &r.id, time: &r.time, meta: &r.meta, body })
                     .unwrap_or_else(|e| panic!("put {}: {e}", r.id));
                 match out {
                     PutOutcome::Stored(_) => {
@@ -262,12 +265,11 @@ fn check_claude(a: &Args) {
     let db = Db::open(a.store(), a.opts()).expect("open store");
     let t_read = t0.elapsed().as_secs_f64();
     let ok = AtomicUsize::new(0);
-    let bad_log = AtomicUsize::new(0);
-    let bad_stored = AtomicUsize::new(0);
     let errors = AtomicUsize::new(0);
     let bytes = AtomicUsize::new(0);
     let missing: Mutex<Vec<usize>> = Mutex::new(Vec::new());
-    let dropped: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+    // rebuilds not equal to requestDigest: compared below with the log's body, blanked
+    let differ: Mutex<Vec<usize>> = Mutex::new(Vec::new());
     let failures: Mutex<Vec<String>> = Mutex::new(Vec::new());
     let next = AtomicUsize::new(0);
     let t1 = Instant::now();
@@ -285,11 +287,6 @@ fn check_claude(a: &Args) {
                         missing.lock().unwrap().push(i);
                         continue;
                     };
-                    if db.request_has_dropped(ri).unwrap_or(false) {
-                        // checked below against the log's body with those values blanked
-                        dropped.lock().unwrap().push(i);
-                        continue;
-                    }
                     out.clear();
                     if let Err(e) = db.rebuild_into(ri, &mut out, &mut ReadStats::default()) {
                         errors.fetch_add(1, Ordering::Relaxed);
@@ -297,19 +294,10 @@ fn check_claude(a: &Args) {
                         continue;
                     }
                     bytes.fetch_add(out.len(), Ordering::Relaxed);
-                    let h = sha256(&out);
-                    let stored_ok = db.request(ri).is_ok_and(|r| r.digest == h);
-                    let log_ok = d.is_none_or(|d| d == h);
-                    if !stored_ok {
-                        bad_stored.fetch_add(1, Ordering::Relaxed);
-                    }
-                    if !log_ok {
-                        bad_log.fetch_add(1, Ordering::Relaxed);
-                    }
-                    if stored_ok && log_ok {
+                    if d.is_some_and(|d| d == sha256(&out)) {
                         ok.fetch_add(1, Ordering::Relaxed);
                     } else {
-                        failures.lock().unwrap().push(format!("{id}: rebuilt bytes differ (stored digest ok: {stored_ok}, log digest ok: {log_ok})"));
+                        differ.lock().unwrap().push(i);
                     }
                 }
             });
@@ -317,16 +305,17 @@ fn check_claude(a: &Args) {
     });
     let secs = t1.elapsed().as_secs_f64();
     let missing = missing.into_inner().unwrap();
-    let dropped = dropped.into_inner().unwrap();
-    // requests that held values the store did not keep: build each body from the log
-    // again, blank the values `--drop` names, and compare with the rebuild
+    let differ = differ.into_inner().unwrap();
+    // build each such body from the log again, blank what the store never keeps (and what
+    // `--drop` names), and compare with the rebuild
     let keep = a.keep();
+    let exact_late = AtomicUsize::new(0);
     let blank_ok = AtomicUsize::new(0);
     let blank_bad = AtomicUsize::new(0);
     let t2 = Instant::now();
-    if !dropped.is_empty() {
-        let want: HashMap<&str, usize> = dropped.iter().map(|&i| (list[i].0.as_str(), i)).collect();
-        let mut fset: Vec<usize> = dropped.iter().map(|&i| list[i].2).collect();
+    if !differ.is_empty() {
+        let want: HashMap<&str, usize> = differ.iter().map(|&i| (list[i].0.as_str(), i)).collect();
+        let mut fset: Vec<usize> = differ.iter().map(|&i| list[i].2).collect();
         fset.sort_unstable();
         fset.dedup();
         let next = AtomicUsize::new(0);
@@ -347,38 +336,33 @@ fn check_claude(a: &Args) {
                                 return;
                             }
                             let ri = db.request_index(&list[i].0).unwrap();
-                            let good = match (split::blank_dropped(body, &keep), db.rebuild(ri)) {
-                                (Ok(want), Ok(got)) => db.request(ri).is_ok_and(|r| r.digest == sha256(body)) && want == got,
-                                _ => false,
-                            };
-                            if good {
-                                blank_ok.fetch_add(1, Ordering::Relaxed);
-                            } else {
-                                blank_bad.fetch_add(1, Ordering::Relaxed);
-                                failures.lock().unwrap().push(format!("{}: rebuild differs from the log's body with dropped values blanked", r.id));
+                            match (split::blank_dropped(body, &keep), db.rebuild(ri)) {
+                                // a log line without requestDigest: compared with its body
+                                (_, Ok(got)) if list[i].1.is_none() && &got == body => _ = exact_late.fetch_add(1, Ordering::Relaxed),
+                                (Ok(want), Ok(got)) if want == got && &want != body => _ = blank_ok.fetch_add(1, Ordering::Relaxed),
+                                _ => {
+                                    blank_bad.fetch_add(1, Ordering::Relaxed);
+                                    failures.lock().unwrap().push(format!("{}: rebuild differs from the log's body, both as sent and with values not kept blanked", r.id));
+                                }
                             }
                         });
                     }
                 });
             }
         });
-        let unseen = dropped.len() - done.into_inner().unwrap().len();
+        let unseen = differ.len() - done.into_inner().unwrap().len();
         blank_bad.fetch_add(unseen, Ordering::Relaxed);
     }
     let stored_in_logs = list.len() - missing.len();
     println!("requests recorded in the logs now: {} distinct ids ({raw_lines} request lines; read in {t_read:.1}s)", list.len());
     println!("  in the store: {stored_in_logs}");
-    println!("    rebuilt byte for byte (sha256 equal to Claude Code's requestDigest and to the digest taken at ingest): {}", ok.load(Ordering::Relaxed));
-    println!("    rebuilt but different from requestDigest: {}", bad_log.load(Ordering::Relaxed));
-    println!("    rebuilt but different from the ingest digest: {}", bad_stored.load(Ordering::Relaxed));
-    if !dropped.is_empty() {
-        println!(
-            "    held values not kept (--drop), so checked against the log's body with those values blanked: {} equal, {} different ({:.1}s)",
-            blank_ok.load(Ordering::Relaxed),
-            blank_bad.load(Ordering::Relaxed),
-            t2.elapsed().as_secs_f64()
-        );
-    }
+    println!("    rebuilt byte for byte (sha256 equal to Claude Code's requestDigest): {}", ok.load(Ordering::Relaxed) + exact_late.load(Ordering::Relaxed));
+    println!(
+        "    no longer equal to requestDigest because thinking or images (or --drop values) were blanked, and equal to the log's body with them blanked: {} ({:.1}s)",
+        blank_ok.load(Ordering::Relaxed),
+        t2.elapsed().as_secs_f64()
+    );
+    println!("    different from the log's body both as sent and blanked: {}", blank_bad.load(Ordering::Relaxed));
     println!("    read errors: {}", errors.load(Ordering::Relaxed));
     println!(
         "    {} rebuilt in {secs:.1}s on {} threads ({:.0} MB/s, {:.0} requests/s)",
@@ -390,7 +374,7 @@ fn check_claude(a: &Args) {
     for f in failures.lock().unwrap().iter().take(20) {
         println!("    FAIL {f}");
     }
-    let failed = bad_log.load(Ordering::Relaxed) + bad_stored.load(Ordering::Relaxed) + errors.load(Ordering::Relaxed) + blank_bad.load(Ordering::Relaxed);
+    let failed = errors.load(Ordering::Relaxed) + blank_bad.load(Ordering::Relaxed);
     println!("  not in the store: {}", missing.len());
     if !missing.is_empty() {
         // explain each one by building it from the log again
@@ -461,7 +445,7 @@ fn stats(a: &Args) {
         mb(st.wal_bytes)
     );
     println!("  message frames {}  ({:.2}x smaller than the {} they hold)", mb(st.frame_bytes), st.node_bytes as f64 / st.frame_bytes.max(1) as f64, mb(st.node_bytes));
-    println!("  opaque values {} raw ({} values kept, {} not kept)", mb(st.opaque_bytes), st.opaques - st.opaques_dropped, st.opaques_dropped);
+    println!("  opaque values {} raw ({} values)", mb(st.opaque_bytes), st.opaques);
     println!("  shared pieces {} compressed from {} ({} pieces: skeletons, system, tools, markers)", mb(st.piece_bytes), mb(st.piece_raw_bytes), st.pieces);
     println!("  segment blocks, directories and catalogs {}; index runs {}", mb(st.index_bytes), mb(st.index_file_bytes));
     let mut sizes: Vec<u64> = db.segments().iter().map(|s| s.4).collect();
@@ -475,9 +459,9 @@ fn stats(a: &Args) {
     println!("  all data files: {} for {} of distinct text ({:.3} bytes per byte)", mb(data), mb(st.node_bytes + opaque_text), data as f64 / (st.node_bytes + opaque_text).max(1) as f64);
     if a.get("opaque").is_some() {
         let total = data.max(1) as f64;
-        println!("  opaque values by kind (kept: values, size, share of all data files; not kept: values, size they had):");
-        for (kind, n, bytes, nd, dbytes) in db.opaque_kinds().expect("opaque kinds") {
-            println!("    {:<20} {:>8}  {:>10}  {:>5.1}%    {:>8}  {:>10}", kind, n, mb(bytes), bytes as f64 * 100.0 / total, nd, mb(dbytes));
+        println!("  opaque values by kind (values, size, share of all data files):");
+        for (kind, n, bytes) in db.opaque_kinds().expect("opaque kinds") {
+            println!("    {:<20} {:>8}  {:>10}  {:>5.1}%", kind, n, mb(bytes), bytes as f64 * 100.0 / total);
         }
     }
     let mut rv: Vec<_> = runs.into_iter().collect();
@@ -768,7 +752,7 @@ fn synth_store(a: &Args) {
     let mut n = 0;
     for s in 0..a.num("sessions", 20) {
         for q in synth::session(seed, s, a.num("per", 40) as usize) {
-            db.put(&Put { session: &q.session, agent: &q.agent, id: &q.id, time: &q.time, meta: b"", body: &q.body, digest: None }).expect("put");
+            db.put(&Put { session: &q.session, agent: &q.agent, id: &q.id, time: &q.time, meta: b"", body: &q.body }).expect("put");
             n += 1;
         }
         db.commit().expect("commit");
@@ -846,7 +830,7 @@ fn crash_child(a: &Args) {
             }
             let i = *r.pick(&live);
             let q = queues[i].remove(0);
-            let o = db.put(&Put { session: &q.session, agent: &q.agent, id: &q.id, time: &q.time, meta: b"", body: &q.body, digest: None }).expect("put");
+            let o = db.put(&Put { session: &q.session, agent: &q.agent, id: &q.id, time: &q.time, meta: b"", body: &q.body }).expect("put");
             if matches!(o, PutOutcome::Stored(_)) {
                 batch.push(q.id);
             }
@@ -882,7 +866,7 @@ fn crash_test(a: &Args) {
         let no: u64 = id.split('-').nth(1).unwrap().parse().unwrap();
         if have_session.insert(no) {
             for q in synth::session(seed, no, CRASH_PER) {
-                expected.insert(q.id.clone(), sha256(&q.body));
+                expected.insert(q.id.clone(), sha256(&split::blank_dropped(&q.body, &Keep::default()).unwrap()));
             }
         }
         expected[id]
@@ -1052,8 +1036,8 @@ fn ceiling(a: &Args) {
     println!("  frames {} ({} of stored messages)", mb(seg[0]), mb(st.node_bytes));
     println!("  message/request blocks {} (raw {}), step blocks {} (raw {}), directory blocks {} (raw {}), catalogs and footers {}", mb(seg[1]), mb(seg[4]), mb(seg[2]), mb(seg[5]), mb(seg[3]), mb(seg[6]), mb(seg[7]));
     println!("  pieces {} (raw {}, {} pieces)", mb(st.piece_bytes), mb(st.piece_raw_bytes), st.pieces);
-    for (k, n, b, nd, bd) in db.opaque_kinds().expect("opaque kinds") {
-        println!("  opaque {k}: {n} values {} raw ({} as base64){}", mb(b), mb(b.div_ceil(3) * 4), if nd > 0 { format!("; {nd} not kept ({})", mb(bd)) } else { String::new() });
+    for (k, n, b) in db.opaque_kinds().expect("opaque kinds") {
+        println!("  opaque {k}: {n} values {} raw ({} as base64)", mb(b), mb(b.div_ceil(3) * 4));
     }
     println!("  blob file bytes other than pieces and opaque values {}", mb(st.blob_file_bytes - st.piece_bytes - st.opaque_bytes));
     let mut pk: std::collections::BTreeMap<u8, [u64; 4]> = Default::default();
@@ -1077,11 +1061,9 @@ fn ceiling(a: &Args) {
     let mut ofiles: Vec<_> = names.iter().map(|n| create(&format!("opq-{n}.bin"))).collect();
     let mut olens: Vec<Enc> = names.iter().map(|_| Enc::new()).collect();
     db.each_opaque(|_, kind, _, p| {
-        if let Some(p) = p {
-            let k = (kind as usize).min(names.len() - 1);
-            ofiles[k].write_all(p).unwrap();
-            olens[k].var(p.len() as u64);
-        }
+        let k = (kind as usize).min(names.len() - 1);
+        ofiles[k].write_all(p).unwrap();
+        olens[k].var(p.len() as u64);
     })
     .expect("opaque values");
     for (i, n) in names.iter().enumerate() {
@@ -1115,20 +1097,21 @@ fn ceiling(a: &Args) {
         for (p, (n, m)) in nodes.iter().zip(&msgs).enumerate() {
             n_nodes += 1;
             tree.var(if n.1 == u32::MAX { 0 } else { (p as u32 - pos_of[n.1 as usize]) as u64 });
-            match seen.get(&n.2) {
+            let key = xxhash_rust::xxh3::xxh3_128(m);
+            match seen.get(&key) {
                 Some(&g) => tree.var(g as u64 + 1),
                 None => {
-                    seen.insert(n.2, n_distinct as u32);
+                    seen.insert(key, n_distinct as u32);
                     n_distinct += 1;
                     tree.var(0);
-                    tree.var(n.3.len() as u64);
-                    stored.write_all(&n.3).unwrap();
+                    tree.var(n.2.len() as u64);
+                    stored.write_all(&n.2).unwrap();
                     full.write_all(m).unwrap();
-                    stored_bytes += n.3.len() as u64;
+                    stored_bytes += n.2.len() as u64;
                     full_bytes += m.len() as u64;
-                    holes.var(n.4.len() as u64);
+                    holes.var(n.3.len() as u64);
                     let mut prev = 0u32;
-                    for &(o, id) in &n.4 {
+                    for &(o, id) in &n.3 {
                         holes.var((o - prev) as u64);
                         prev = o;
                         holes.var(id.wrapping_sub(last_opaque).wrapping_add(1) & 0xffff_ffff);
@@ -1274,7 +1257,7 @@ fn growth(a: &Args) {
                 let mut any = false;
                 for s in queues.iter_mut() {
                     if let Some(q) = s.pop() {
-                        db.put(&Put { session: &q.session, agent: &q.agent, id: &q.id, time: &q.time, meta: b"", body: &q.body, digest: None }).expect("put");
+                        db.put(&Put { session: &q.session, agent: &q.agent, id: &q.id, time: &q.time, meta: b"", body: &q.body }).expect("put");
                         round_raw += q.body.len() as u64;
                         any = true;
                     }

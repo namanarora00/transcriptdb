@@ -9,7 +9,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-pub const MAGIC: &[u8; 8] = b"TDBWAL02";
+pub const MAGIC: &[u8; 8] = b"TDBWAL03";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyncMode {

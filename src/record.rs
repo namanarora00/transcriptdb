@@ -37,8 +37,6 @@ pub struct ReqRec {
     pub system: u32,
     pub tools: u32,
     pub notes: Box<[ReqNote]>,
-    /// sha256 of the body as it arrived.
-    pub digest: [u8; 32],
     pub layout: Option<Box<[Box<[u8]>]>>,
 }
 
@@ -71,7 +69,6 @@ impl ReqRec {
             e.var(n.offset as u64);
             e.var(n.text as u64);
         }
-        e.raw(&self.digest);
         match &self.layout {
             None => e.u8(0),
             Some(g) => {
@@ -99,7 +96,6 @@ impl ReqRec {
         for _ in 0..nn {
             notes.push(ReqNote { target: d.var32()?, offset: d.var32()?, text: d.var32()? });
         }
-        let digest: [u8; 32] = d.raw(32)?.try_into().unwrap();
         let layout = match d.u8()? {
             0 => None,
             1 => {
@@ -112,7 +108,7 @@ impl ReqRec {
             }
             _ => return corrupt("bad layout flag"),
         };
-        Ok(ReqRec { id, time, meta, session, tip, n_msgs, skeleton, system, tools, notes: notes.into_boxed_slice(), digest, layout })
+        Ok(ReqRec { id, time, meta, session, tip, n_msgs, skeleton, system, tools, notes: notes.into_boxed_slice(), layout })
     }
 }
 
@@ -133,10 +129,7 @@ pub struct NewOpaque {
     pub enc: u8,
     pub kind: u8,
     pub hash: u128,
-    /// The value; empty when it is not kept.
     pub payload: Vec<u8>,
-    /// For a value not kept: the length its payload had.
-    pub dropped: Option<u32>,
 }
 
 /// One write-ahead log record: everything one request adds to the store.
@@ -178,12 +171,9 @@ impl Mutation {
         for o in &self.opaques {
             e.var(o.id);
             e.u8(o.enc);
-            e.u8(o.kind | if o.dropped.is_some() { 0x80 } else { 0 });
+            e.u8(o.kind);
             e.u128(o.hash);
-            match o.dropped {
-                Some(n) => e.var(n as u64),
-                None => e.bytes(&o.payload),
-            }
+            e.bytes(&o.payload);
         }
         e.var(self.session as u64);
         e.var(self.nodes.len() as u64);
@@ -221,9 +211,8 @@ impl Mutation {
         let no = d.var()? as usize;
         let mut opaques = Vec::with_capacity(no);
         for _ in 0..no {
-            let (id, enc, k, hash) = (d.var()?, d.u8()?, d.u8()?, d.u128()?);
-            let (payload, dropped) = if k & 0x80 != 0 { (Vec::new(), Some(d.var32()?)) } else { (d.bytes()?.to_vec(), None) };
-            opaques.push(NewOpaque { id, enc, kind: k & 0x7f, hash, payload, dropped });
+            let (id, enc, kind, hash) = (d.var()?, d.u8()?, d.u8()?, d.u128()?);
+            opaques.push(NewOpaque { id, enc, kind, hash, payload: d.bytes()?.to_vec() });
         }
         let session = d.var32()?;
         let nn = d.var()? as usize;
@@ -259,8 +248,8 @@ mod tests {
             new_session: Some((3, "s".into(), "a".into())),
             pieces: vec![(1, PIECE_SKELETON, 99, b"sk".to_vec())],
             opaques: vec![
-                NewOpaque { id: 7, enc: 0, kind: 2, hash: 5, payload: vec![1, 2, 3], dropped: None },
-                NewOpaque { id: 8, enc: 1, kind: 1, hash: 6, payload: Vec::new(), dropped: Some(300) },
+                NewOpaque { id: 7, enc: 0, kind: 3, hash: 5, payload: vec![1, 2, 3] },
+                NewOpaque { id: 8, enc: 1, kind: 0, hash: 6, payload: b"text".to_vec() },
             ],
             session: 3,
             nodes: vec![NewNode { id: 0, parent: NONE, hash: 1, bytes: b"{}".to_vec(), holes: vec![(1, 7)] }],
@@ -275,7 +264,6 @@ mod tests {
                 system: NONE,
                 tools: NONE,
                 notes: vec![ReqNote { target: 2, offset: 1, text: 4 }].into_boxed_slice(),
-                digest: [7; 32],
                 layout: Some(vec![b" ".to_vec().into_boxed_slice()].into_boxed_slice()),
             },
         };

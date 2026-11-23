@@ -323,7 +323,7 @@ pub enum OpaqueKind {
     Document = 3,
     /// `data` of a `redacted_thinking` block.
     RedactedThinking = 4,
-    /// The text of a thinking block; cut out only when thinking is not kept.
+    /// The text of a thinking block (never kept).
     ThinkingText = 5,
 }
 
@@ -350,13 +350,11 @@ impl OpaqueKind {
     }
 }
 
-/// Which opaque values the store keeps. A value that is not kept is stored as its kind,
-/// hash and size only; requests that held it rebuild with an empty string in its place.
+/// Which opaque values the store keeps, besides the ones it never keeps: thinking (text,
+/// signatures, redacted thinking) and images are always replaced by an empty string at
+/// ingest, so requests that held them rebuild with `""` in their place.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Keep {
-    /// Thinking signatures, redacted thinking and thinking text.
-    pub thinking: bool,
-    pub images: bool,
     pub documents: bool,
     /// Long base64 strings under `signature` or `data` that match none of the above.
     pub other: bool,
@@ -364,32 +362,27 @@ pub struct Keep {
 
 impl Default for Keep {
     fn default() -> Self {
-        Keep { thinking: true, images: true, documents: true, other: true }
+        Keep { documents: true, other: true }
     }
 }
 
 impl Keep {
-    pub fn all(&self) -> bool {
-        self.thinking && self.images && self.documents && self.other
-    }
     pub fn keeps(&self, k: OpaqueKind) -> bool {
         match k {
-            OpaqueKind::Signature | OpaqueKind::RedactedThinking | OpaqueKind::ThinkingText => self.thinking,
-            OpaqueKind::Image => self.images,
+            OpaqueKind::Signature | OpaqueKind::RedactedThinking | OpaqueKind::ThinkingText | OpaqueKind::Image => false,
             OpaqueKind::Document => self.documents,
             OpaqueKind::Other => self.other,
         }
     }
-    /// Parse a comma-separated list of what not to keep: `thinking`, `images`, `documents`, `other`.
+    /// Parse a comma-separated list of what else not to keep: `documents`, `other`.
     pub fn dropping(list: &str) -> std::result::Result<Keep, String> {
         let mut k = Keep::default();
         for w in list.split(',').map(str::trim).filter(|w| !w.is_empty()) {
             match w {
-                "thinking" => k.thinking = false,
-                "images" => k.images = false,
                 "documents" => k.documents = false,
                 "other" => k.other = false,
-                _ => return Err(format!("unknown kind '{w}' (thinking, images, documents, other)")),
+                "thinking" | "images" => return Err(format!("{w} is never kept, so there is nothing to drop (documents, other)")),
+                _ => return Err(format!("unknown kind '{w}' (documents, other)")),
             }
         }
         Ok(k)
@@ -475,46 +468,72 @@ fn opaque_spans(m: &[u8], thinking_text: bool) -> Result<Vec<(Span, OpaqueKind)>
     Ok(spans)
 }
 
-/// Cut thinking signatures, base64 images and other opaque values out of a message (and
-/// thinking text, when `keep` drops thinking).
-pub fn cut_opaque(m: &[u8], keep: &Keep) -> Result<(Vec<u8>, Vec<OpaqueHole>)> {
-    let spans = opaque_spans(m, !keep.thinking)?;
+/// A message as the store keeps it: values not kept are blanked (their string content
+/// removed), the kept opaque values cut out as holes.
+pub struct Cut {
+    pub bytes: Vec<u8>,
+    pub holes: Vec<OpaqueHole>,
+    /// Content spans of the blanked values, in the message as it came.
+    pub blanked: Vec<Span>,
+}
+
+/// Blank the values `keep` does not keep, and cut the other opaque values (documents and
+/// other long base64) out of a message.
+pub fn cut_opaque(m: &[u8], keep: &Keep) -> Result<Cut> {
+    let spans = opaque_spans(m, true)?;
     if spans.is_empty() {
-        return Ok((m.to_vec(), Vec::new()));
+        return Ok(Cut { bytes: m.to_vec(), holes: Vec::new(), blanked: Vec::new() });
     }
     let eng = base64::engine::general_purpose::STANDARD;
     let mut bytes = Vec::with_capacity(m.len());
-    let mut holes = Vec::with_capacity(spans.len());
+    let mut holes = Vec::new();
+    let mut blanked = Vec::new();
     let mut pos = 0;
     for (s, kind) in spans {
         bytes.extend_from_slice(&m[pos..s.start]);
+        pos = s.end;
+        if !keep.keeps(kind) {
+            blanked.push(s);
+            continue;
+        }
         let text = &m[s.clone()];
         let (enc, payload) = match eng.decode(text) {
-            Ok(raw) if kind != OpaqueKind::ThinkingText && eng.encode(&raw).as_bytes() == text => (OpaqueEnc::Base64, raw),
+            Ok(raw) if eng.encode(&raw).as_bytes() == text => (OpaqueEnc::Base64, raw),
             _ => (OpaqueEnc::Text, text.to_vec()),
         };
         holes.push(OpaqueHole { offset: bytes.len() as u32, enc, kind, payload });
-        pos = s.end;
     }
     bytes.extend_from_slice(&m[pos..]);
-    Ok((bytes, holes))
+    Ok(Cut { bytes, holes, blanked })
 }
 
-/// A whole request body with every value `keep` drops replaced by an empty string: what
-/// the store gives back for a request that held such values. Used to check rebuilds.
-pub fn blank_dropped(body: &[u8], keep: &Keep) -> Result<Vec<u8>> {
-    let spans = opaque_spans(body, !keep.thinking)?;
-    let mut out = Vec::with_capacity(body.len());
+/// Content spans of the values `keep` does not keep, in order.
+pub fn blanked_spans(m: &[u8], keep: &Keep) -> Result<Vec<Span>> {
+    Ok(opaque_spans(m, true)?.into_iter().filter(|(_, k)| !keep.keeps(*k)).map(|(s, _)| s).collect())
+}
+
+/// `m` with the content of each of `spans` (sorted, from [`blanked_spans`]) removed.
+pub fn remove_spans(m: &[u8], spans: &[Span]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(m.len());
     let mut pos = 0;
-    for (s, kind) in spans {
-        if keep.keeps(kind) {
-            continue;
-        }
-        out.extend_from_slice(&body[pos..s.start]);
+    for s in spans {
+        out.extend_from_slice(&m[pos..s.start]);
         pos = s.end;
     }
-    out.extend_from_slice(&body[pos..]);
-    Ok(out)
+    out.extend_from_slice(&m[pos..]);
+    out
+}
+
+/// Where offset `o` of a message lands once `blanked` (sorted spans, none containing `o`)
+/// are removed.
+pub fn offset_after_blanking(o: u32, blanked: &[Span]) -> u32 {
+    o - blanked.iter().filter(|s| s.end as u32 <= o).map(|s| s.len() as u32).sum::<u32>()
+}
+
+/// A whole request body with every value `keep` does not keep replaced by an empty
+/// string: what the store gives back for it. Used to check rebuilds.
+pub fn blank_dropped(body: &[u8], keep: &Keep) -> Result<Vec<u8>> {
+    Ok(remove_spans(body, &blanked_spans(body, keep)?))
 }
 
 /// Write an opaque value back as the text it came from.
@@ -566,21 +585,31 @@ mod tests {
     fn opaque_cut_and_restore() {
         let sig = "QUJD".repeat(40);
         let img = "iVBORw0KGgo".repeat(10) + "=";
-        let m = format!(r#"{{"content":[{{"signature":"{sig}","thinking":"x","type":"thinking"}},{{"source":{{"data":"{img}","media_type":"image/png","type":"base64"}},"type":"image"}},{{"data":"short","type":"t"}}],"role":"assistant"}}"#);
-        let (cut, holes) = cut_opaque(m.as_bytes(), &Keep::default()).unwrap();
-        assert_eq!(holes.len(), 2);
-        assert_eq!((holes[0].kind, holes[1].kind), (OpaqueKind::Signature, OpaqueKind::Image));
-        assert_eq!(holes[0].enc, OpaqueEnc::Base64);
-        assert_eq!(holes[1].enc, OpaqueEnc::Text); // not canonical base64 (bad padding)
+        let pdf = "JVBERi0x".repeat(12);
+        let other = "T1RI".repeat(19) + "T1R";
+        let m = format!(
+            r#"{{"content":[{{"signature":"{sig}","thinking":"x","type":"thinking"}},{{"source":{{"data":"{img}","media_type":"image/png","type":"base64"}},"type":"image"}},{{"source":{{"data":"{pdf}","media_type":"application/pdf","type":"base64"}},"type":"document"}},{{"data":"{other}","type":"t"}},{{"data":"short","type":"t"}}],"role":"assistant"}}"#
+        );
+        let c = cut_opaque(m.as_bytes(), &Keep::default()).unwrap();
+        assert_eq!(c.holes.len(), 2);
+        assert_eq!((c.holes[0].kind, c.holes[1].kind), (OpaqueKind::Document, OpaqueKind::Other));
+        assert_eq!(c.holes[0].enc, OpaqueEnc::Base64);
+        assert_eq!(c.holes[1].enc, OpaqueEnc::Text); // not canonical base64 (length 79)
+        assert_eq!(c.blanked.len(), 3, "thinking text, signature and image are never kept");
         let mut out = Vec::new();
         let mut pos = 0;
-        for h in &holes {
-            out.extend_from_slice(&cut[pos..h.offset as usize]);
+        for h in &c.holes {
+            out.extend_from_slice(&c.bytes[pos..h.offset as usize]);
             opaque_text(h.enc, &h.payload, &mut out);
             pos = h.offset as usize;
         }
-        out.extend_from_slice(&cut[pos..]);
-        assert_eq!(out, m.as_bytes());
+        out.extend_from_slice(&c.bytes[pos..]);
+        assert_eq!(out, blank_dropped(m.as_bytes(), &Keep::default()).unwrap());
+        let s = String::from_utf8(out).unwrap();
+        assert!(s.contains(r#""signature":"","thinking":"","type":"thinking""#) && s.contains(r#"{"data":"","media_type":"image/png""#));
+        // offsets past blanked values move back by what was removed
+        let after = m.find(r#"{"data":"short""#).unwrap() as u32;
+        assert_eq!(&s.as_bytes()[offset_after_blanking(after, &c.blanked) as usize..][..15], br#"{"data":"short""#);
     }
 
     #[test]
@@ -592,19 +621,19 @@ mod tests {
         let m = format!(
             r#"{{"messages":[{{"role":"assistant","content":[{{"type":"thinking","thinking":"plan \"it\"","signature":"{sig}"}},{{"type":"redacted_thinking","data":"{red}"}},{{"type":"document","source":{{"type":"base64","media_type":"application/pdf","data":"{pdf}"}}}},{{"type":"x","data":"{other}"}}]}}]}}"#
         );
-        let kinds = |k: &Keep| opaque_spans(m.as_bytes(), !k.thinking).unwrap().into_iter().map(|x| x.1).collect::<Vec<_>>();
         use OpaqueKind::*;
-        assert_eq!(kinds(&Keep::default()), vec![Signature, RedactedThinking, Document, Other]);
-        let no_thinking = Keep::dropping("thinking").unwrap();
-        assert_eq!(kinds(&no_thinking), vec![ThinkingText, Signature, RedactedThinking, Document, Other]);
-        let blank = String::from_utf8(blank_dropped(m.as_bytes(), &no_thinking).unwrap()).unwrap();
+        let kinds = opaque_spans(m.as_bytes(), true).unwrap().into_iter().map(|x| x.1).collect::<Vec<_>>();
+        assert_eq!(kinds, vec![ThinkingText, Signature, RedactedThinking, Document, Other]);
+        let blank = String::from_utf8(blank_dropped(m.as_bytes(), &Keep::default()).unwrap()).unwrap();
         assert!(blank.contains(r#""thinking":"","signature":"""#) && blank.contains(r#""data":"""#) && blank.contains(&pdf) && blank.contains(&other));
-        let (_, holes) = cut_opaque(m.as_bytes(), &no_thinking).unwrap();
-        assert_eq!(holes[0].kind, ThinkingText);
-        assert_eq!(holes[0].enc, OpaqueEnc::Text);
-        assert_eq!(holes[0].payload, br#"plan \"it\""#.to_vec());
-        assert_eq!(blank_dropped(m.as_bytes(), &Keep::default()).unwrap(), m.as_bytes());
+        let no_docs = Keep::dropping("documents").unwrap();
+        let blank = String::from_utf8(blank_dropped(m.as_bytes(), &no_docs).unwrap()).unwrap();
+        assert!(!blank.contains(&pdf) && blank.contains(&other));
+        let c = cut_opaque(m.as_bytes(), &no_docs).unwrap();
+        assert_eq!(c.holes.len(), 1);
+        assert_eq!(c.holes[0].kind, Other);
         assert!(Keep::dropping("pictures").is_err());
-        assert_eq!(Keep::dropping("images, documents").unwrap(), Keep { images: false, documents: false, ..Keep::default() });
+        assert!(Keep::dropping("thinking").is_err());
+        assert_eq!(Keep::dropping("other, documents").unwrap(), Keep { documents: false, other: false });
     }
 }

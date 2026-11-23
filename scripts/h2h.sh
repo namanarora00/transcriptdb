@@ -3,8 +3,9 @@
 # Needs PostgreSQL (Homebrew postgresql@18). Creates a throwaway cluster and store under
 # $WORK (default $TMPDIR/transcriptdb-h2h), runs the comparison, then stops PostgreSQL and
 # deletes both (KEEP=1 keeps them). Prints counts, sizes and times only.
-#   DROP=thinking,images   build the store without those values (PostgreSQL then gets the same
-#                          blanked messages)
+# The store never keeps thinking or images, and PostgreSQL is loaded from the store, so both
+# hold the same messages with those values blanked.
+#   DROP=documents,other   blank those values too
 #   H2H_ARGS="--split x"   extra arguments for `tdb h2h` (`--split x` prints where PostgreSQL's
 #                          bytes are, `--sizes-only x` skips the queries)
 set -euo pipefail

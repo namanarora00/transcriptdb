@@ -84,7 +84,7 @@ fn core_rows(p: &CorePart) -> Vec<u8> {
     for n in &p.nodes {
         e.var(n.id as u64);
         e.var(if n.parent == u32::MAX { 0 } else { n.parent as u64 + 1 });
-        e.u128(n.hash);
+
         e.var(n.off as u64);
         e.var(n.len as u64);
         e.var(n.holes.len() as u64);
@@ -122,9 +122,7 @@ fn core_cols(p: &CorePart, with_hash: bool) -> Vec<u8> {
         c[2].var(zz(n.id as i64 - prev_id - 1));
         prev_id = n.id as i64;
         c[3].var(if n.parent == u32::MAX { 0 } else { zz(n.id as i64 - n.parent as i64) + 1 });
-        if with_hash {
-            c[4].u128(n.hash);
-        }
+        let _ = with_hash;
         c[5].var(n.len as u64);
         c[6].var(n.holes.len() as u64);
         let mut po = 0u32;
@@ -153,7 +151,6 @@ fn core_cols(p: &CorePart, with_hash: bool) -> Vec<u8> {
             c[14].var(n.offset as u64);
             c[14].var(n.text as u64);
         }
-        c[15].raw(&r.digest);
         match &r.layout {
             None => c[16].u8(0),
             Some(g) => {

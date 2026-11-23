@@ -29,7 +29,7 @@ use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-const MAGIC: &[u8; 8] = b"TDBIDX02";
+const MAGIC: &[u8; 8] = b"TDBIDX03";
 
 pub const NS_PIECE: u8 = 0;
 pub const NS_OPAQUE: u8 = 1;
@@ -89,8 +89,6 @@ pub struct PieceEnt {
 pub struct OpaqueEnt {
     pub enc: u8,
     pub kind: u8,
-    /// Not kept: no payload, and `len` is the length it had.
-    pub dropped: bool,
     pub hash: u128,
     pub file: u32,
     pub off: u64,
@@ -115,14 +113,14 @@ impl PieceEnt {
 impl OpaqueEnt {
     fn put(&self, b: &mut Vec<u8>) {
         b.push(self.enc);
-        b.push(self.kind | if self.dropped { 0x80 } else { 0 });
+        b.push(self.kind);
         b.extend_from_slice(&self.hash.to_le_bytes());
         b.extend_from_slice(&self.file.to_le_bytes());
         b.extend_from_slice(&self.off.to_le_bytes());
         b.extend_from_slice(&self.len.to_le_bytes());
     }
     fn get(b: &[u8]) -> OpaqueEnt {
-        OpaqueEnt { enc: b[0], kind: b[1] & 0x7f, dropped: b[1] & 0x80 != 0, hash: u128_at(b, 2), file: u32_at(b, 18), off: u64_at(b, 22), len: u32_at(b, 30) }
+        OpaqueEnt { enc: b[0], kind: b[1], hash: u128_at(b, 2), file: u32_at(b, 18), off: u64_at(b, 22), len: u32_at(b, 30) }
     }
 }
 
@@ -185,7 +183,6 @@ pub struct RunCat {
     pub piece_bytes: u64,
     pub piece_raw_bytes: u64,
     pub opaque_bytes: u64,
-    pub n_dropped: u64,
 }
 
 impl RunCat {
@@ -228,7 +225,7 @@ impl RunCat {
             e.u8(ns);
             e.u128(h);
         }
-        for v in [self.piece_bytes, self.piece_raw_bytes, self.opaque_bytes, self.n_dropped] {
+        for v in [self.piece_bytes, self.piece_raw_bytes, self.opaque_bytes] {
             e.var(v);
         }
         e.buf
@@ -254,7 +251,6 @@ impl RunCat {
         c.piece_bytes = d.var()?;
         c.piece_raw_bytes = d.var()?;
         c.opaque_bytes = d.var()?;
-        c.n_dropped = d.var()?;
         if !d.done() || c.ns.iter().sum::<u64>() != c.n_keys || c.top.len() != c.pages().div_ceil(FENCES) {
             return corrupt("bad index catalog");
         }
@@ -399,11 +395,7 @@ impl RunWriter {
         e.put(&mut self.ids);
         self.ids_n += 1;
         self.cat.no += 1;
-        if e.dropped {
-            self.cat.n_dropped += 1;
-        } else {
-            self.cat.opaque_bytes += e.len as u64;
-        }
+        self.cat.opaque_bytes += e.len as u64;
         if self.ids_n == IDS {
             self.flush_ids()?;
         }
@@ -654,7 +646,7 @@ mod tests {
         }
         for i in 0..no {
             let id = olo + i;
-            w.opaque(&OpaqueEnt { enc: 0, kind: 2, dropped: id.is_multiple_of(5), hash: h(id), file: 3, off: id * 3, len: 4 }).unwrap();
+            w.opaque(&OpaqueEnt { enc: 0, kind: 3, hash: h(id), file: 3, off: id * 3, len: 4 }).unwrap();
         }
         w.finish(SyncMode::Os).unwrap();
         Run::open(dir, num).unwrap()
@@ -687,7 +679,7 @@ mod tests {
         for id in [0u64, 5, 2099, 2100, 2106] {
             let IxBlock::Opaques(v) = m.block(K_OPAQUES, (id as usize) / IDS).unwrap() else { panic!() };
             let e = v[id as usize % IDS];
-            assert_eq!((e.off, e.dropped, e.hash), (id * 3, id.is_multiple_of(5), h(id)));
+            assert_eq!((e.off, e.hash), (id * 3, h(id)));
         }
         // merged adjacency is checked
         assert!(merge(&dir, 5, &[a.clone(), c.clone()], SyncMode::Os).is_err());
