@@ -22,6 +22,7 @@ pub mod matcher;
 pub mod parse;
 pub mod plan;
 pub mod reference;
+pub mod summary;
 pub mod value;
 
 use std::fmt;

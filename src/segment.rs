@@ -23,6 +23,7 @@ use crate::block::{file, handle, read_block, read_catalog, read_packed, write_bl
 use crate::bloom::{key_hash, Bloom};
 use crate::codec::{corrupt, Dec, Enc, Result};
 use crate::record::ReqRec;
+use crate::stats::StatsBuilder;
 use crate::steps::{self, StepRow};
 use crate::wal::{sync_file, SyncMode};
 use std::cell::RefCell;
@@ -33,7 +34,7 @@ use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-const SEG_MAGIC: &[u8; 8] = b"TDBSEG09";
+const SEG_MAGIC: &[u8; 8] = b"TDBSEG10";
 /// Raw bytes per group block of encoded parts, and per directory block.
 const GROUP: usize = 64 * 1024;
 /// Bloom filter bits per key: about 0.2% false positives.
@@ -78,6 +79,8 @@ pub struct StepPart {
     /// (field, value as JSON text)
     pub values: Vec<(u32, Vec<u8>)>,
     pub longs: Vec<(u32, u32)>,
+    /// JSON text of each of `longs`, for the summaries (filled when writing, not when reading).
+    pub long_text: Vec<Vec<u8>>,
 }
 
 /// Where a session's part sits: (block, offset in the decompressed block, length).
@@ -126,6 +129,9 @@ pub struct SegCat {
     pub node_bytes: u64,
     /// The zstd dictionary the frames were compressed with (merged segments), if any.
     pub dict: Option<BlockRef>,
+    /// The step summaries (`stats.rs`) and their size on disk.
+    pub stats: Option<BlockRef>,
+    pub stats_bytes: u64,
 }
 
 impl SegCat {
@@ -165,6 +171,14 @@ impl SegCat {
                 r.encode(&mut e);
             }
         }
+        match &self.stats {
+            None => e.u8(0),
+            Some(r) => {
+                e.u8(1);
+                r.encode(&mut e);
+                e.var(self.stats_bytes);
+            }
+        }
         e.buf
     }
 
@@ -193,6 +207,14 @@ impl SegCat {
             1 => Some(BlockRef::decode(&mut d)?),
             _ => return corrupt("bad segment catalog"),
         };
+        match d.u8()? {
+            0 => {}
+            1 => {
+                c.stats = Some(BlockRef::decode(&mut d)?);
+                c.stats_bytes = d.var()?;
+            }
+            _ => return corrupt("bad segment catalog"),
+        }
         if !d.done() || c.dirs.windows(2).any(|w| w[0].0 > w[1].0) || (c.sessions > 0) != !c.dirs.is_empty() {
             return corrupt("bad segment catalog");
         }
@@ -244,10 +266,15 @@ fn unopt_id(v: u64) -> Result<u32> {
     if v == 0 { Ok(u32::MAX) } else { u32::try_from(v - 1).map_err(|_| crate::codec::Error::Corrupt("id over u32".into())) }
 }
 
-fn put_columns(cols: Vec<Enc>, e: &mut Enc) {
+/// Write each column with its length; returns where each column's bytes start in `e`.
+fn put_columns(cols: Vec<Enc>, e: &mut Enc) -> Vec<usize> {
+    let mut starts = Vec::with_capacity(cols.len());
     for c in cols {
-        e.bytes(&c.buf);
+        e.var(c.buf.len() as u64);
+        starts.push(e.buf.len());
+        e.raw(&c.buf);
     }
+    starts
 }
 
 fn get_columns<'a>(d: &mut Dec<'a>, n: usize) -> Result<Vec<Dec<'a>>> {
@@ -438,14 +465,19 @@ pub fn decode_core(b: &[u8]) -> Result<CorePart> {
 
 const STEP_COLS: usize = 12;
 
-fn encode_steps(p: &StepPart, e: &mut Enc) {
+/// Encode a step part; returns where each value's text starts in the encoding.
+fn encode_steps(p: &StepPart, e: &mut Enc) -> Vec<u32> {
+    let base = e.buf.len();
+    let mut at = Vec::with_capacity(p.values.len());
     let mut c: Vec<Enc> = (0..STEP_COLS).map(|_| Enc::new()).collect();
     c[0].var(p.first as u64);
     c[0].var(p.values.len() as u64);
     c[0].var(p.rows.len() as u64);
     for (f, v) in &p.values {
         c[1].var(*f as u64);
-        c[2].bytes(v);
+        c[2].var(v.len() as u64);
+        at.push(c[2].buf.len() as u32);
+        c[2].raw(v);
     }
     let (mut pc, mut pt) = (0i64, 0i64);
     for (i, (r, fs)) in p.rows.iter().zip(&p.fields).enumerate() {
@@ -473,7 +505,13 @@ fn encode_steps(p: &StepPart, e: &mut Enc) {
             }
         }
     }
-    put_columns(c, e);
+    // the values are column 2: move each position from the column to the whole encoding
+    let starts = put_columns(c, e);
+    let col = (starts[2] - base) as u32;
+    for a in &mut at {
+        *a += col;
+    }
+    at
 }
 
 pub fn decode_steps(b: &[u8]) -> Result<StepPart> {
@@ -528,7 +566,7 @@ pub fn decode_steps(b: &[u8]) -> Result<StepPart> {
     if c.iter().any(|x| !x.done()) {
         return corrupt("trailing bytes in a step part");
     }
-    Ok(StepPart { first, rows, fields, values, longs })
+    Ok(StepPart { first, rows, fields, values, longs, long_text: Vec::new() })
 }
 
 fn encode_dir(dir: &[DirEnt]) -> Vec<u8> {
@@ -675,6 +713,7 @@ pub struct SegWriter {
     steps_waiting: Vec<usize>,
     pending: Vec<Pending>,
     pending_raw: usize,
+    stats: StatsBuilder,
 }
 
 impl SegWriter {
@@ -703,6 +742,7 @@ impl SegWriter {
             steps_waiting: Vec::new(),
             pending: Vec::new(),
             pending_raw: 0,
+            stats: StatsBuilder::default(),
         })
     }
 
@@ -826,7 +866,8 @@ impl SegWriter {
         self.core_buf.extend_from_slice(&e.buf);
         self.core_waiting.push(i);
         let mut e = Enc::new();
-        encode_steps(steps, &mut e);
+        let value_at = encode_steps(steps, &mut e);
+        self.stats.add_part(session, &key, steps, &steps.long_text, &value_at)?;
         let steps_ref = (BlockRef::default(), self.steps_buf.len() as u32, e.buf.len() as u32);
         self.steps_buf.extend_from_slice(&e.buf);
         self.steps_waiting.push(i);
@@ -876,6 +917,17 @@ impl SegWriter {
         self.flush_pending()?;
         self.seal(false)?;
         self.seal(true)?;
+        let stats = std::mem::take(&mut self.stats);
+        let (f, pos) = (&mut self.f, &mut self.pos);
+        let mut stats_bytes = 0u64;
+        let step_refs: Vec<PartRef> = self.dir.iter().map(|d| d.steps).collect();
+        let head = stats.finish(&step_refs, &mut |raw| {
+            let r = write_block(f, pos, raw, 3)?;
+            stats_bytes += r.clen as u64;
+            Ok(r)
+        })?;
+        self.cat.stats = Some(head);
+        self.cat.stats_bytes = stats_bytes;
         // the directory in blocks of about GROUP bytes, each starting at a new entry
         let mut a = 0;
         while a < self.dir.len() {

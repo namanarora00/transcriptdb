@@ -44,6 +44,19 @@ pub struct QStats {
     pub plan_ms: f64,
     pub scan_ms: f64,
     pub rest_ms: f64,
+    /// Segments whose step summaries answered the query (0: steps were scanned).
+    pub summary_segments: usize,
+    pub summarized: bool,
+}
+
+thread_local! {
+    static SUMMARIES: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+/// Whether queries on this thread may read step summaries (on by default). Checks turn it
+/// off to compare against the step scan.
+pub fn set_summaries(on: bool) {
+    SUMMARIES.with(|c| c.set(on));
 }
 
 pub struct RowCtx<'a> {
@@ -81,7 +94,7 @@ impl Ctx for RowCtx<'_> {
     }
 }
 
-fn now_ms() -> i64 {
+pub fn now_ms() -> i64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
 }
 
@@ -142,6 +155,10 @@ pub struct Compiled {
     pub excl: Vec<Test>,
     pub vars: Vec<String>,
     pub eq: Option<(String, Vec<usize>)>,
+    /// Per shape code, a step's whole mask when tool and outcome decide every test.
+    pub shape_masks: Box<[Option<u64>; 256]>,
+    /// Whether a test reads input values (else sessions' steps are read without them).
+    pub reads_values: bool,
 }
 
 pub fn compile_pattern(db: &Db, p: &Pattern, pre: &Sp, now: i64) -> Result<Compiled, QError> {
@@ -175,7 +192,23 @@ pub fn compile_pattern(db: &Db, p: &Pattern, pre: &Sp, now: i64) -> Result<Compi
             _ => return Err(QError::new("element comparisons work on input fields for now (such as a.file_path == c.file_path)")),
         },
     };
-    Ok(Compiled { spec, elems, excl, vars, eq })
+    let mut shape_masks = Box::new([None; 256]);
+    for (code, slot) in shape_masks.iter_mut().enumerate() {
+        let mut m = 0u64;
+        let mut all = true;
+        for (bit, t) in elems.iter().enumerate().chain(excl.iter().enumerate().map(|(x, t)| (32 + x, t))) {
+            match t.shape.as_ref().and_then(|tab| tab[code]) {
+                Some(true) => m |= 1 << bit,
+                Some(false) => {}
+                None => all = false,
+            }
+        }
+        if all {
+            *slot = Some(m);
+        }
+    }
+    let reads_values = elems.iter().chain(&excl).any(|t| t.sp.reads_values());
+    Ok(Compiled { spec, elems, excl, vars, eq, shape_masks, reads_values })
 }
 
 /// Partition key of a step for an equality constraint: the dictionary code, or the full
@@ -199,7 +232,7 @@ pub fn eq_key(db: &Db, s: u32, pos: u32, field: &str) -> Result<Option<EqKey>, Q
 
 /// Matches of a compiled pattern in one session.
 pub fn session_matches(db: &Db, c: &Compiled, s: u32, now: i64, scanned: &AtomicUsize) -> Result<Option<Vec<Match>>, QError> {
-    let ss_arc = db.steps(s);
+    let ss_arc = if c.reads_values { db.try_steps(s) } else { db.light_steps(s) }.map_err(|e| QError::new(e.to_string()))?;
     let ss = &*ss_arc;
     if ss.rows.is_empty() {
         return Ok(None);
@@ -210,55 +243,184 @@ pub fn session_matches(db: &Db, c: &Compiled, s: u32, now: i64, scanned: &Atomic
         }
     }
     scanned.fetch_add(ss.rows.len(), Ordering::Relaxed);
-    let mut masks = vec![0u64; ss.rows.len()];
-    for (pos, m) in masks.iter_mut().enumerate() {
-        let pos = pos as u32;
-        for (k, t) in c.elems.iter().enumerate() {
-            if t.test(db, s, ss, pos, now)? {
-                *m |= 1 << k;
+    let mut masks = MASKS.with(|b| std::mem::take(&mut *b.borrow_mut()));
+    masks.clear();
+    masks.resize(ss.rows.len(), 0);
+    let r = session_matches_in(db, c, s, ss, now, &mut masks);
+    MASKS.with(|b| *b.borrow_mut() = masks);
+    r
+}
+
+thread_local! {
+    /// Per-step masks, kept between sessions so each does not allocate its own.
+    static MASKS: std::cell::RefCell<Vec<u64>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn session_matches_in(db: &Db, c: &Compiled, s: u32, ss: &steps::SessionSteps, now: i64, masks: &mut [u64]) -> Result<Option<Vec<Match>>, QError> {
+    // masks by shape code: whole groups of steps at once where tool and outcome decide every
+    // test, step by step elsewhere; `active` gets the steps passing some element
+    let mut active: Vec<u32> = Vec::new();
+    if c.eq.is_none() {
+        // every step's mask, in order
+        for (pos, m) in masks.iter_mut().enumerate() {
+            if let Some(x) = c.shape_masks[ss.shape[pos] as usize] {
+                *m = x;
+                continue;
             }
-        }
-        for (x, t) in c.excl.iter().enumerate() {
-            if t.test(db, s, ss, pos, now)? {
-                *m |= 1 << (32 + x);
+            let pos = pos as u32;
+            for (k, t) in c.elems.iter().enumerate() {
+                if t.test(db, s, ss, pos, now)? {
+                    *m |= 1 << k;
+                }
+            }
+            for (x, t) in c.excl.iter().enumerate() {
+                if t.test(db, s, ss, pos, now)? {
+                    *m |= 1 << (32 + x);
+                }
             }
         }
     }
+    let by = ss.by_shape();
+    for code in 0..=255u8 {
+        if c.eq.is_none() {
+            break;
+        }
+        let ps = by.of(code);
+        if ps.is_empty() {
+            continue;
+        }
+        match c.shape_masks[code as usize] {
+            Some(0) => {}
+            Some(x) => {
+                for &p in ps {
+                    masks[p as usize] = x;
+                }
+                if x as u32 != 0 {
+                    active.extend_from_slice(ps);
+                }
+            }
+            None => {
+                for &pos in ps {
+                    let mut m = 0u64;
+                    for (k, t) in c.elems.iter().enumerate() {
+                        if t.test(db, s, ss, pos, now)? {
+                            m |= 1 << k;
+                        }
+                    }
+                    for (x, t) in c.excl.iter().enumerate() {
+                        if t.test(db, s, ss, pos, now)? {
+                            m |= 1 << (32 + x);
+                        }
+                    }
+                    masks[pos as usize] = m;
+                    if m as u32 != 0 {
+                        active.push(pos);
+                    }
+                }
+            }
+        }
+    }
+    active.sort_unstable();
+    let masks: &[u64] = masks;
     let mut out = Vec::new();
     match &c.eq {
-        None => matcher::run(&c.spec, ss, &masks, &mut out),
+        None => matcher::run(&c.spec, ss, masks, &mut out),
         Some((field, ks)) => {
             let bits: u64 = ks.iter().fold(0, |a, &k| a | 1 << k);
-            let mut keys: Vec<Option<u32>> = Vec::with_capacity(ss.rows.len());
-            // distinct values, with the compared elements each value has a step for
-            let mut ids: HashMap<EqKey, u32> = HashMap::new();
+            let fcode = db.step_dicts().fields.code(field.as_bytes());
+            // (step, value id) of the steps a compared element passes, with each distinct
+            // value (dictionary codes by array, long values by text) and the compared
+            // elements it has a step for
+            let mut keys: Vec<(u32, u32)> = Vec::new();
+            let mut by_code: Vec<u32> = vec![u32::MAX; fcode.map_or(0, |f| ss.value_count(f))];
+            let mut longs: HashMap<Vec<u8>, u32> = HashMap::new();
             let mut seen: Vec<u64> = Vec::new();
-            for (pos, m) in masks.iter().enumerate() {
-                let k = if m & bits != 0 { eq_key(db, s, pos as u32, field)? } else { None };
-                keys.push(k.map(|k| {
-                    let n = ids.len() as u32;
-                    let id = *ids.entry(k).or_insert(n);
-                    if id == n {
-                        seen.push(0);
+            for &pos in &active {
+                let m = masks[pos as usize];
+                if let Some(f) = fcode
+                    && m & bits != 0
+                    && let Some(&(_, v)) = ss.fields_of(pos).iter().find(|x| x.0 == f)
+                {
+                    let n = seen.len() as u32;
+                    let i = if steps::is_long(v) {
+                        plan::long_value(db, s, ss, pos, v, field)?.map(|raw| *longs.entry(raw).or_insert(n))
+                    } else {
+                        let slot = &mut by_code[v as usize];
+                        if *slot == u32::MAX {
+                            *slot = n;
+                        }
+                        Some(*slot)
+                    };
+                    if let Some(i) = i {
+                        if i == n {
+                            seen.push(0);
+                        }
+                        seen[i as usize] |= m & bits;
+                        keys.push((pos, i));
                     }
-                    seen[id as usize] |= m & bits;
-                    id
-                }));
+                }
             }
-            let mut part = vec![0u64; masks.len()];
-            for (v, &have) in seen.iter().enumerate() {
-                if have != bits {
-                    continue; // some compared element never sees this value
-                }
-                let mut start = usize::MAX;
-                for (pos, (m, k)) in masks.iter().zip(&keys).enumerate() {
-                    part[pos] = if *k == Some(v as u32) { *m } else { m & !bits };
-                    if start == usize::MAX && part[pos] & 1 == 1 {
-                        start = pos;
+            if !seen.contains(&bits) {
+                // no value is seen by every compared element
+            } else if bits == (1u64 << c.spec.n) - 1 {
+                // every element is compared: only steps with the value can bind, so each
+                // value visits just its own turns
+                let turns = ss.turns();
+                let nt = turns.depth.len();
+                let mut gx = vec![0u64; nt];
+                if !c.spec.excl.is_empty() {
+                    for (pos, m) in masks.iter().enumerate() {
+                        gx[turns.of[pos] as usize] |= m >> 32;
                     }
                 }
-                if start != usize::MAX {
-                    matcher::run_from(&c.spec, ss, &part, start, &mut out);
+                let mut xs: Vec<Vec<u32>> = vec![vec![0; nt]; c.spec.excl.len()];
+                for (x, cnt) in xs.iter_mut().enumerate() {
+                    for g in 0..nt {
+                        let up = if turns.parent[g] == NONE { 0 } else { cnt[turns.parent[g] as usize] };
+                        cnt[g] = up + (gx[g] >> x & 1) as u32;
+                    }
+                }
+                // steps of each value seen by every compared element, in one array by value
+                let mut at = vec![0u32; seen.len() + 1];
+                for &(_, v) in &keys {
+                    if seen[v as usize] == bits {
+                        at[v as usize + 1] += 1;
+                    }
+                }
+                for v in 0..seen.len() {
+                    at[v + 1] += at[v];
+                }
+                let mut fill = at.clone();
+                let mut flat = vec![(0u32, 0u64); at[seen.len()] as usize];
+                for &(pos, v) in &keys {
+                    if seen[v as usize] == bits {
+                        flat[fill[v as usize] as usize] = (pos, masks[pos as usize]);
+                        fill[v as usize] += 1;
+                    }
+                }
+                for v in 0..seen.len() {
+                    matcher::run_sparse(&c.spec, &turns, &gx, &xs, &flat[at[v] as usize..at[v + 1] as usize], &mut out);
+                }
+            } else {
+                let mut key_of: Vec<u32> = vec![u32::MAX; masks.len()];
+                for &(pos, v) in &keys {
+                    key_of[pos as usize] = v;
+                }
+                let mut part = vec![0u64; masks.len()];
+                for (v, &have) in seen.iter().enumerate() {
+                    if have != bits {
+                        continue; // some compared element never sees this value
+                    }
+                    let mut start = usize::MAX;
+                    for (pos, (m, k)) in masks.iter().zip(&key_of).enumerate() {
+                        part[pos] = if *k == v as u32 { *m } else { m & !bits };
+                        if start == usize::MAX && part[pos] & 1 == 1 {
+                            start = pos;
+                        }
+                    }
+                    if start != usize::MAX {
+                        matcher::run_from(&c.spec, ss, &part, start, &mut out);
+                    }
                 }
             }
             out.sort();
@@ -269,6 +431,10 @@ pub fn session_matches(db: &Db, c: &Compiled, s: u32, now: i64, scanned: &Atomic
 }
 
 fn parallel<T: Send>(n: usize, threads: usize, f: impl Fn(u32) -> Result<T, QError> + Sync) -> Result<Vec<(u32, T)>, QError> {
+    if threads <= 1 {
+        // on the caller's thread: no thread to start, and per-thread caches stay warm
+        return (0..n as u32).map(|i| f(i).map(|v| (i, v))).collect();
+    }
     let next = AtomicUsize::new(0);
     let out: Mutex<Vec<(u32, T)>> = Mutex::new(Vec::new());
     let err: Mutex<Option<QError>> = Mutex::new(None);
@@ -320,8 +486,23 @@ pub fn run(db: &Db, q: &Query, threads: usize) -> Result<Run, QError> {
         i += 1;
     }
     let scanned = AtomicUsize::new(0);
-    let mut table = match q.stages.get(i) {
-        Some(Stage::Match(p)) => {
+    // `where ... | summarize`: from the segments' step summaries when they can answer it
+    let mut from_summaries: Option<Table> = None;
+    if let Some(Stage::Summarize { aggs, by }) = q.stages.get(i)
+        && SUMMARIES.with(|c| c.get())
+    {
+        st.plan_ms = t0.elapsed().as_secs_f64() * 1e3;
+        let t1 = Instant::now();
+        if let Some((t, used)) = super::summary::try_run(db, &pre, aggs, by, &q.stages[i + 1..], now, &mut st)? {
+            st.summarized = true;
+            from_summaries = Some(t);
+            i += 1 + used;
+        }
+        st.scan_ms = t1.elapsed().as_secs_f64() * 1e3;
+    }
+    let mut table = match (from_summaries, q.stages.get(i)) {
+        (Some(t), _) => t,
+        (None, Some(Stage::Match(p))) => {
             i += 1;
             let c = compile_pattern(db, p, &pre, now)?;
             st.plan_ms = t0.elapsed().as_secs_f64() * 1e3;
@@ -338,12 +519,13 @@ pub fn run(db: &Db, q: &Query, threads: usize) -> Result<Run, QError> {
             st.matches = rows.len();
             Table { kind: Kind::Matches(c.vars), cols: Vec::new(), rows }
         }
-        _ => {
+        (None, _) => {
+            let reads_values = pre.reads_values();
             let test = Test::new(db, pre, now);
             st.plan_ms = t0.elapsed().as_secs_f64() * 1e3;
             let t1 = Instant::now();
             let per = parallel(db.session_count(), threads, |s| {
-                let ss_arc = db.steps(s);
+                let ss_arc = if reads_values { db.try_steps(s) } else { db.light_steps(s) }.map_err(|e| QError::new(e.to_string()))?;
                 let ss = &*ss_arc;
                 if !test.possible_in(db, ss, s, now)? {
                     return Ok(None);
@@ -372,7 +554,9 @@ pub fn run(db: &Db, q: &Query, threads: usize) -> Result<Run, QError> {
             Table { kind: Kind::Steps, cols: Vec::new(), rows }
         }
     };
-    st.steps_scanned = scanned.load(Ordering::Relaxed);
+    if !st.summarized {
+        st.steps_scanned = scanned.load(Ordering::Relaxed);
+    }
     let t2 = Instant::now();
     let rest = &q.stages[i..];
     let mut k = 0;
@@ -678,22 +862,31 @@ fn fast_summarize(db: &Db, t: &Table, aggs: &[(String, AggFn, Option<Expr>)], by
                 let name = String::from_utf8_lossy(sd.fields.get(f)).into_owned();
                 match plan::long_value(db, s, ss, pos, v, &name)? {
                     None => NULL,
-                    Some(raw) => {
-                        let n = long_ids.len() as u64;
-                        *long_ids.entry(raw.clone()).or_insert_with(|| {
-                            longs.push(raw);
-                            LONG_TAG | n
-                        })
-                    }
+                    Some(raw) => match super::value::group_key(&raw) {
+                        None => NULL,
+                        Some(k) => {
+                            let n = long_ids.len() as u64;
+                            *long_ids.entry(k).or_insert_with(|| {
+                                longs.push(raw);
+                                LONG_TAG | n
+                            })
+                        }
+                    },
                 }
             }
             Some(&(_, v)) => *sess_vals.entry((f, v)).or_insert_with(|| {
-                let text = ss.value(f, v).to_vec();
-                let n = val_names.len() as u64;
-                *val_ids.entry((f, text.clone())).or_insert_with(|| {
-                    val_names.push(text);
-                    n
-                })
+                // values group by what they decode to (see `group_key`)
+                let text = ss.value(f, v);
+                match super::value::group_key(text) {
+                    None => NULL,
+                    Some(k) => {
+                        let n = val_names.len() as u64;
+                        *val_ids.entry((f, k)).or_insert_with(|| {
+                            val_names.push(text.to_vec());
+                            n
+                        })
+                    }
+                }
             }),
         })
     };
