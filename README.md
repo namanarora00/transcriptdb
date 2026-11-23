@@ -109,6 +109,8 @@ nothing per key or per block in it.
 - **Unflushed data** (up to 64 MB), and **caches with fixed budgets** (256 MB in all by default)
   for sessions, steps (with each session's turn tree and steps by shape code), segment blocks,
   directory blocks, index blocks, pieces and decoded step-summary blocks (1/12 of the budget),
+  sessions' steps with only the fields queries tested (1/16), the texts summaries confirmed and
+  the long input values queries read (1/32 each),
   plus the merged segments' dictionaries (32 MB, shared) and, per thread reading, decode
   buffers for the last segments with a dictionary it read (the dictionary plus 256 KB, or plus
   4 MB once it reads a cold run; up to 16 MB in all) and decompressed frames (8 MB).
@@ -268,7 +270,8 @@ value written with `\/`.
 What the summaries cost (2026-11-23): 1.6 MB on the 200-file sample's store
 (124.8 MB in all; postings 0.73 MB, words 0.34, rows and listed steps 0.24, values 0.25, part
 tables 0.04), which main stored in 123.1 MB the same day: +1.2%. On every log: 8.1 MB of 585.5 MB
-(1.4%). Ingest: the build before this branch and this one, run back to back on the same 200 files
+(1.4%). Those stores still kept thinking and images; in the store that never keeps them the same
+1.6 MB is 8% of 19.8 MB, which is what takes the head-to-head from 7.24x to 6.74x (see there). Ingest: the build before this branch and this one, run back to back on the same 200 files
 (load 5–7), went through the write path at 769–817 MB/s and 870–875 MB/s, so no cost shows above
 the noise; flushes write 1.3% more bytes; compacting that store takes about 0.3 s more (1.0 s
 against 0.6–0.8 s), for splitting values into words and finding equal values at every flush and
@@ -335,57 +338,91 @@ aggregations on their rows, reads on the bytes returned. Settings: shared_buffer
 every query pays a client round trip (about 0.1 ms) that the in-process engine does not; that
 matters for the sub-millisecond rows below.
 
-Measured 2026-11-23 with thinking and images never stored (PostgreSQL is loaded from the store,
-so it holds the same blanked messages) and cold sessions in runs, on 200 log files (seed 7, from
-the 1,730 files that existed before 14:43 that day: `BORN_BEFORE=1795425000`): 156 sessions, 20,567
-requests, 26,565 steps, 95.9 MB of distinct message text; 139 of the 156 sessions are cold (last
-request more than 7 days before the newest). Every answer matched (16 of 16 queries, 1,056 of 1,056
-reads, including 300 whole requests rebuilt from each side). Each query best of 7, at load 3–4.
+Measured 2026-11-23 on the build that has both the storage work and the step summaries (commit
+9032b4f): thinking and images never stored (PostgreSQL is loaded from the store, so it holds the
+same blanked messages), cold sessions in runs, each query best of 7 on one thread, at load 4–5.
+Two sizes of the same logs (`BORN_BEFORE=1795425000`): 200 files (seed 7) and every file
+(`FILES=100000`). Every answer matched at both sizes: 16 of 16 queries and every read, including
+300 whole requests rebuilt from each side.
 
-| | TranscriptDB | PostgreSQL |
+| | 200 files | Every file |
 |---|---|---|
-| Disk (tables, indexes, TOAST) | 18.0 MB | 130.7 MB (7.24x) |
+| Sessions, requests, steps | 156; 20,824; 26,818 | 1,068; 129,056; 149,424 |
+| Distinct message text | 96.6 MB | 612.8 MB |
+| TranscriptDB | 19.6 MB | 121.6 MB |
+| PostgreSQL (tables, indexes, TOAST) | 132.3 MB (6.74x) | 771.0 MB (6.34x) |
 
-| Query | TDB, 1 thread | TDB, 8 threads | PostgreSQL | PG / TDB (1 thread) |
+| Query | 200 files: TDB | PostgreSQL | PG / TDB | Every file: TDB | PostgreSQL | PG / TDB |
+|---|---|---|---|---|---|---|
+| Bash, then Edit, then Bash; no Read between | 0.705 ms | 404 ms | 574x | 3.92 ms | 1,830 ms | 466x |
+| Bash fails, only test files edited, Bash passes | 0.740 ms | 711 ms | 961x | 4.53 ms | 3,355 ms | 740x |
+| 3 Read/Grep turns in a row, then Edit | 0.212 ms | 25.3 ms | 119x | 1.12 ms | 139 ms | 125x |
+| Bash fails, then passes the next turn | 0.390 ms | 22.6 ms | 58x | 2.32 ms | 119 ms | 51x |
+| Edit, then Bash within 3 turns | 0.255 ms | 17.2 ms | 67x | 1.42 ms | 82.4 ms | 58x |
+| Write a file, later Read the same file | 0.048 ms | 3.19 ms | 66x | 0.281 ms | 14.6 ms | 52x |
+| 3 failing turns in a row | 0.377 ms | 22.0 ms | 58x | 2.23 ms | 118 ms | 53x |
+| WebSearch, then WebFetch the next turn | 0.058 ms | 21.3 ms | 367x | 0.312 ms | 115 ms | 368x |
+| Steps per tool, top 10 | 0.010 ms | 0.904 ms | 91x | 0.036 ms | 4.79 ms | 132x |
+| Failure rate per tool | 0.025 ms | 2.26 ms | 89x | 0.073 ms | 9.08 ms | 124x |
+| Bash steps and failures per week | 0.013 ms | 1.97 ms | 152x | 0.053 ms | 15.3 ms | 286x |
+| Sessions with the most failed steps | 0.013 ms | 1.11 ms | 84x | 0.049 ms | 11.1 ms | 226x |
+| Most edited files | 0.023 ms | 0.602 ms | 26x | 0.106 ms | 4.42 ms | 42x |
+| Average output size per tool | 0.020 ms | 2.41 ms | 119x | 0.056 ms | 9.06 ms | 162x |
+| Sessions using browser tools, per day | 0.020 ms | 3.63 ms | 178x | 0.056 ms | 23.4 ms | 415x |
+| Commands running `git commit` | 0.236 ms | 24.7 ms | 105x | 1.46 ms | 135 ms | 92x |
+
+| Read (median / p95 per item) | 200 files: TDB | PostgreSQL | Every file: TDB | PostgreSQL |
 |---|---|---|---|---|
-| Bash, then Edit, then Bash; no Read between | 0.85 ms | 0.30 ms | 398 ms | 466x |
-| Bash fails, only test files edited, Bash passes | 0.81 ms | 0.30 ms | 717 ms | 888x |
-| 3 Read/Grep turns in a row, then Edit | 0.27 ms | 0.16 ms | 25.5 ms | 93x |
-| Bash fails, then passes the next turn | 0.49 ms | 0.23 ms | 22.6 ms | 47x |
-| Edit, then Bash within 3 turns | 0.34 ms | 0.18 ms | 17.3 ms | 51x |
-| Write a file, later Read the same file | 1.47 ms | 1.27 ms | 3.15 ms | 2.1x |
-| 3 failing turns in a row | 0.42 ms | 0.19 ms | 22.0 ms | 52x |
-| WebSearch, then WebFetch the next turn | 0.10 ms | 0.10 ms | 21.4 ms | 218x |
-| Steps per tool, top 10 | 0.32 ms | 0.36 ms | 0.89 ms | 2.8x |
-| Failure rate per tool | 0.36 ms | 0.42 ms | 2.27 ms | 6.2x |
-| Bash steps and failures per week | 0.40 ms | 0.44 ms | 1.98 ms | 5.0x |
-| Sessions with the most failed steps | 0.10 ms | 0.15 ms | 1.15 ms | 11x |
-| Most edited files | 0.51 ms | 0.48 ms | 0.63 ms | 1.2x |
-| Average output size per tool | 0.35 ms | 0.40 ms | 2.42 ms | 6.9x |
-| Sessions using browser tools, per day | 0.15 ms | 0.19 ms | 3.59 ms | 24x |
-| Commands running `git commit` | 29.5 ms | 11.3 ms | 24.3 ms | **0.8x** |
+| A request's messages in order | 0.42 / 1.6 ms | 1.02 / 2.6 ms | 0.56 / 2.2 ms | 1.67 / 4.4 ms |
+| 20 steps with their call and result messages | 0.17 / 0.76 ms | 0.39 / 1.5 ms | 0.30 / 0.80 ms | 0.64 / 2.1 ms |
+| A whole session's messages | 0.22 / 0.89 ms | 0.77 / 3.1 ms | 0.30 / 1.1 ms | 1.08 / 6.8 ms |
+| A whole request rebuilt | 0.49 / 1.6 ms | 1.75 / 4.0 ms | 0.59 / 2.3 ms | 1.77 / 5.2 ms |
 
-| Read (median / p95 per item) | TranscriptDB | PostgreSQL |
-|---|---|---|
-| A request's messages in order | 0.43 / 1.6 ms | 1.03 / 2.8 ms |
-| 20 steps with their call and result messages | 0.18 / 0.79 ms | 0.41 / 1.7 ms |
-| A whole session's messages | 0.21 / 0.82 ms | 0.79 / 2.6 ms |
-| A whole request rebuilt | 0.53 / 1.6 ms | 1.81 / 4.0 ms |
+The targets for this build: the eight pattern queries each at least 50 times faster than
+PostgreSQL, the other eight each at least 20 times, at both sizes, in a store at least 7 times
+smaller. The speed targets are met (closest: 51x and 26x). **The size target is not: 6.74x on the
+sample, 6.34x on every file.**
 
-One query is now slower than PostgreSQL on one thread: `git commit` (29.5 against 24.3 ms; on 8
-threads 11.3 ms). It tests `command`, and the 393 commands over 4 KB are read from the call's
-message, which in a cold session means decoding a whole run (with 64 KB frames the query took
-16.7 ms). Copying input values over 4 KB of cold sessions into their step parts would fix it for
-0.49 MB (`command` only) or 1.42 MB (every field) on this sample (`examples/longs_exp.rs`); not
-done. With every session in 64 KB frames (`--cold-mb 0`) the store is 20.1 MB and every query is
-faster on one thread (closest: most edited files 1.3x, `git commit` 1.5x). Before PostgreSQL held
-what rebuilding needs, it was 127.7 MB on the same data (126.9 MB on the earlier run): skeletons,
-pieces and request metadata cost it 3.0 MB. Earlier runs, when the store kept every value:
-2026-11-22 on another 200-file sample, 67.5 against 168.4 MB (2.49x), all answers equal and every
-query faster; on 2026-11-23 before this work, 106.6 against 250.5 MB (2.35x). The first run of the
-comparison (before the fixes below) lost three: `command contains ...` over long commands (278 ms
-against 17), the same-file pattern (7.3 ms against 1.7) and most edited files (0.72 against 0.46).
-What changed:
+Where the size went. The storage work alone (5878bda) measured 18.0 against 130.7 MB (7.24x) with
+one query slower than PostgreSQL. The step summaries added 1.6 MB on the sample, nearly what the
+step blocks themselves take (1.8 MB): word postings 0.75 MB, word lists 0.34, listed steps and
+value rows 0.25, values 0.26; `command` alone is 0.75 MB (`examples/stats_exp.rs`, at zstd level
+3). They are now written at the merge's level (19.8 → 19.6 MB). Measured and not built
+(`examples/words_exp.rs`): postings numbered by distinct text, without words held by more than
+1/16 of a field's texts and without the words of values over 4 KB, 0.73 → 0.42 MB; word lists
+front-coded, 0.30 → 0.25 MB. That would not reach 7x either. What would is a change to the storage
+core, neither built nor measured: a tool call's inputs are stored twice, in the call's message and
+in its step part (11.5 MB of text on the sample, 1.8 MB as step blocks), and could be stored once
+with the message pointing at the step data.
+
+The times are with the caches holding what a query reads. The first run after opening the store, on
+every file: `git commit` 137 ms, the test-files pattern 188 ms, the same-file pattern 98 ms
+(PostgreSQL's first runs were not timed).
+
+What made the last four queries pass:
+
+- **Long values kept after their first read.** `command contains` reads commands over 4 KB from
+  the call's message, which in a cold session decodes a whole run: 6.3 ms on the sample against
+  PostgreSQL's 25. The values a query read are kept (1/32 of the cache budget): 0.24 ms.
+- **Confirmed texts kept.** A summary confirms each candidate of a text test on its text, which
+  for a field listed by step is in the part's step block. On every file the candidates of
+  `git commit` are spread over more step blocks than the summaries' cache holds: 31 ms. The texts
+  read are kept by (segment, part, offset), 1/32 of the budget: 1.46 ms.
+- **Patterns read only the fields they test.** A pattern with a test on an input value read each
+  scanned session's steps with every value (commands, file contents); on every file the steps
+  cache could not hold them and 88% of the test-files pattern was decoding step parts again, 93 ms.
+  Sessions' steps are also kept with only the fields queries tested (1/16 of the budget): 4.5 ms.
+- **The matcher keeps its working arrays.** Matching a session with a compared field allocated
+  nine arrays per session and six more per value; they are kept per thread, steps that pass arrive
+  as one ascending run per shape code and are merged, and only the masks written are cleared.
+  Same-file pattern: 0.069 → 0.048 ms on the sample, 0.34 → 0.28 ms on every file.
+
+Earlier runs: storage work alone with every session in 64 KB frames (`--cold-mb 0`), 20.1 MB and
+every query faster on one thread (closest 1.3x); when the store kept every value, 2026-11-22,
+67.5 against 168.4 MB (2.49x); the first run of the comparison lost three queries (`command
+contains ...` over long commands 278 ms against 17, the same-file pattern 7.3 against 1.7, most
+edited files 0.72 against 0.46).
+
 
 
 ### Size against PostgreSQL, and how small it can get
@@ -550,6 +587,20 @@ at the end unless `KEEP=1`. Both it and the crash test exit non-zero on any fail
 
 ## Measured (2026-11-23, thinking and images never stored, every Claude Code log on one Mac)
 
+The build with both the storage work and the step summaries (9032b4f), all four run at once on
+the same day (so the rebuild speed below is with the machine busy):
+
+| Check | Result |
+|---|---|
+| Rebuild (`scripts/check-rebuild.sh`, every log) | 129,426 requests in the store: 2,271 byte for byte, 127,155 equal to the log's body once thinking and images are blanked, 0 different, 0 read errors; 24 not in the store (20 the log cannot rebuild, 4 logged after the ingest); 97.2 GB rebuilt at 5,976 MB/s on 10 threads |
+| Steps against the slow reference | 149,829 steps in 1,075 sessions: none missing, none extra, no wrong `prev` or shape code |
+| Crash (`scripts/crash-test.sh 1000`) | 1,000 kills: 0 lost, 0 wrong bytes; at least 138 folds and 11 rewrites finished before a kill; 2,811 of 2,867 sessions ended in cold runs |
+| Queries against brute force (`tdb check-queries`, every log) | 300 generated patterns and 150 with a compared field over 1,012 sessions: 0 differ (2,412,412 matches); 300 generated aggregations over all 1,068: 0 differ, 131 answered from summaries |
+| Planted bugs (`scripts/planted-bugs.sh`) | 15 caught, 0 missed |
+| `scripts/test.sh`, clippy | 56 tests pass; no warnings |
+
+The rest of this section is the storage work alone (5878bda).
+
 Apple Silicon, 10 cores. Sizes compare stores built from the 1,730 log files that existed before
 14:43 that day; the rebuild check ran on every log present when it ran.
 
@@ -707,17 +758,26 @@ LOCK                  held with flock while a process has the store open
 
 ## What's next
 
-1. Derived columns (rules at write time, backfilled when a merge rewrites a session), then text
+1. The size target (7x smaller than PostgreSQL, measured 6.74x on the sample and 6.34x on every
+   log): a tool call's inputs are stored in its message and again in its step part. Stored once,
+   with the message pointing at the step data, the step summaries would fit under the target; it
+   changes how every message is read and rebuilt. A cheaper part, measured in
+   `examples/words_exp.rs`: postings by distinct text without the commonest words, front-coded
+   word lists (about 0.4 MB of the sample's 19.6).
+2. Derived columns (rules at write time, backfilled when a merge rewrites a session), then text
    search over message text.
-2. Summaries for `time` tests (the part table has each row's earliest and latest time, so a row
+3. First runs: a query's first run after opening the store reads what later runs find in the
+   caches (`git commit` 137 ms on every log, then 1.5 ms).
+4. Summaries for `time` tests (the part table has each row's earliest and latest time, so a row
    wholly inside or outside a range could be counted without its steps) and for `bin(time, 1h)`;
    pattern queries that skip whole segments from their catalogs before reading any session.
-3. The field tables keep short values a second time (the step parts keep each part's own
+5. The field tables keep short values a second time (the step parts keep each part's own
    dictionary): one dictionary per segment that the step parts point into would remove that copy.
-4. Merges run inside the flush that triggers them; a background thread would keep writes going
+6. Merges run inside the flush that triggers them; a background thread would keep writes going
    while a big merge runs (index merges are capped at 1 GB and segment merges at 256 MB). This
    matters more now that a merge into a full-size segment spends about 2.5 times the CPU it did
    (the 9 MB dictionary at level 19).
-5. A bigger head-to-head on the full logs, and a multi-terabyte run on an external disk (the
+7. A head-to-head on generated data many times the local logs, and a multi-terabyte run on an
+   external disk (the
    index's filters are about 1.8 bytes per key and are read through the cache, so at that size
    ingest speed depends on how much of them the cache holds).
