@@ -820,8 +820,9 @@ fn crash_child(a: &Args) {
     // idle flush and tiny caches: kills land in every part of the write path; merges of over
     // 1.6 MB of messages train a dictionary (at a low level, to keep kills frequent). Sizes are
     // small because requests store little once thinking and images are blanked: full-size
-    // merges must happen for folds and rewrites to be killed too.
-    let opts = Options { sync: a.sync(), flush_bytes: 128 << 10, merge_at: 3, seg_bytes: 32 << 10, idle_flushes: 1, cache_bytes: 4 << 20, blob_bytes: 32 << 10, run_bytes: 64 << 10, merge_level: 3, threads: 2, ..Options::default() };
+    // merges must happen for folds and rewrites to be killed too. Synthetic sessions span
+    // minutes, so any session older than the newest request is cold, in runs of 4 frames.
+    let opts = Options { sync: a.sync(), flush_bytes: 128 << 10, merge_at: 3, seg_bytes: 32 << 10, idle_flushes: 1, cache_bytes: 4 << 20, blob_bytes: 32 << 10, run_bytes: 64 << 10, merge_level: 3, threads: 2, cold_after_ms: 1, cold_run: 256 << 10, ..Options::default() };
     let mut db = Db::open(a.store(), opts).expect("open store");
     {
         let mut l = std::io::stdout().lock();
@@ -1005,6 +1006,8 @@ fn crash_test(a: &Args) {
     println!("  steps after all kills: {} engine steps; missing {}, extra {}, wrong prev {}, wrong shape {}", sc.engine_steps, sc.missing, sc.extra, sc.prev_wrong, sc.shape_wrong);
     println!("  recovery saw: {torn} torn log bytes cut, {replayed} log records replayed, {orphans} orphan files removed");
     println!("  merges seen to finish before a kill: at least {folded} sessions folded, {reclaims} segments rewritten to drop replaced parts; replaced parts left {}", mb(db.stats().dead_bytes));
+    let (cold, cold_bytes) = db.cold_sessions().expect("cold sessions");
+    println!("  sessions in cold runs at the end: {cold} of {} ({})", db.session_count(), mb(cold_bytes));
     println!("  {:.0}s", t0.elapsed().as_secs_f64());
     if lost + wrong + missing_final + stored_wrong > 0 || !sc.ok() {
         std::process::exit(1);

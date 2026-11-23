@@ -1574,6 +1574,8 @@ impl Db {
         }
         let full = bytes_in >= self.opts.seg_bytes;
         let fold = fold && full;
+        // where data moves for the last time: cold sessions go in runs there
+        let settled = last || full;
         let raw_in: u64 = inputs.iter().filter_map(|n| self.segs.get(n)).map(|s| s.cat.node_bytes).sum();
         let last = (last || full || inputs.iter().any(|n| self.segs.get(n).is_some_and(|s| s.cat.dict.is_some()))) && raw_in >= DICT_MIN_RAW;
         let codec = if last {
@@ -1583,7 +1585,7 @@ impl Db {
         };
         // cold sessions, in a merge into full-size segments: runs instead of frames
         let newest = self.segs.values().map(|s| s.cat.time_hi).max().unwrap_or(0);
-        let cold_before = if last && self.opts.cold_run > 0 && newest > 0 { newest - self.opts.cold_after_ms } else { i64::MIN };
+        let cold_before = if settled && self.opts.cold_run > 0 && newest > 0 { newest - self.opts.cold_after_ms } else { i64::MIN };
         let mut man = self.manifest.clone();
         let mut outputs: Vec<u32> = Vec::new();
         let mut w: Option<SegWriter> = None;
