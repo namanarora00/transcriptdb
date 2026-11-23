@@ -49,7 +49,7 @@ fn main() {
         let m = |x: u64| x as f64 / 1e6;
         println!("{n}: raw {:.2} MB, on disk {:.2}, level 19 {:.2}, level 19 with the dictionary {:.2}", m(tot[i][0]), m(tot[i][1]), m(tot[i][2]), m(tot[i][3]));
     }
-    per.sort_by(|a, b| b.0.cmp(&a.0));
+    per.sort_by_key(|x| std::cmp::Reverse(x.0));
     for (_, line) in per.iter().take(8) {
         println!("{line}");
     }
