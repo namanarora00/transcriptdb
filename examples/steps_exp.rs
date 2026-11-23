@@ -148,6 +148,29 @@ fn main() {
     }
     // the writer's blocks as they are, with other codecs
     let enc: Vec<Vec<u8>> = parts.iter().map(|p| encode(p, 4096)).collect();
+    // each part's values sorted by (field, value), codes renumbered: similar values side by side
+    let sorted: Vec<Vec<u8>> = parts
+        .iter()
+        .map(|p| {
+            let mut order: Vec<usize> = (0..p.values.len()).collect();
+            order.sort_by(|&a, &b| p.values[a].cmp(&p.values[b]));
+            let mut new_code = vec![0u32; p.values.len()];
+            for (n, &o) in order.iter().enumerate() {
+                new_code[o] = n as u32;
+            }
+            let mut q = p.clone();
+            q.values = order.iter().map(|&o| p.values[o].clone()).collect();
+            for fs in q.fields.iter_mut() {
+                for fv in fs.iter_mut() {
+                    if !steps::is_long(fv.1) {
+                        fv.1 = new_code[fv.1 as usize];
+                    }
+                }
+            }
+            encode(&q, 4096)
+        })
+        .collect();
+    println!("values sorted by (field, value): {:.2} MB at level 19, {:.2} MB with the frame dictionary (as written: {:.2} / {:.2})", grouped(&sorted, 19, &[]) as f64 / 1e6, grouped(&sorted, 19, &dict) as f64 / 1e6, grouped(&enc, 19, &[]) as f64 / 1e6, grouped(&enc, 19, &dict) as f64 / 1e6);
     for kb in [128usize, 256, 512] {
         println!("blocks of {kb} KB: {:.2} MB at level 19, {:.2} MB with the frame dictionary", grouped_by(&enc, 19, &[], kb << 10) as f64 / 1e6, grouped_by(&enc, 19, &dict, kb << 10) as f64 / 1e6);
     }

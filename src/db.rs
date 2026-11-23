@@ -87,6 +87,12 @@ pub struct Options {
     /// dictionary (about 1/12 of the messages merged, up to this). Every thread reading a
     /// segment keeps a copy of its dictionary, so this costs memory per reading thread.
     pub dict_content: usize,
+    /// A session whose last request is more than `cold_after_ms` older than the newest
+    /// request in the store is cold: merges into full-size segments write its messages in
+    /// runs of up to `cold_run` bytes instead of `frame_size` frames (about 17% smaller;
+    /// reading one message then decodes up to a whole run). 0 for `cold_run`: never.
+    pub cold_after_ms: i64,
+    pub cold_run: usize,
     /// Threads compressing frames in merges.
     pub threads: usize,
 }
@@ -111,6 +117,8 @@ impl Default for Options {
             merge_level: 19,
             dict_bytes: 1 << 20,
             dict_content: 8 << 20,
+            cold_after_ms: 7 * 86_400_000,
+            cold_run: 4 << 20,
             threads: std::thread::available_parallelism().map_or(4, |n| n.get()),
         }
     }
@@ -169,6 +177,8 @@ struct Chunk {
     seg: u32,
     frames: Arc<[(u64, u32)]>,
     raw_len: u64,
+    /// Raw bytes per frame.
+    fs: u32,
 }
 
 /// A session's messages and requests.
@@ -787,7 +797,7 @@ impl Db {
                 return corrupt(format!("session {s}: parts do not follow each other"));
             }
             let chunk = core.chunks.len() as u32;
-            core.chunks.push(Chunk { seg: seg.num, frames: p.frames.into(), raw_len: p.raw_len });
+            core.chunks.push(Chunk { seg: seg.num, frames: p.frames.into(), raw_len: p.raw_len, fs: p.frame });
             let end = core.nodes.len() + p.nodes.len();
             core.nodes.resize(end, NodeMeta { parent: NONE, len: 0, loc: UNSET, holes: None });
             for n in p.nodes {
@@ -1285,7 +1295,7 @@ impl Db {
         if stream.len() > u32::MAX as usize {
             return Err(Error::BadRequest("a session part is over 4 GiB".into()));
         }
-        Ok((CorePart { frames: Vec::new(), raw_len: stream.len() as u64, nodes, first_node: first, first_req, requests: core.requests[reqs.start as usize..reqs.end as usize].to_vec() }, stream))
+        Ok((CorePart { frames: Vec::new(), raw_len: stream.len() as u64, frame: self.opts.frame_size as u32, nodes, first_node: first, first_req, requests: core.requests[reqs.start as usize..reqs.end as usize].to_vec() }, stream))
     }
 
     /// Write everything in memory to files (a new segment and index run; values appended
@@ -1428,7 +1438,7 @@ impl Db {
             let a = self.active.get_mut(&s).unwrap();
             let core = Arc::make_mut(&mut a.core);
             let chunk = core.chunks.len() as u32;
-            core.chunks.push(Chunk { seg: num, frames: cp.frames.into(), raw_len: cp.raw_len });
+            core.chunks.push(Chunk { seg: num, frames: cp.frames.into(), raw_len: cp.raw_len, fs: cp.frame });
             for n in &cp.nodes {
                 core.nodes[n.id as usize].loc = Loc::Seg { chunk, off: n.off };
             }
@@ -1571,6 +1581,9 @@ impl Db {
         } else {
             Codec::plain(self.opts.level)
         };
+        // cold sessions, in a merge into full-size segments: runs instead of frames
+        let newest = self.segs.values().map(|s| s.cat.time_hi).max().unwrap_or(0);
+        let cold_before = if last && self.opts.cold_run > 0 && newest > 0 { newest - self.opts.cold_after_ms } else { i64::MIN };
         let mut man = self.manifest.clone();
         let mut outputs: Vec<u32> = Vec::new();
         let mut w: Option<SegWriter> = None;
@@ -1619,10 +1632,15 @@ impl Db {
                 runs = vec![(0, parts.len())];
                 folded += 1;
             }
+            let last_ms = core.requests.last().map_or(0, |r| steps::parse_time_ms(&r.time));
+            let cold = last_ms > 0 && last_ms < cold_before && !self.busy.contains(&s);
             let wr = w.as_mut().unwrap();
             for (a, b) in runs {
                 let (pa, pb) = (&parts[a].1, &parts[b - 1].1);
-                let (cp, stream) = self.core_part(&core, pa.first_node..pb.first_node + pb.n_nodes, pa.first_req..pb.first_req + pb.n_reqs)?;
+                let (mut cp, stream) = self.core_part(&core, pa.first_node..pb.first_node + pb.n_nodes, pa.first_req..pb.first_req + pb.n_reqs)?;
+                if cold {
+                    cp.frame = self.opts.cold_run.max(self.opts.frame_size) as u32;
+                }
                 let sp = self.step_part(wr, &ss, pa.first_row..pb.first_row + pb.n_rows);
                 wr.add_stream(s, core.key.clone(), cp, stream, sp)?;
             }
@@ -1669,16 +1687,15 @@ impl Db {
         Ok(())
     }
 
-    /// Flush, then merge every segment into level 1: each session stored whole, main line first.
-    /// A zstd dictionary for what a merge writes: trained on frames spread evenly over the
-    /// merge's input, about 100 times the dictionary's size of them. Empty when the input is
-    /// too small for one to pay (under about 1.6 MB of messages) or training fails.
     /// The dictionary for a merge into a full-size segment: one trained on the input (zstd's
     /// trainer, about 1% of the messages, at most `dict_bytes`), then the input's own
     /// messages sampled evenly (about 1/12 of them, at most `dict_content`). The trainer
     /// keeps short common strings; whole messages give the long matches it cannot (on the
-    /// full logs, 8 MB of them make frames and dictionary 6% smaller).
+    /// full logs, 8 MB of them make frames and dictionary 6% smaller). Empty when the input
+    /// is too small for one to pay (under about 1.6 MB of messages) or training fails.
+    /// Frames are looked at in 64 KB pieces, so cold sessions' runs count like frames.
     fn train_dict(&self, sessions: &BTreeSet<u32>, inputs: &BTreeSet<u32>) -> Result<Vec<u8>> {
+        const PIECE: usize = 64 << 10;
         let raw: u64 = inputs.iter().filter_map(|n| self.segs.get(n)).map(|s| s.cat.node_bytes).sum();
         let size = (raw / 100).min(self.opts.dict_bytes as u64) as usize;
         if raw < DICT_MIN_RAW || size == 0 {
@@ -1692,24 +1709,33 @@ impl Db {
             let core = self.load_core(s)?;
             for ch in core.chunks.iter().filter(|c| inputs.contains(&c.seg)) {
                 let sg = self.segs.get(&ch.seg).ok_or_else(|| bad("segment is gone"))?;
+                let fs = ch.fs as usize;
                 for f in 0..ch.frames.len() {
-                    let sample = k.is_multiple_of(stride);
-                    // whole frames of messages every raw / content bytes
-                    let take = content > 0 && at >= next && (extra.len() as u64) < content;
-                    if sample || take {
-                        let fr = sg.frames(&ch.frames, ch.raw_len, f, f)?;
-                        if sample {
-                            data.extend_from_slice(&fr[0]);
-                            sizes.push(fr[0].len());
+                    let len = (ch.raw_len as usize - f * fs).min(fs);
+                    let mut fr: Option<Arc<Vec<u8>>> = None;
+                    for p in 0..len.div_ceil(PIECE) {
+                        let sample = k.is_multiple_of(stride);
+                        // whole pieces of messages every raw / content bytes
+                        let take = content > 0 && at >= next && (extra.len() as u64) < content;
+                        if sample || take {
+                            if fr.is_none() {
+                                fr = Some(sg.frames(&ch.frames, ch.raw_len, fs, f, f)?.remove(0));
+                            }
+                            let fr = fr.as_ref().unwrap();
+                            let piece = &fr[p * PIECE..((p + 1) * PIECE).min(len)];
+                            if sample {
+                                data.extend_from_slice(piece);
+                                sizes.push(piece.len());
+                            }
+                            if take {
+                                let n = piece.len().min((content as usize).saturating_sub(extra.len()));
+                                extra.extend_from_slice(&piece[..n]);
+                                next = at + (raw / content).max(1) * PIECE as u64;
+                            }
                         }
-                        if take {
-                            let n = fr[0].len().min((content as usize).saturating_sub(extra.len()));
-                            extra.extend_from_slice(&fr[0][..n]);
-                            next = at + (raw / content).max(1) * sg.cat.frame_size as u64;
-                        }
+                        at += PIECE as u64;
+                        k += 1;
                     }
-                    at += sg.cat.frame_size as u64;
-                    k += 1;
                 }
             }
         }
@@ -1721,6 +1747,7 @@ impl Db {
         Ok(dict)
     }
 
+    /// Flush, then merge every segment into level 1: each session stored whole, main line first.
     pub fn compact(&mut self) -> Result<()> {
         self.flush()?;
         let all: BTreeSet<u32> = self.segs.keys().copied().collect();
@@ -1739,12 +1766,12 @@ impl Db {
                 }
                 let ch = &core.chunks[chunk as usize];
                 let sg = self.segs.get(&ch.seg).ok_or_else(|| bad(format!("segment {} is gone", ch.seg)))?;
-                let fs = sg.cat.frame_size as usize;
+                let fs = ch.fs as usize;
                 let (a, b) = (off as usize, off as usize + nm.len as usize);
                 let (f0, f1) = (a / fs, (b - 1) / fs);
                 let missing: Vec<usize> = (f0..=f1).filter(|k| !cache.contains_key(&(chunk, *k))).collect();
                 if let (Some(&lo), Some(&hi)) = (missing.first(), missing.last()) {
-                    for (k, d) in (lo..=hi).zip(sg.frames(&ch.frames, ch.raw_len, lo, hi)?) {
+                    for (k, d) in (lo..=hi).zip(sg.frames(&ch.frames, ch.raw_len, fs, lo, hi)?) {
                         cache.entry((chunk, k)).or_insert(d);
                     }
                 }
@@ -1779,7 +1806,7 @@ impl Db {
             let nm = &core.nodes[id as usize];
             match nm.loc {
                 Loc::Seg { chunk, off } => {
-                    let fs = self.segs.get(&core.chunks[chunk as usize].seg).map_or(1, |s| s.cat.frame_size as usize);
+                    let fs = core.chunks[chunk as usize].fs as usize;
                     if nm.len > 0 {
                         for k in off as usize / fs..=(off as usize + nm.len as usize - 1) / fs {
                             need.insert((chunk, k));
@@ -1807,7 +1834,7 @@ impl Db {
             }
             let ch = &core.chunks[chunk as usize];
             let sg = self.segs.get(&ch.seg).ok_or_else(|| bad(format!("segment {} is gone", ch.seg)))?;
-            let frames = sg.frames(&ch.frames, ch.raw_len, k0, v[j].1)?;
+            let frames = sg.frames(&ch.frames, ch.raw_len, ch.fs as usize, k0, v[j].1)?;
             st.reads += 1;
             st.frames += frames.len() as u32;
             for (n, d) in frames.into_iter().enumerate() {
@@ -2221,10 +2248,10 @@ impl Db {
                 }
                 let ch = &core.chunks[chunk as usize];
                 let sg = self.segs.get(&ch.seg).ok_or_else(|| bad("segment is gone"))?;
-                let fs = sg.cat.frame_size as usize;
+                let fs = ch.fs as usize;
                 let (ga, gb) = (base as usize + a, base as usize + b);
                 let (f0, f1) = (ga / fs, (gb - 1) / fs);
-                let frames = sg.frames(&ch.frames, ch.raw_len, f0, f1)?;
+                let frames = sg.frames(&ch.frames, ch.raw_len, fs, f0, f1)?;
                 let mut out = Vec::with_capacity(len as usize);
                 for (i, fr) in frames.iter().enumerate() {
                     let k = f0 + i;
@@ -2371,6 +2398,21 @@ impl Db {
             out.push((id, nm.parent, b, nm.holes.as_deref().map(|h| h.to_vec()).unwrap_or_default()));
         }
         Ok(out)
+    }
+
+    /// Sessions with a part written in cold runs (bigger than its segment's frames), and the
+    /// raw message bytes of those parts. Loads every session's metadata.
+    pub fn cold_sessions(&self) -> Result<(usize, u64)> {
+        let (mut n, mut bytes) = (0, 0);
+        for s in 0..self.session_count() as u32 {
+            let core = self.load_core(s)?;
+            let cold: u64 = core.chunks.iter().filter(|c| self.segs.get(&c.seg).is_some_and(|g| c.fs > g.cat.frame_size)).map(|c| c.raw_len).sum();
+            if cold > 0 {
+                n += 1;
+                bytes += cold;
+            }
+        }
+        Ok((n, bytes))
     }
 
     /// How many parts session `s` is stored in.

@@ -509,15 +509,18 @@ fn merged_frames_use_a_trained_dictionary_and_pieces_chain() {
     let reqs = traffic(21, 90, 60);
     // 8 KB frames: step blocks (about 64 KB) are then bigger than the room for them after
     // the dictionary, and are decoded the other way
-    for frame_kb in [64, 8] {
-        merged_with_dictionary(&reqs, frame_kb);
+    // then with every session that ended before the newest request cold: messages in runs of
+    // 8 frames, bigger than the room after the dictionary, which then grows
+    for (frame_kb, cold) in [(64, false), (8, false), (8, true)] {
+        merged_with_dictionary(&reqs, frame_kb, cold);
     }
 }
 
-fn merged_with_dictionary(reqs: &[SynthRequest], frame_kb: usize) {
-    let dir = tmpdir(&format!("dict-{frame_kb}"));
+fn merged_with_dictionary(reqs: &[SynthRequest], frame_kb: usize, cold: bool) {
+    let dir = tmpdir(&format!("dict-{frame_kb}-{cold}"));
     // merges only in `compact`, at a low level (the level does not change the format)
-    let o = Options { seg_bytes: 384 << 10, merge_at: 1 << 20, merge_level: 3, frame_size: frame_kb << 10, ..opts(2 << 20) };
+    let (cold_after_ms, cold_run) = if cold { (1, 8 * (frame_kb << 10)) } else { (0, 0) };
+    let o = Options { seg_bytes: 384 << 10, merge_at: 1 << 20, merge_level: 3, frame_size: frame_kb << 10, cold_after_ms, cold_run, ..opts(2 << 20) };
     let mut db = Db::open(&dir, o.clone()).unwrap();
     for (i, q) in reqs.iter().enumerate() {
         put(&mut db, q);
@@ -536,6 +539,12 @@ fn merged_with_dictionary(reqs: &[SynthRequest], frame_kb: usize) {
     assert!(st.dict_bytes > 0, "merged segments should carry a dictionary");
     assert!(st.frame_bytes < flushed.frame_bytes, "dictionary frames {} should be smaller than flushed ones {}", st.frame_bytes, flushed.frame_bytes);
     assert!(st.piece_bytes * 3 < st.piece_raw_bytes, "pieces compressed against earlier ones");
+    let (n_cold, _) = db.cold_sessions().unwrap();
+    assert_eq!(n_cold > 0, cold, "{n_cold} sessions in cold runs");
+    if cold {
+        // sessions that end at the newest request's second are not cold
+        assert!(n_cold * 4 >= db.session_count(), "only {n_cold} of {} sessions are cold", db.session_count());
+    }
     check_all(&db, reqs);
     drop(db);
     // reopened, and read from several threads at once, each going back and forth between

@@ -33,7 +33,7 @@ use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-const SEG_MAGIC: &[u8; 8] = b"TDBSEG08";
+const SEG_MAGIC: &[u8; 8] = b"TDBSEG09";
 /// Raw bytes per group block of encoded parts, and per directory block.
 const GROUP: usize = 64 * 1024;
 /// Bloom filter bits per key: about 0.2% false positives.
@@ -57,6 +57,9 @@ pub struct SegNode {
 pub struct CorePart {
     pub frames: Vec<(u64, u32)>,
     pub raw_len: u64,
+    /// Raw bytes per frame of this part's stream: the segment's frame size, or bigger runs
+    /// for a cold session.
+    pub frame: u32,
     /// In storage order; ids are `first_node..first_node + nodes.len()` in some order.
     pub nodes: Vec<SegNode>,
     pub first_node: u32,
@@ -269,6 +272,7 @@ fn encode_core(p: &CorePart, e: &mut Enc) {
     c[0].var(p.nodes.len() as u64);
     c[0].var(p.first_req as u64);
     c[0].var(p.requests.len() as u64);
+    c[0].var(p.frame as u64);
     // frames: where each starts against where the one before it ended (0 when back to back)
     let mut end = 0i64;
     for &(o, l) in &p.frames {
@@ -344,6 +348,10 @@ pub fn decode_core(b: &[u8]) -> Result<CorePart> {
     let nn = c[0].var()? as usize;
     let first_req = c[0].var32()?;
     let nr = c[0].var()? as usize;
+    let frame = c[0].var32()?;
+    if frame == 0 {
+        return corrupt("session part with frames of no size");
+    }
     let mut frames = Vec::with_capacity(nf.min(1 << 20));
     let mut end = 0i64;
     for _ in 0..nf {
@@ -425,7 +433,7 @@ pub fn decode_core(b: &[u8]) -> Result<CorePart> {
     if c.iter().any(|x| !x.done()) {
         return corrupt("trailing bytes in a session part");
     }
-    Ok(CorePart { frames, raw_len, nodes, first_node, first_req, requests })
+    Ok(CorePart { frames, raw_len, frame, nodes, first_node, first_req, requests })
 }
 
 const STEP_COLS: usize = 12;
@@ -639,6 +647,7 @@ fn compress_all(level: i32, dict: Option<&zstd::dict::EncoderDictionary<'static>
 struct Pending {
     session: u32,
     key: (String, String),
+    /// `core.frame` says how big its frames are.
     core: CorePart,
     stream: Vec<u8>,
     steps: StepPart,
@@ -698,12 +707,18 @@ impl SegWriter {
     }
 
     /// Write a session's message stream as frames; returns (offset, compressed length) per frame.
+    /// Compress and write a part's stream in frames of the segment's frame size.
     pub fn frames(&mut self, stream: &[u8]) -> Result<Vec<(u64, u32)>> {
+        let fs = self.frame;
         let packed = match &mut self.comp {
-            Some(c) => stream.chunks(self.frame).map(|ch| c.compress(ch)).collect::<std::io::Result<Vec<_>>>()?,
-            None => compress_all(self.codec.level, self.cdict.as_ref(), self.codec.threads, &stream.chunks(self.frame).collect::<Vec<_>>())?,
+            Some(c) => stream.chunks(fs).map(|ch| c.compress(ch)).collect::<std::io::Result<Vec<_>>>()?,
+            None => compress_all(self.codec.level, self.cdict.as_ref(), self.codec.threads, &stream.chunks(fs).collect::<Vec<_>>())?,
         };
         self.write_frames(packed)
+    }
+
+    pub fn frame_size(&self) -> usize {
+        self.frame
     }
 
     fn write_frames(&mut self, packed: Vec<Vec<u8>>) -> Result<Vec<(u64, u32)>> {
@@ -720,9 +735,13 @@ impl SegWriter {
     /// Add a part with its message stream not yet written: with several threads, the frames
     /// of many parts are compressed at once (most parts have only a few frames). The part's
     /// frames are filled in when written. Same order rules as [`SegWriter::add`].
+    /// Add a part whose stream is cut into frames of `core.frame` bytes (compressed in
+    /// batches with other parts' frames when the segment has no single compressor).
     pub fn add_stream(&mut self, session: u32, key: (String, String), mut core: CorePart, stream: Vec<u8>, steps: StepPart) -> Result<()> {
         if self.comp.is_some() {
-            core.frames = self.frames(&stream)?;
+            let c = self.comp.as_mut().unwrap();
+            let packed = stream.chunks(core.frame as usize).map(|ch| c.compress(ch)).collect::<std::io::Result<Vec<_>>>()?;
+            core.frames = self.write_frames(packed)?;
             return self.add(session, key, &core, &steps);
         }
         self.pending_raw += stream.len();
@@ -736,12 +755,11 @@ impl SegWriter {
     fn flush_pending(&mut self) -> Result<()> {
         let pending = std::mem::take(&mut self.pending);
         self.pending_raw = 0;
-        let fs = self.frame;
-        let chunks: Vec<&[u8]> = pending.iter().flat_map(|p| p.stream.chunks(fs)).collect();
+        let chunks: Vec<&[u8]> = pending.iter().flat_map(|p| p.stream.chunks(p.core.frame as usize)).collect();
         let mut packed = compress_all(self.codec.level, self.cdict.as_ref(), self.codec.threads, &chunks)?.into_iter();
         drop(chunks);
         for mut p in pending {
-            let nf = p.stream.len().div_ceil(fs);
+            let nf = p.stream.len().div_ceil(p.core.frame as usize);
             let mine: Vec<Vec<u8>> = packed.by_ref().take(nf).collect();
             p.core.frames = self.write_frames(mine)?;
             self.add(p.session, p.key, &p.core, &p.steps)?;
@@ -910,12 +928,15 @@ thread_local! {
     static FRAMES: RefCell<FrameCache> = RefCell::new(FrameCache::default());
 }
 
-const FRAME_CACHE: usize = 128;
+/// Bytes of decompressed frames each thread keeps (128 frames of 64 KB, or two of a cold
+/// session's 4 MB runs).
+const FRAME_CACHE: usize = 8 << 20;
 
 #[derive(Default)]
 struct FrameCache {
     map: HashMap<(u64, u64), Arc<Vec<u8>>>,
     order: std::collections::VecDeque<(u64, u64)>,
+    bytes: usize,
 }
 
 impl FrameCache {
@@ -923,11 +944,13 @@ impl FrameCache {
         self.map.get(k).cloned()
     }
     fn put(&mut self, k: (u64, u64), v: Arc<Vec<u8>>) {
+        let n = v.len();
         if self.map.insert(k, v).is_none() {
             self.order.push_back(k);
-            while self.order.len() > FRAME_CACHE {
+            self.bytes += n;
+            while self.bytes > FRAME_CACHE && self.order.len() > 1 {
                 if let Some(old) = self.order.pop_front() {
-                    self.map.remove(&old);
+                    self.bytes -= self.map.remove(&old).map_or(0, |x| x.len());
                 }
             }
         }
@@ -996,12 +1019,15 @@ impl Drop for DictBuf {
 }
 
 /// Dictionary buffers per thread, most recently used last, and the most bytes they may
-/// hold together (a full-size segment's dictionary is about 9 MB, so one of those fits).
+/// hold together (a full-size segment's dictionary is about 9 MB and its biggest frame
+/// 4 MB, so one of those fits).
 const DICT_BUFS: usize = 2;
-const DICT_BUF_BYTES: usize = 12 << 20;
-/// Room after the dictionary in such a buffer, in frames: enough for a frame or for most
-/// blocks of step parts (about 64 KB); bigger blocks are decoded without it.
+const DICT_BUF_BYTES: usize = 16 << 20;
+/// Room after the dictionary in such a buffer, in frames of the segment's frame size: enough
+/// for a frame or for most blocks of step parts (about 64 KB). It grows for a bigger frame or
+/// block, up to `DICT_ROOM_MAX`; anything bigger is decoded without it.
 const DICT_ROOM_FRAMES: usize = 4;
+const DICT_ROOM_MAX: usize = 4 << 20;
 
 thread_local! {
     static DICT_BUF: RefCell<Vec<DictBuf>> = const { RefCell::new(Vec::new()) };
@@ -1053,21 +1079,24 @@ impl Segment {
 
     /// Frame or block `src` of this segment decompressed with its dictionary.
     fn decompress_dict(&self, src: &[u8], cap: usize) -> Result<Vec<u8>> {
-        let room = DICT_ROOM_FRAMES * self.cat.frame_size as usize;
-        if cap > room {
-            // a block bigger than the room after the dictionary: rare, decoded the slow way
+        if cap > DICT_ROOM_MAX.max(DICT_ROOM_FRAMES * self.cat.frame_size as usize) {
+            // bigger than any room after the dictionary: rare, decoded the slow way
             let d = self.dict()?.ok_or_else(|| crate::codec::Error::Corrupt("segment has no dictionary".into()))?;
             return Ok(zstd::bulk::Decompressor::with_dictionary(&d)?.decompress(src, cap)?);
         }
         DICT_BUF.with(|bufs| {
             let mut bufs = bufs.borrow_mut();
-            match bufs.iter().position(|b| b.uid == self.uid) {
+            match bufs.iter().position(|b| b.uid == self.uid && b.len - b.dlen >= cap) {
                 Some(i) => {
                     let b = bufs.remove(i);
                     bufs.push(b);
                 }
                 None => {
                     let d = self.dict()?.ok_or_else(|| crate::codec::Error::Corrupt("segment has no dictionary".into()))?;
+                    // a buffer for this segment with too little room is replaced by a bigger one
+                    bufs.retain(|b| b.uid != self.uid);
+                    let base = DICT_ROOM_FRAMES * self.cat.frame_size as usize;
+                    let room = if cap > base { DICT_ROOM_MAX } else { base };
                     while !bufs.is_empty() && (bufs.len() >= DICT_BUFS || bufs.iter().map(|b| b.len).sum::<usize>() + d.len() + room > DICT_BUF_BYTES) {
                         bufs.remove(0);
                     }
@@ -1115,9 +1144,9 @@ impl Segment {
         Ok(d)
     }
 
-    /// Frames `first..=last` of a part's stream, decompressed: from the cache, or with one
-    /// read for the run of frames that are not cached.
-    pub fn frames(&self, frames: &[(u64, u32)], raw_len: u64, first: usize, last: usize) -> Result<Vec<Arc<Vec<u8>>>> {
+    /// Frames `first..=last` of a part's stream (frames of `fs` raw bytes), decompressed:
+    /// from the cache, or with one read for the run of frames that are not cached.
+    pub fn frames(&self, frames: &[(u64, u32)], raw_len: u64, fs: usize, first: usize, last: usize) -> Result<Vec<Arc<Vec<u8>>>> {
         let mut out: Vec<Option<Arc<Vec<u8>>>> = (first..=last).map(|k| FRAMES.with(|c| c.borrow().get(&(self.uid, frames[k].0)))).collect();
         let missing: Vec<usize> = (first..=last).filter(|k| out[k - first].is_none()).collect();
         if let (Some(&lo), Some(&hi)) = (missing.first(), missing.last()) {
@@ -1125,7 +1154,6 @@ impl Segment {
             let end = frames[hi].0 + frames[hi].1 as u64;
             let mut buf = vec![0u8; (end - start) as usize];
             handle(self.uid, &self.path)?.read_exact_at(&mut buf, start)?;
-            let fs = self.cat.frame_size as usize;
             let dict = self.cat.dict.is_some();
             for k in lo..=hi {
                 if out[k - first].is_some() {

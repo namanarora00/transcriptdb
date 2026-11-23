@@ -3,14 +3,19 @@
 //! PostgreSQL gets the store's contents with the usual tricks: every distinct message stored
 //! once (by hash), requests as arrays of message ids, a step table with indexes and the
 //! two input fields the queries use as columns, and for patterns a materialized table of
-//! root-to-leaf turn paths so window functions are exact on forked sessions. Pattern
-//! queries are compared on the set of sessions with a match (what SQL answers naturally),
-//! aggregations on their rows, reads on the bytes returned.
+//! root-to-leaf turn paths so window functions are exact on forked sessions. It also gets
+//! what rebuilding every request byte for byte needs, as the store keeps it: skeletons,
+//! system prompts, tool lists and cache-marker texts once each (tool lists and system arrays
+//! split into elements stored once each), and per request its time, metadata, cache-marker
+//! positions and message separators. Pattern queries are compared on the set of sessions
+//! with a match (what SQL answers naturally), aggregations on their rows, reads on the bytes
+//! returned, and whole requests rebuilt from either side are compared byte for byte.
 
 use crate::db::{sha256, Db, ReadStats};
 use crate::pg::{Pg, PgError};
 use crate::query::{self, exec::Kind, plan, value::Value};
-use crate::record::NONE;
+use crate::record::{NONE, TARGET_MSG0, TARGET_SYSTEM, TARGET_TOOLS};
+use crate::split::{self, HoleKind, Skeleton};
 use crate::synth::Rng;
 use std::collections::{BTreeSet, HashMap};
 use std::time::Instant;
@@ -75,16 +80,173 @@ fn text_of(v: Value) -> Option<Vec<u8>> {
     }
 }
 
+/// The elements of a JSON array that is exactly `[` + elements joined by `,` + `]`.
+fn array_elements(b: &[u8]) -> Option<Vec<&[u8]>> {
+    let (spans, end) = crate::json::elements(b, &(0..b.len())).ok()?;
+    if end + 1 != b.len() {
+        return None;
+    }
+    let els: Vec<&[u8]> = spans.into_iter().map(|s| &b[s]).collect();
+    let mut joined = vec![b'['];
+    for (i, e) in els.iter().enumerate() {
+        if i > 0 {
+            joined.push(b',');
+        }
+        joined.extend_from_slice(e);
+    }
+    joined.push(b']');
+    (joined == b && !els.is_empty()).then_some(els)
+}
+
+/// Strings as a JSON array (for the rare request whose messages are not separated by bare
+/// commas).
+fn json_strings<'a>(xs: impl Iterator<Item = &'a [u8]>) -> Vec<u8> {
+    let mut out = vec![b'['];
+    for (i, x) in xs.enumerate() {
+        if i > 0 {
+            out.push(b',');
+        }
+        out.push(b'"');
+        for &c in x {
+            match c {
+                b'"' => out.extend_from_slice(b"\\\""),
+                b'\\' => out.extend_from_slice(b"\\\\"),
+                b'\n' => out.extend_from_slice(b"\\n"),
+                b'\r' => out.extend_from_slice(b"\\r"),
+                b'\t' => out.extend_from_slice(b"\\t"),
+                c => out.push(c),
+            }
+        }
+        out.push(b'"');
+    }
+    out.push(b']');
+    out
+}
+
+fn parse_json_strings(s: &str) -> Option<Vec<Vec<u8>>> {
+    let b = s.as_bytes();
+    let (spans, _) = crate::json::elements(b, &(0..b.len())).ok()?;
+    spans.iter().map(|sp| (b[sp.start] == b'"').then(|| crate::query::value::json_unescape(crate::json::inner(b, sp)).into_bytes())).collect()
+}
+
+fn ints(s: &str) -> Vec<u32> {
+    s.trim_matches(|c| c == '{' || c == '}').split(',').filter(|x| !x.is_empty()).filter_map(|x| x.parse().ok()).collect()
+}
+
+/// Insert cache-marker texts at their offsets.
+fn with_notes(body: &[u8], notes: &[(u32, Vec<u8>)], out: &mut Vec<u8>) -> R<()> {
+    let mut pos = 0usize;
+    for (o, t) in notes {
+        let o = *o as usize;
+        if o < pos || o > body.len() {
+            return Err("cache note out of range".into());
+        }
+        out.extend_from_slice(&body[pos..o]);
+        out.extend_from_slice(t);
+        pos = o;
+    }
+    out.extend_from_slice(&body[pos..]);
+    Ok(())
+}
+
+/// Rebuild request `id` from PostgreSQL alone: one query for its messages, pieces, cache
+/// markers and separators, then the same assembly as the store's.
+pub fn pg_rebuild(pg: &mut Pg, id: &str) -> R<Vec<u8>> {
+    let sql = format!(
+        "WITH r AS (SELECT * FROM requests WHERE id = {}),
+         p AS (SELECT p.id, p.kind, p.holes,
+                      coalesce(p.body, '[' || (SELECT string_agg(b.body, ',' ORDER BY u.k) FROM unnest(p.elements) WITH ORDINALITY u(bid, k) JOIN blocks b ON b.id = u.bid) || ']') AS body
+               FROM pieces p, r
+               WHERE p.id IN (r.skeleton, r.system, r.tools)
+                  OR p.id = ANY (SELECT r.notes[i] FROM generate_subscripts(r.notes, 1) i WHERE i % 3 = 0))
+         SELECT 'm', u.k::text, m.body, NULL FROM r, unnest(r.msgs) WITH ORDINALITY u(mid, k) JOIN messages m ON m.id = u.mid
+         UNION ALL SELECT 'p', p.id::text, p.body, p.holes::text FROM p
+         UNION ALL SELECT 'r', concat_ws(',', r.skeleton, coalesce(r.system, -1), coalesce(r.tools, -1)), r.notes::text, r.layout FROM r",
+        sql_str(id)
+    );
+    let rows = pg.query(&sql).map_err(pe)?;
+    let (mut msgs, mut pcs, mut head) = (Vec::new(), HashMap::new(), None);
+    for row in rows {
+        let col = |i: usize| row[i].clone();
+        match col(0).as_deref() {
+            Some("m") => msgs.push((col(1).and_then(|x| x.parse::<u64>().ok()).unwrap_or(0), col(2).unwrap_or_default())),
+            Some("p") => {
+                pcs.insert(col(1).and_then(|x| x.parse::<u32>().ok()).unwrap_or(u32::MAX), (col(2).unwrap_or_default(), col(3)));
+            }
+            Some("r") => head = Some((col(1).unwrap_or_default(), col(2), col(3))),
+            _ => {}
+        }
+    }
+    let (ids, notes, layout) = head.ok_or("no such request")?;
+    msgs.sort_by_key(|m| m.0);
+    let ids: Vec<i64> = ids.split(',').filter_map(|x| x.parse().ok()).collect();
+    let piece = |i: i64| pcs.get(&(i as u32)).ok_or_else(|| format!("missing piece {i}"));
+    let (skel_body, holes) = piece(ids[0])?;
+    let h = ints(holes.as_deref().unwrap_or(""));
+    let mut sk_holes = Vec::with_capacity(h.len() / 2);
+    for p in h.chunks(2) {
+        sk_holes.push((p[0], HoleKind::from_u8(p[1] as u8).map_err(|e| e.to_string())?));
+    }
+    let skel = Skeleton { bytes: skel_body.as_bytes().to_vec(), holes: sk_holes };
+    let nt = ints(notes.as_deref().unwrap_or(""));
+    let mut by_target: HashMap<u32, Vec<(u32, Vec<u8>)>> = HashMap::new();
+    for t in nt.chunks(3) {
+        by_target.entry(t[0]).or_default().push((t[1], piece(t[2] as i64)?.0.as_bytes().to_vec()));
+    }
+    let layout = match layout {
+        Some(l) => Some(parse_json_strings(&l).ok_or("bad layout")?),
+        None => None,
+    };
+    let empty = Vec::new();
+    let mut out = Vec::new();
+    let mut err = None;
+    split::assemble(&skel, &mut out, |kind, out| {
+        let r = (|| -> R<()> {
+            match kind {
+                HoleKind::Messages => {
+                    for (i, (_, m)) in msgs.iter().enumerate() {
+                        match &layout {
+                            Some(g) => out.extend_from_slice(&g[i]),
+                            None if i > 0 => out.push(b','),
+                            None => {}
+                        }
+                        with_notes(m.as_bytes(), by_target.get(&(TARGET_MSG0 + i as u32)).unwrap_or(&empty), out)?;
+                    }
+                    if let Some(g) = &layout {
+                        out.extend_from_slice(&g[msgs.len()]);
+                    }
+                }
+                HoleKind::System => with_notes(piece(ids[1])?.0.as_bytes(), by_target.get(&TARGET_SYSTEM).unwrap_or(&empty), out)?,
+                HoleKind::Tools => with_notes(piece(ids[2])?.0.as_bytes(), by_target.get(&TARGET_TOOLS).unwrap_or(&empty), out)?,
+            }
+            Ok(())
+        })();
+        if let Err(e) = r {
+            err = Some(e);
+        }
+        Ok(())
+    })
+    .map_err(|e| e.to_string())?;
+    match err {
+        Some(e) => Err(e),
+        None => Ok(out),
+    }
+}
+
 /// Load the store into PostgreSQL (tables dropped first).
 pub fn load(db: &Db, pg: &mut Pg) -> R<String> {
     let t0 = Instant::now();
     pg.exec(
-        "DROP TABLE IF EXISTS sessions, messages, nodes, requests, steps, path_steps CASCADE;
+        "DROP TABLE IF EXISTS sessions, messages, nodes, requests, steps, path_steps, pieces, blocks, metas CASCADE;
          BEGIN;
          CREATE TABLE sessions (id int PRIMARY KEY, sid text NOT NULL, agent text NOT NULL);
          CREATE TABLE messages (id int, body text NOT NULL);
          CREATE TABLE nodes (session int, node int, parent int, msg int);
-         CREATE TABLE requests (id text, session int, msgs int[]);
+         CREATE TABLE requests (id text, session int, msgs int[], skeleton int, system int, tools int,
+                                time timestamptz, meta int, notes int[], layout text);
+         CREATE TABLE metas (id int, body text);
+         CREATE TABLE pieces (id int, kind smallint, body text, holes int[], elements int[]);
+         CREATE TABLE blocks (id int, body text);
          CREATE TABLE steps (session int, step int, turn int, depth int, prev int, call_node int, result_node int,
                              tool text, failed bool, out_bytes int, time_ms bigint, file_path text, command text);
          CREATE TABLE path_steps (session int, path int, depth int, step int, tool text, failed bool, file_path text);",
@@ -152,7 +314,10 @@ pub fn load(db: &Db, pg: &mut Pg) -> R<String> {
         Ok(())
     })
     .map_err(pe)?;
+    // per-request metadata (query source, client version) takes few values: once each
+    let mut meta_ids: HashMap<Vec<u8>, u32> = HashMap::new();
     pg.copy_in("COPY requests FROM STDIN", |c| {
+        let opt = |v: u32| if v == NONE { None } else { Some(v.to_string()) };
         for ri in db.all_requests().map_err(|e| PgError(e.to_string()))? {
             let r = db.request(ri).map_err(|e| PgError(e.to_string()))?;
             let path = db.request_path(ri).map_err(|e| PgError(e.to_string()))?;
@@ -160,6 +325,74 @@ pub fn load(db: &Db, pg: &mut Pg) -> R<String> {
             c.field(Some(r.id.as_bytes()));
             c.int(r.session as i64);
             c.field(Some(format!("{{{}}}", arr.join(",")).as_bytes()));
+            c.int(r.skeleton as i64);
+            c.field(opt(r.system).as_deref().map(str::as_bytes));
+            c.field(opt(r.tools).as_deref().map(str::as_bytes));
+            c.field(r.time.contains('T').then_some(r.time.as_bytes()));
+            let next = meta_ids.len() as u32;
+            c.int(*meta_ids.entry(r.meta.to_vec()).or_insert(next) as i64);
+            let notes: Vec<String> = r.notes.iter().flat_map(|n| [n.target, n.offset, n.text]).map(|x| x.to_string()).collect();
+            c.field(if notes.is_empty() { None } else { Some(format!("{{{}}}", notes.join(","))) }.as_deref().map(str::as_bytes));
+            c.field(r.layout.as_ref().map(|g| json_strings(g.iter().map(|x| &x[..]))).as_deref());
+            c.end_row()?;
+        }
+        Ok(())
+    })
+    .map_err(pe)?;
+    pg.copy_in("COPY metas FROM STDIN", |c| {
+        for (m, id) in &meta_ids {
+            c.int(*id as i64);
+            c.field(Some(m));
+            c.end_row()?;
+        }
+        Ok(())
+    })
+    .map_err(pe)?;
+    // pieces once each; a tool list or system array that is exactly its elements joined by
+    // commas is kept as element ids, each distinct element once
+    let mut pieces: Vec<(u32, u8, Vec<u8>)> = Vec::new();
+    db.each_piece(|id, kind, b, _, _| pieces.push((id, kind, b.to_vec()))).map_err(|e| e.to_string())?;
+    let mut block_ids: HashMap<u128, u32> = HashMap::new();
+    let mut blocks: Vec<Vec<u8>> = Vec::new();
+    pg.copy_in("COPY pieces FROM STDIN", |c| {
+        for (id, kind, b) in &pieces {
+            c.int(*id as i64);
+            c.int(*kind as i64);
+            if *kind == crate::record::PIECE_SKELETON {
+                let sk = Skeleton::decode(b).map_err(|e| PgError(e.to_string()))?;
+                c.field(Some(&sk.bytes));
+                let h: Vec<String> = sk.holes.iter().flat_map(|&(o, k)| [o, k as u32]).map(|x| x.to_string()).collect();
+                c.field(Some(format!("{{{}}}", h.join(",")).as_bytes()));
+                c.field(None);
+            } else if let Some(els) = array_elements(b).filter(|_| *kind == crate::record::PIECE_TOOLS || *kind == crate::record::PIECE_SYSTEM) {
+                let ids: Vec<String> = els
+                    .iter()
+                    .map(|e| {
+                        let next = blocks.len() as u32;
+                        let id = *block_ids.entry(xxh3_128(e)).or_insert(next);
+                        if id == next {
+                            blocks.push(e.to_vec());
+                        }
+                        id.to_string()
+                    })
+                    .collect();
+                c.field(None);
+                c.field(None);
+                c.field(Some(format!("{{{}}}", ids.join(",")).as_bytes()));
+            } else {
+                c.field(Some(b));
+                c.field(None);
+                c.field(None);
+            }
+            c.end_row()?;
+        }
+        Ok(())
+    })
+    .map_err(pe)?;
+    pg.copy_in("COPY blocks FROM STDIN", |c| {
+        for (i, b) in blocks.iter().enumerate() {
+            c.int(i as i64);
+            c.field(Some(b));
             c.end_row()?;
         }
         Ok(())
@@ -245,6 +478,9 @@ pub fn load(db: &Db, pg: &mut Pg) -> R<String> {
         "ALTER TABLE messages ADD PRIMARY KEY (id);
          ALTER TABLE nodes ADD PRIMARY KEY (session, node);
          ALTER TABLE requests ADD PRIMARY KEY (id);
+         ALTER TABLE pieces ADD PRIMARY KEY (id);
+         ALTER TABLE blocks ADD PRIMARY KEY (id);
+         ALTER TABLE metas ADD PRIMARY KEY (id);
          ALTER TABLE steps ADD PRIMARY KEY (session, step);
          CREATE INDEX steps_tool ON steps (tool);
          CREATE INDEX path_steps_order ON path_steps (session, path, depth);
@@ -581,6 +817,22 @@ pub fn run_reads(db: &Db, pg: &mut Pg, n: usize, seed: u64) -> R<Vec<ReadOutcome
             same += (sha256(&eb) == sha256(pb.as_bytes())) as usize;
         }
         res.push(ReadOutcome { name: "a whole session's messages".into(), same, total: m, engine: (quantile(&mut te.clone(), 0.5), quantile(&mut te, 0.95)), pg: (quantile(&mut tp.clone(), 0.5), quantile(&mut tp, 0.95)) });
+    }
+    // 4. a whole request rebuilt byte for byte, as it was sent (less what is never stored)
+    {
+        let (mut te, mut tp, mut same) = (Vec::new(), Vec::new(), 0);
+        for _ in 0..n {
+            let ri = all[r.below(all.len() as u64) as usize];
+            let id = db.request(ri).map_err(e)?.id;
+            let a = Instant::now();
+            let eb = db.rebuild(ri).map_err(e)?;
+            te.push(a.elapsed().as_secs_f64() * 1e3);
+            let a = Instant::now();
+            let pb = pg_rebuild(pg, &id)?;
+            tp.push(a.elapsed().as_secs_f64() * 1e3);
+            same += (eb == pb) as usize;
+        }
+        res.push(ReadOutcome { name: "a whole request rebuilt".into(), same, total: n, engine: (quantile(&mut te.clone(), 0.5), quantile(&mut te, 0.95)), pg: (quantile(&mut tp.clone(), 0.5), quantile(&mut tp, 0.95)) });
     }
     Ok(res)
 }

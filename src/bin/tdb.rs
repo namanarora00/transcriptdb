@@ -12,8 +12,10 @@
 //!   tdb h2h           --store DIR [--pg ADDR] [--split x] [--sizes-only x]
 //!
 //! Writing commands take --merge-level 19 --dict-kb 1024 --dict-content-kb 8192 --zstd-threads N
-//! (full-size merges and compact: zstd level, trained dictionary size, messages added to
-//! the dictionary, compression threads).
+//! --cold-days 7 --cold-mb 4 (full-size merges and compact: zstd level, trained dictionary
+//! size, messages added to the dictionary, compression threads, how much older than the
+//! newest request a session's last one must be for it to be cold, and its runs' size;
+//! --cold-mb 0 keeps every session in 64 KB frames).
 //!
 //! Thinking (text, signatures, redacted thinking) and images are never stored: they are
 //! replaced by empty strings at ingest. `--drop` blanks documents and other base64 too.
@@ -92,6 +94,8 @@ impl Args {
             merge_level: self.num("merge-level", Options::default().merge_level as u64) as i32,
             dict_bytes: (self.num("dict-kb", (Options::default().dict_bytes >> 10) as u64) as usize) << 10,
             dict_content: (self.num("dict-content-kb", (Options::default().dict_content >> 10) as u64) as usize) << 10,
+            cold_after_ms: self.num("cold-days", (Options::default().cold_after_ms / 86_400_000) as u64) as i64 * 86_400_000,
+            cold_run: (self.num("cold-mb", (Options::default().cold_run >> 20) as u64) as usize) << 20,
             threads: self.num("zstd-threads", Options::default().threads as u64) as usize,
             frame_size: (self.num("frame-kb", 64) as usize) << 10,
             keep: self.keep(),
@@ -453,6 +457,8 @@ fn stats(a: &Args) {
         mb(st.wal_bytes)
     );
     println!("  message frames {}  ({:.2}x smaller than the {} they hold)", mb(st.frame_bytes), st.node_bytes as f64 / st.frame_bytes.max(1) as f64, mb(st.node_bytes));
+    let (cold, cold_bytes) = db.cold_sessions().expect("cold sessions");
+    println!("  sessions in cold runs: {cold} of {} ({} of messages)", st.sessions, mb(cold_bytes));
     println!("  opaque values {} raw ({} values)", mb(st.opaque_bytes), st.opaques);
     println!("  shared pieces {} compressed from {} ({} pieces: skeletons, system, tools, markers)", mb(st.piece_bytes), mb(st.piece_raw_bytes), st.pieces);
     println!("  segment blocks, directories and catalogs {}; index runs {}", mb(st.index_bytes), mb(st.index_file_bytes));
