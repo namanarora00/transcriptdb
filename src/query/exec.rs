@@ -243,23 +243,91 @@ pub fn session_matches(db: &Db, c: &Compiled, s: u32, now: i64, scanned: &Atomic
         }
     }
     scanned.fetch_add(ss.rows.len(), Ordering::Relaxed);
-    let mut masks = MASKS.with(|b| std::mem::take(&mut *b.borrow_mut()));
-    masks.clear();
-    masks.resize(ss.rows.len(), 0);
-    let r = session_matches_in(db, c, s, ss, now, &mut masks);
-    MASKS.with(|b| *b.borrow_mut() = masks);
+    let mut sc = SCRATCH.with(|b| std::mem::take(&mut *b.borrow_mut()));
+    // the masks are all zero between sessions: only the steps a session wrote are cleared
+    let n = ss.rows.len();
+    if sc.masks.len() < n {
+        sc.masks.resize(n, 0);
+    }
+    let r = session_matches_in(db, c, s, ss, now, &mut sc);
+    if c.eq.is_none() || r.is_err() {
+        sc.masks[..n].fill(0);
+    } else {
+        let by = ss.by_shape();
+        for code in 0..=255u8 {
+            if c.shape_masks[code as usize] != Some(0) {
+                for &p in by.of(code) {
+                    sc.masks[p as usize] = 0;
+                }
+            }
+        }
+    }
+    SCRATCH.with(|b| *b.borrow_mut() = sc);
     r
 }
 
-thread_local! {
-    /// Per-step masks, kept between sessions so each does not allocate its own.
-    static MASKS: std::cell::RefCell<Vec<u64>> = const { std::cell::RefCell::new(Vec::new()) };
+/// Working arrays of one session's matching, kept between sessions so each session does
+/// not allocate its own (a session with few steps costs about as much to allocate for as
+/// to match).
+#[derive(Default)]
+struct Scratch {
+    /// Per-step masks.
+    masks: Vec<u64>,
+    active: Vec<u32>,
+    runs: Vec<(u32, u32)>,
+    merged: Vec<u32>,
+    keys: Vec<(u32, u32)>,
+    by_code: Vec<u32>,
+    seen: Vec<u64>,
+    gx: Vec<u64>,
+    at: Vec<u32>,
+    fill: Vec<u32>,
+    flat: Vec<(u32, u64)>,
 }
 
-fn session_matches_in(db: &Db, c: &Compiled, s: u32, ss: &steps::SessionSteps, now: i64, masks: &mut [u64]) -> Result<Option<Vec<Match>>, QError> {
+thread_local! {
+    static SCRATCH: std::cell::RefCell<Scratch> = std::cell::RefCell::new(Scratch::default());
+}
+
+/// Put `active`, made of ascending runs `runs` (start, end), in ascending order.
+fn merge_runs(active: &mut Vec<u32>, runs: &mut Vec<(u32, u32)>, merged: &mut Vec<u32>) {
+    runs.retain(|r| r.0 < r.1);
+    if runs.len() <= 1 {
+        return;
+    }
+    if runs.len() > 8 {
+        active.sort_unstable();
+        return;
+    }
+    merged.clear();
+    merged.reserve(active.len());
+    loop {
+        // the run whose next step comes first
+        let mut best = usize::MAX;
+        let mut low = u32::MAX;
+        for (i, r) in runs.iter().enumerate() {
+            if r.0 < r.1 && (best == usize::MAX || active[r.0 as usize] < low) {
+                best = i;
+                low = active[r.0 as usize];
+            }
+        }
+        if best == usize::MAX {
+            break;
+        }
+        merged.push(low);
+        runs[best].0 += 1;
+    }
+    std::mem::swap(active, merged);
+}
+
+fn session_matches_in(db: &Db, c: &Compiled, s: u32, ss: &steps::SessionSteps, now: i64, sc: &mut Scratch) -> Result<Option<Vec<Match>>, QError> {
+    let Scratch { masks, active, runs, merged, keys, by_code, seen, gx, at, fill, flat } = sc;
+    let masks: &mut [u64] = &mut masks[..ss.rows.len()];
     // masks by shape code: whole groups of steps at once where tool and outcome decide every
-    // test, step by step elsewhere; `active` gets the steps passing some element
-    let mut active: Vec<u32> = Vec::new();
+    // test, step by step elsewhere; `active` gets the steps passing some element, as one
+    // ascending run per shape code
+    active.clear();
+    runs.clear();
     if c.eq.is_none() {
         // every step's mask, in order
         for (pos, m) in masks.iter_mut().enumerate() {
@@ -296,10 +364,13 @@ fn session_matches_in(db: &Db, c: &Compiled, s: u32, ss: &steps::SessionSteps, n
                     masks[p as usize] = x;
                 }
                 if x as u32 != 0 {
+                    let a = active.len() as u32;
                     active.extend_from_slice(ps);
+                    runs.push((a, active.len() as u32));
                 }
             }
             None => {
+                let a = active.len() as u32;
                 for &pos in ps {
                     let mut m = 0u64;
                     for (k, t) in c.elems.iter().enumerate() {
@@ -317,10 +388,11 @@ fn session_matches_in(db: &Db, c: &Compiled, s: u32, ss: &steps::SessionSteps, n
                         active.push(pos);
                     }
                 }
+                runs.push((a, active.len() as u32));
             }
         }
     }
-    active.sort_unstable();
+    merge_runs(active, runs, merged);
     let masks: &[u64] = masks;
     let mut out = Vec::new();
     match &c.eq {
@@ -331,11 +403,12 @@ fn session_matches_in(db: &Db, c: &Compiled, s: u32, ss: &steps::SessionSteps, n
             // (step, value id) of the steps a compared element passes, with each distinct
             // value (dictionary codes by array, long values by text) and the compared
             // elements it has a step for
-            let mut keys: Vec<(u32, u32)> = Vec::new();
-            let mut by_code: Vec<u32> = vec![u32::MAX; fcode.map_or(0, |f| ss.value_count(f))];
+            keys.clear();
+            by_code.clear();
+            by_code.resize(fcode.map_or(0, |f| ss.value_count(f)), u32::MAX);
             let mut longs: HashMap<Vec<u8>, u32> = HashMap::new();
-            let mut seen: Vec<u64> = Vec::new();
-            for &pos in &active {
+            seen.clear();
+            for &pos in active.iter() {
                 let m = masks[pos as usize];
                 if let Some(f) = fcode
                     && m & bits != 0
@@ -367,7 +440,8 @@ fn session_matches_in(db: &Db, c: &Compiled, s: u32, ss: &steps::SessionSteps, n
                 // value visits just its own turns
                 let turns = ss.turns();
                 let nt = turns.depth.len();
-                let mut gx = vec![0u64; nt];
+                gx.clear();
+                gx.resize(nt, 0);
                 if !c.spec.excl.is_empty() {
                     for (pos, m) in masks.iter().enumerate() {
                         gx[turns.of[pos] as usize] |= m >> 32;
@@ -381,8 +455,9 @@ fn session_matches_in(db: &Db, c: &Compiled, s: u32, ss: &steps::SessionSteps, n
                     }
                 }
                 // steps of each value seen by every compared element, in one array by value
-                let mut at = vec![0u32; seen.len() + 1];
-                for &(_, v) in &keys {
+                at.clear();
+                at.resize(seen.len() + 1, 0);
+                for &(_, v) in keys.iter() {
                     if seen[v as usize] == bits {
                         at[v as usize + 1] += 1;
                     }
@@ -390,20 +465,22 @@ fn session_matches_in(db: &Db, c: &Compiled, s: u32, ss: &steps::SessionSteps, n
                 for v in 0..seen.len() {
                     at[v + 1] += at[v];
                 }
-                let mut fill = at.clone();
-                let mut flat = vec![(0u32, 0u64); at[seen.len()] as usize];
-                for &(pos, v) in &keys {
+                fill.clear();
+                fill.extend_from_slice(at);
+                flat.clear();
+                flat.resize(at[seen.len()] as usize, (0u32, 0u64));
+                for &(pos, v) in keys.iter() {
                     if seen[v as usize] == bits {
                         flat[fill[v as usize] as usize] = (pos, masks[pos as usize]);
                         fill[v as usize] += 1;
                     }
                 }
                 for v in 0..seen.len() {
-                    matcher::run_sparse(&c.spec, &turns, &gx, &xs, &flat[at[v] as usize..at[v + 1] as usize], &mut out);
+                    matcher::run_sparse(&c.spec, &turns, gx, &xs, &flat[at[v] as usize..at[v + 1] as usize], &mut out);
                 }
             } else {
                 let mut key_of: Vec<u32> = vec![u32::MAX; masks.len()];
-                for &(pos, v) in &keys {
+                for &(pos, v) in keys.iter() {
                     key_of[pos as usize] = v;
                 }
                 let mut part = vec![0u64; masks.len()];

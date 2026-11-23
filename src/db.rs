@@ -449,6 +449,10 @@ pub struct Db {
     skels: Cache<u32, Skeleton>,
     /// Decoded summary blocks by (segment, offset).
     statc: Cache<(u32, u64), StatBlock>,
+    /// Input values over `MAX_VALUE` that queries read, by (session, call message, offset
+    /// in it): their text is only in the message, and in a cold session reading it decodes
+    /// a whole run.
+    longc: Cache<(u32, u32, u32), Option<Vec<u8>>>,
     /// Per segment holding parts that folds replaced: which of its parts are live, as of a
     /// manifest generation.
     live_masks: Mutex<HashMap<u32, (u64, Arc<Vec<bool>>)>>,
@@ -595,6 +599,7 @@ impl Db {
             piece_bases: HashMap::new(),
             skels: Cache::sharded(cb / 32, 16),
             statc: Cache::new(cb / 12),
+            longc: Cache::sharded(cb / 16, 16),
             live_masks: Mutex::new(HashMap::new()),
             active: HashMap::new(),
             busy: BTreeSet::new(),
@@ -1366,7 +1371,7 @@ impl Db {
                     p.longs.push(ss.long_at(v));
                     // the summaries index long values' words, so their text is read here
                     let name = String::from_utf8_lossy(self.sd.fields.get(f)).into_owned();
-                    p.long_text.push(self.long_value(s, ss, pos, v, &name)?.unwrap_or_default());
+                    p.long_text.push(self.read_long_value(s, ss, pos, v, &name)?.unwrap_or_default());
                     steps::LONG_BASE + p.longs.len() as u32 - 1
                 } else {
                     *vl.entry((f, v)).or_insert_with(|| {
@@ -1771,7 +1776,7 @@ impl Db {
             return corrupt("merge with unflushed sessions");
         }
         self.key_ix.clear();
-        for c in [&self.cores as &dyn Clear, &self.stepc, &self.lightc, &self.dirs, &self.blocks, &self.statc] {
+        for c in [&self.cores as &dyn Clear, &self.stepc, &self.lightc, &self.dirs, &self.blocks, &self.statc, &self.longc] {
             c.clear_all();
         }
         let mut bytes_out = 0;
@@ -2306,6 +2311,7 @@ impl Db {
             ("steps", self.stepc.stats()),
             ("steps without values", self.lightc.stats()),
             ("step summaries", self.statc.stats()),
+            ("long input values", self.longc.stats()),
             ("blocks", self.blocks.stats()),
             ("directories", self.dirs.stats()),
             ("index blocks", self.ix.stats()),
@@ -2392,7 +2398,20 @@ impl Db {
     /// The raw JSON text of long input value `v` (a `LONG_BASE` code) of field `name` of
     /// step `pos`: just its bytes, unless an opaque value sits inside (then the message is
     /// rebuilt). `None` if the call no longer has the field.
+    /// Kept in a cache after the first read: a message of a session never changes.
     pub fn long_value(&self, s: u32, ss: &SessionSteps, pos: u32, v: u32, name: &str) -> Result<Option<Vec<u8>>> {
+        let key = (s, ss.rows[pos as usize].call_node, ss.long_at(v).0);
+        if let Some(x) = self.longc.get(&key) {
+            return Ok((*x).clone());
+        }
+        let x = self.read_long_value(s, ss, pos, v, name)?;
+        let size = 64 + x.as_ref().map_or(0, |b| b.len());
+        Ok((*self.longc.insert(key, Arc::new(x), size)).clone())
+    }
+
+    /// [`Db::long_value`] straight from the message (what writing a segment uses: it reads
+    /// every long value once).
+    fn read_long_value(&self, s: u32, ss: &SessionSteps, pos: u32, v: u32, name: &str) -> Result<Option<Vec<u8>>> {
         let (off, len) = ss.long_at(v);
         let r = ss.rows[pos as usize];
         match self.stored_range(s, r.call_node, off, len)? {
@@ -2540,6 +2559,14 @@ impl Db {
     /// A segment's tool and field codes mapped to the store's.
     pub fn seg_codes(&self, num: u32) -> Option<&(Vec<u32>, Vec<u32>)> {
         self.seg_codes.get(&num)
+    }
+
+    /// The name of a segment's field code (for reports).
+    pub fn seg_field_name(&self, num: u32, seg_field: u32) -> String {
+        match self.seg_codes.get(&num).and_then(|c| c.1.get(seg_field as usize)) {
+            Some(&f) => String::from_utf8_lossy(self.sd.fields.get(f)).into_owned(),
+            None => format!("#{seg_field}"),
+        }
     }
 
     /// One message (tree node) of a session, with opaque values put back.
@@ -2709,7 +2736,7 @@ impl Db {
 
     /// Drop everything read from files from the caches (sessions taking writes stay).
     pub fn clear_caches(&self) {
-        for c in [&self.cores as &dyn Clear, &self.stepc, &self.lightc, &self.dirs, &self.blocks, &self.ix, &self.pieces, &self.skels, &self.statc] {
+        for c in [&self.cores as &dyn Clear, &self.stepc, &self.lightc, &self.dirs, &self.blocks, &self.ix, &self.pieces, &self.skels, &self.statc, &self.longc] {
             c.clear_all();
         }
     }

@@ -921,8 +921,9 @@ impl SegWriter {
         let (f, pos) = (&mut self.f, &mut self.pos);
         let mut stats_bytes = 0u64;
         let step_refs: Vec<PartRef> = self.dir.iter().map(|d| d.steps).collect();
+        let level = self.codec.block_level;
         let head = stats.finish(&step_refs, &mut |raw| {
-            let r = write_block(f, pos, raw, 3)?;
+            let r = write_block(f, pos, raw, level)?;
             stats_bytes += r.clen as u64;
             Ok(r)
         })?;
