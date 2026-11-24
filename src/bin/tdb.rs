@@ -697,12 +697,15 @@ fn screen(a: &Args) {
     let all: Vec<u32> = (0..db.session_count() as u32).collect();
     let ids = db.key_ids(&all).expect("read sessions");
     let total: std::collections::HashSet<u32> = ids.iter().map(|x| x.0).collect();
-    let mut flagged: std::collections::HashSet<u32> = Default::default();
+    let mut flagged: std::collections::HashSet<String> = Default::default();
     let mut sum_ms = 0.0;
     println!("{:<52} {:>10} {:>9} {:>7}", "filter (one thread)", "ms", "sessions", "share");
     for (name, q) in &filters {
+        // a filter passes sessions on: grouped by session id, which also lets a filter on
+        // one input field be answered from the step summaries
+        let q = &format!("{q} | summarize n = count() by session");
         let mut best = f64::MAX;
-        let mut hit: std::collections::HashSet<u32> = Default::default();
+        let mut hit: std::collections::HashSet<String> = Default::default();
         for _ in 0..reps.max(1) {
             let t = Instant::now();
             let run = match transcriptdb::query::run(&db, q, 1) {
@@ -713,7 +716,7 @@ fn screen(a: &Args) {
                 }
             };
             best = best.min(t.elapsed().as_secs_f64() * 1e3);
-            hit = run.table.rows.iter().map(|r| ids[r.session as usize].0).collect();
+            hit = run.table.rows.iter().map(|r| r.vals[0].to_string()).collect();
         }
         sum_ms += best;
         println!("{:<52} {:>10.3} {:>9} {:>6.1}%", name, best, hit.len(), 100.0 * hit.len() as f64 / total.len().max(1) as f64);

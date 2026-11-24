@@ -53,7 +53,7 @@ BUGS=(
   "regex-one-branch-enough|src/query/relit.rs|                    Req::Any => return Req::Any,
                     Req::Or(inner) => out.extend(inner),|                    Req::Any => {}
                     Req::Or(inner) => out.extend(inner),|lib:nothing_when_unsure"
-  "regex-as-plain-words|src/query/summary.rs|if !matches!(op, StrOp::Matches \| StrOp::Regex) && is_ref(e)|if !matches!(op, StrOp::Matches) && is_ref(e)|test:regex_errors_and_step_fields"
+  "regex-either-branch-both-required|src/query/summary.rs|            other => regex_spec(&other).into_iter().collect(),|            other => regex_spec(&other).into_iter().flatten().map(\|w\| vec![w]).collect(),|test:regex_errors_and_step_fields"
   "word-suffix-as-inside|src/textindex.rs|if if fit == Fit::Suffix { at + run.len() == end } else { at + run.len() <= end } {|if at + run.len() <= end {|lib:round_trip_and_lookups"
 )
 

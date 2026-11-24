@@ -464,6 +464,9 @@ fn phrases_across_pieces_and_shared_session_ids() {
             (r#"messages | where text matches regex @"needle \.+ +one""#, 1),
             (r#"messages | where text matches regex "a{50}needle""#, 1),
             (r#"messages | where text matches regex "x?needle one$""#, 2),
+            // an optional part is not something a match must hold
+            (r#"messages | where text matches regex "(very )?needle one$""#, 2),
+            (r#"messages | where text matches regex "(missing)*needle (one|absent)""#, 5),
             (r#"messages | where text matches regex @"^\.+ needle one \.""#, 1),
         ] {
             let (a, b) = (message_rows(db, q, true), message_rows(db, q, false));
@@ -505,10 +508,13 @@ fn regex_errors_and_step_fields() {
         let fast = rows(&format!(r#"where command matches regex @"{rx}" or file_path matches regex @"{rx}" | summarize n = count()"#));
         let slow = rows(&format!(r#"where command matches regex @"{rx}" or file_path matches regex @"{rx}" | extend one = 1 | summarize n = count()"#));
         assert_eq!(fast, slow, "regex {rx}: one test");
-        let fast = rows(&format!(r#"where command matches regex @"{rx}" | summarize n = count(), s = dcount(session) by tool"#));
-        let slow = rows(&format!(r#"where command matches regex @"{rx}" | extend one = 1 | summarize n = count(), s = dcount(session) by tool"#));
-        assert_eq!(fast, slow, "regex {rx}: by tool");
-        found += !slow.is_empty() as usize;
+        let q = format!(r#"where command matches regex @"{rx}" | summarize n = count(), s = dcount(session)"#);
+        let fast = rows(&q);
+        let slow = rows(&format!(r#"where command matches regex @"{rx}" | extend one = 1 | summarize n = count(), s = dcount(session)"#));
+        assert_eq!(fast, slow, "regex {rx}: counted");
+        // this one is answered from the summaries, where the word index narrows the values read
+        assert!(query::run(&db, &q, 1).unwrap().stats.summarized, "regex {rx}: not answered from the summaries");
+        found += (slow[0][0] != "0") as usize;
     }
     assert!(found >= 3, "only {found} patterns found anything");
     drop(db);
