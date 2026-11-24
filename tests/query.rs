@@ -466,6 +466,10 @@ fn phrases_across_pieces_and_shared_session_ids() {
             (r#"messages | where text matches regex "x?needle one$""#, 2),
             // an optional part is not something a match must hold
             (r#"messages | where text matches regex "(very )?needle one$""#, 2),
+            (r#"messages | where text matches regex @"(very\s+)?needle one$""#, 2),
+            // a letter that may be missing: both spellings are looked up
+            (r#"messages | where text matches regex "needles? one""#, 5),
+            (r#"messages | where text matches regex "needle (zzz )?one""#, 5),
             (r#"messages | where text matches regex "(missing)*needle (one|absent)""#, 5),
             (r#"messages | where text matches regex @"^\.+ needle one \.""#, 1),
         ] {

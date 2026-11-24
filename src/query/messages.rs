@@ -358,8 +358,16 @@ fn candidates(db: &Db, num: u32, h: &TextHead, low: &str, whole: bool) -> Result
     Ok(Some(Cand { bits: cand.unwrap(), near, open, single }))
 }
 
-/// The units of `scope` that may contain the lower-cased ASCII text `low` ignoring case.
+/// The units of `scope` that may contain the lower-cased ASCII text `low` ignoring case:
+/// those the index and the text windows say hold it, and those only their whole text can
+/// answer for.
 fn literal_units(db: &Db, num: u32, h: &TextHead, low: &str, scope: &Bits) -> Result<Bits, QError> {
+    // a phrase is confirmed on the text windows; for one word the index is as good
+    if is_phrase(low) {
+        let (mut units, maybe) = text_atom(db, num, h, StrOp::Contains, low, false, scope)?;
+        or(&mut units, &maybe);
+        return Ok(units);
+    }
     let Some(c) = candidates(db, num, h, low, false)? else { return Ok(scope.clone()) };
     let mut units = if c.near { h.units_with(&c.bits) } else { c.bits };
     if c.open {
@@ -370,6 +378,21 @@ fn literal_units(db: &Db, num: u32, h: &TextHead, low: &str, scope: &Bits) -> Re
     Ok(units)
 }
 
+/// Whether a lower-cased text has more than one word the index can look up.
+fn is_phrase(low: &str) -> bool {
+    textindex::pattern_runs(low, false).0.len() >= 2
+}
+
+/// Whether a requirement holds a phrase: those are narrowed last, on the fewest units.
+fn has_phrase(req: &super::relit::Req) -> bool {
+    use super::relit::Req;
+    match req {
+        Req::Any => false,
+        Req::Lit(s) => is_phrase(s),
+        Req::And(v) | Req::Or(v) => v.iter().any(has_phrase),
+    }
+}
+
 /// The units of `scope` that may hold what a regular expression requires.
 fn required_units(db: &Db, num: u32, h: &TextHead, req: &super::relit::Req, scope: &Bits) -> Result<Bits, QError> {
     use super::relit::Req;
@@ -378,7 +401,7 @@ fn required_units(db: &Db, num: u32, h: &TextHead, req: &super::relit::Req, scop
         Req::Lit(s) => literal_units(db, num, h, s, scope)?,
         Req::And(v) => {
             let mut out = scope.clone();
-            for x in v {
+            for x in v.iter().filter(|x| !has_phrase(x)).chain(v.iter().filter(|x| has_phrase(x))) {
                 if !textindex::any(&out) {
                     break;
                 }

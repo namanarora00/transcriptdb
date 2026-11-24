@@ -54,6 +54,8 @@ BUGS=(
                     Req::Or(inner) => out.extend(inner),|                    Req::Any => {}
                     Req::Or(inner) => out.extend(inner),|lib:nothing_when_unsure"
   "regex-either-branch-both-required|src/query/summary.rs|            other => regex_spec(&other).into_iter().collect(),|            other => regex_spec(&other).into_iter().flatten().map(\|w\| vec![w]).collect(),|test:regex_errors_and_step_fields"
+  "regex-shortest-spelling-dropped|src/query/relit.rs|                if k >= r.min {|                if k > r.min {|test:phrases_across_pieces_and_shared_session_ids"
+  "regex-long-words-not-read|src/query/messages.rs|        or(&mut units, &maybe);|        let _ = &maybe;|test:phrases_across_pieces_and_shared_session_ids"
   "word-suffix-as-inside|src/textindex.rs|if if fit == Fit::Suffix { at + run.len() == end } else { at + run.len() <= end } {|if at + run.len() <= end {|lib:round_trip_and_lookups"
 )
 

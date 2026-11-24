@@ -95,14 +95,29 @@ fn set(h: &Hir) -> Option<Vec<String>> {
             }
             acc
         }
-        HirKind::Repetition(r) if r.min == r.max.unwrap_or(u32::MAX) && r.min <= 8 => {
+        // a part repeated a few times at most (`s?`, `a{1,3}`): every count it may take
+        HirKind::Repetition(r) => {
+            let max = r.max.filter(|&m| m <= 8)?;
             let one = set(&r.sub)?;
-            if one.len() != 1 {
-                return None;
+            let mut out: Vec<String> = Vec::new();
+            let mut cur = vec![String::new()];
+            for k in 0..=max {
+                if k >= r.min {
+                    for t in &cur {
+                        if !out.contains(t) {
+                            out.push(t.clone());
+                        }
+                    }
+                }
+                if k < max {
+                    if cur.len() * one.len() > MAX_SET {
+                        return None;
+                    }
+                    cur = cur.iter().flat_map(|a| one.iter().map(move |n| format!("{a}{n}"))).collect();
+                }
             }
-            vec![one[0].repeat(r.min as usize)]
+            out
         }
-        _ => return None,
     };
     (out.len() <= MAX_SET && out.iter().all(|t| t.len() <= MAX_LEN)).then_some(out)
 }
@@ -224,6 +239,13 @@ mod tests {
         assert_eq!(required("foo.*bar"), Req::And(vec![lit("foo"), lit("bar")]));
         assert_eq!(required("(foo)+bar"), Req::And(vec![lit("foo"), lit("bar")]));
         assert_eq!(required("ab{3}c"), lit("abbbc"));
+        // an optional part spells out both ways
+        assert_eq!(required(r"\d+ tests? failed"), Req::Or(vec![lit(" test failed"), lit(" tests failed")]));
+        assert_eq!(required("ab{1,2}c"), Req::Or(vec![lit("abc"), lit("abbc")]));
+        assert_eq!(required("(very )?needle"), Req::Or(vec![lit("needle"), lit("very needle")]));
+        assert_eq!(required(r"(very\s+)?needle"), lit("needle"));
+        assert_eq!(required("x?y?"), Req::Any);
+        assert_eq!(required("a{0,20}b"), lit("b"));
     }
 
     #[test]
