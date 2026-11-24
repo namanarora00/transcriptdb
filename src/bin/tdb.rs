@@ -1187,7 +1187,7 @@ fn scale(a: &Args) {
                 worst_quiet = worst_quiet.max(us);
             }
             bytes_in += it.body.len() as u64;
-            if k as u64 % check_every == 0 {
+            if (k as u64).is_multiple_of(check_every) {
                 kept.push((it.id, sha256(&it.body)));
             }
         }
