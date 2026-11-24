@@ -286,6 +286,19 @@ fn aggregations_skip_parts_that_folds_replaced() {
     assert!(st.merges.folded > 0 && st.dead_bytes > 0, "no parts replaced by folds: {:?}", st.merges);
     let used = check_aggregations(&db, 150, 9);
     assert!(used >= 40, "summaries answered only {used} of 150");
+    // text search skips the replaced parts too
+    let mut hits = 0;
+    for q in [
+        r#"messages | where text has "parser""#,
+        r#"messages | where text contains "test fails" or text has "cargo""#,
+        r#"messages | where role == "assistant" and not (text has "empty")"#,
+        r#"messages"#,
+    ] {
+        let (a, b) = (message_rows(&db, q, true), message_rows(&db, q, false));
+        assert_eq!(a, b, "index and scan differ on {q}");
+        hits += b.len();
+    }
+    assert!(hits > 100, "only {hits} text units found");
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -386,6 +399,76 @@ fn message_search_matches_a_scan_at_every_stage() {
         let rows = |q: &str| -> Vec<Vec<String>> { query::run(&db, q, 1).unwrap_or_else(|e| panic!("{}", e.show(q))).table.rows.iter().map(|r| r.vals.iter().map(|v| v.to_string()).collect()).collect() };
         assert_eq!(rows(&fast), rows(&slow), "grouping by {by}");
     }
+    drop(db);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `n` bytes with no word in them, ending in a space.
+fn pad(n: usize) -> String {
+    format!("{} ", ".".repeat(n - 1))
+}
+
+/// Phrases at piece boundaries, at the ends of long texts, inside longer words and next
+/// to words too long for the index, and sessions that share a session id: the word index
+/// finds exactly what reading every text finds.
+#[test]
+fn phrases_across_pieces_and_shared_session_ids() {
+    let texts = [
+        // "needle" starts in the first piece, "one" in the second
+        format!("{}needle one {}", pad(1018), pad(500)),
+        // both words, far apart
+        format!("needle {} one", pad(3000)),
+        // at the very end, and at the very start
+        format!("{}needle one", pad(2000)),
+        format!("needle one {}", pad(2000)),
+        // not a whole word where the text is, but both words stand alone further on
+        format!("{}xneedle one {}needle zzz one {}", pad(511), pad(577), pad(300)),
+        // after a run of letters too long to be indexed whole
+        format!("{}needle one", "a".repeat(200)),
+        "Needle ONE".to_string(),
+        "nothing here".to_string(),
+    ];
+    let dir = tmpdir("pieces");
+    let mut db = Db::open(&dir, opts()).unwrap();
+    let mut put = |db: &mut Db, session: &str, agent: &str, k: usize, text: &str| {
+        let b = body(&[format!(r#"{{"role":"user","content":"{text}"}}"#)]);
+        db.put(&Put { session, agent, id: &format!("r{k}"), time: &format!("{}", 1_700_000_000 + k), meta: b"", body: b.as_bytes() }).unwrap();
+    };
+    for (k, t) in texts.iter().enumerate() {
+        put(&mut db, &format!("s{k}"), "", k, t);
+    }
+    // one session id stored three times: the main agent and two side agents
+    put(&mut db, "shared", "", 100, "a needle for the main agent");
+    put(&mut db, "shared", "side-1", 101, "a needle for a side agent");
+    put(&mut db, "shared", "side-2", 102, "no such thing here");
+    db.commit().unwrap();
+    let check = |db: &Db, stage: &str| {
+        for (q, want) in [
+            (r#"messages | where text contains "needle one""#, 6),
+            (r#"messages | where text has "needle one""#, 4),
+            (r#"messages | where text contains "eedle on""#, 6),
+            (r#"messages | where text has "needle""#, 8),
+            (r#"messages | where text contains_cs "needle one""#, 5),
+            (r#"messages | where not (text contains "needle one") and role == "user""#, 5),
+            (r#"messages | where text endswith "needle one" or text startswith "needle one""#, 4),
+        ] {
+            let (a, b) = (message_rows(db, q, true), message_rows(db, q, false));
+            assert_eq!(a, b, "{stage}: index and scan differ on {q}");
+            assert_eq!(b.len(), want, "{stage}: {q}");
+        }
+        let rows = |q: &str| -> Vec<Vec<String>> { query::run(db, q, 1).unwrap_or_else(|e| panic!("{}", e.show(q))).table.rows.iter().map(|r| r.vals.iter().map(|v| v.to_string()).collect()).collect() };
+        let fast = rows(r#"messages | where text has "needle" | summarize n = count(), s = dcount(session) by session | sort by session asc"#);
+        let slow = rows(r#"messages | where text has "needle" | extend one = 1 | summarize n = count(), s = dcount(session) by session | sort by session asc"#);
+        assert_eq!(fast, slow, "{stage}: grouping by session");
+        assert!(fast.contains(&vec!["shared".to_string(), "2".to_string(), "1".to_string()]), "{stage}: the shared session id is one group");
+        let all = rows(r#"messages | where text has "needle" | summarize n = count(), s = dcount(session)"#);
+        assert_eq!(all, vec![vec!["8".to_string(), "7".to_string()]], "{stage}: distinct session ids");
+    };
+    check(&db, "in memory");
+    db.flush().unwrap();
+    check(&db, "flushed");
+    db.compact().unwrap();
+    check(&db, "merged");
     drop(db);
     let _ = std::fs::remove_dir_all(&dir);
 }

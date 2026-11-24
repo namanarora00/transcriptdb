@@ -2491,7 +2491,9 @@ impl Db {
                 // a segment without a word index has no text units
                 continue;
             }
-            let live = if self.manifest.dead.iter().any(|(n, _)| *n == num) { Some(self.live_mask(seg)?) } else { None };
+            // parts a fold replaced are searched where they were written again
+            let replaced = self.manifest.dead.iter().any(|(n, _)| *n == num);
+            let live = if replaced { Some(self.live_mask(seg)?) } else { None };
             out.push(TextSource::Seg { num, live });
         }
         let mut act: Vec<(&u32, &Active)> = self.active.iter().collect();

@@ -41,6 +41,15 @@ BUGS=(
 |test:patterns_follow_sessions_taking_writes"
   "escaped-hit-counted|src/query/plan.rs|        if slashes % 2 == 0 {|        if true {|lib:raw_contains"
   "shape-mask-bits|src/query/exec.rs|                Some(true) => m \|= 1 << bit,|                Some(true) => m \|= 1 << (bit ^ 1),|match"
+  "phrase-next-piece-ignored|src/query/messages.rs|            or(&mut b, &down);|            let _ = &down;|test:phrases_across_pieces_and_shared_session_ids"
+  "window-without-margin|src/textindex.rs|pub const WINDOW: usize = 512;|pub const WINDOW: usize = 0;|test:phrases_across_pieces_and_shared_session_ids"
+  "long-words-not-read|src/query/messages.rs|        or(&mut read_whole, &h.long);|        let _ = &h.long;|test:phrases_across_pieces_and_shared_session_ids"
+  "window-edge-is-a-word-end|src/query/messages.rs|let before = if a == 0 { !w.cut_left } else|let before = if a == 0 { true } else|test:phrases_across_pieces_and_shared_session_ids"
+  "grouped-by-stored-session|src/query/messages.rs|        let (sid, agent) = ids[at];|        let (sid, agent) = (s, ids[at].1);|test:phrases_across_pieces_and_shared_session_ids"
+  "roles-swapped|src/query/messages.rs|            if *user { and(&mut d, &h.user) } else { and_not(&mut d, &h.user) }|            if *user { and_not(&mut d, &h.user) } else { and(&mut d, &h.user) }|test:message_search_matches_a_scan_at_every_stage"
+  "unflushed-messages-not-searched|src/db.rs|            if (a.core.flushed_nodes as usize) < a.core.nodes.len() {|            if false && (a.core.flushed_nodes as usize) < a.core.nodes.len() {|test:message_search_matches_a_scan_at_every_stage"
+  "replaced-messages-searched|src/db.rs|            let live = if replaced { Some(self.live_mask(seg)?) } else { None };|            let live: Option<Arc<Vec<bool>>> = if replaced { None } else { None };|test:aggregations_skip_parts_that_folds_replaced"
+  "word-suffix-as-inside|src/textindex.rs|if if fit == Fit::Suffix { at + run.len() == end } else { at + run.len() <= end } {|if at + run.len() <= end {|lib:round_trip_and_lookups"
 )
 
 store() {
