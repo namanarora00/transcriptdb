@@ -251,7 +251,7 @@ pub fn check(e: &Expr) -> Result<(), QError> {
 
 fn full(n: usize) -> Bits {
     let mut b = vec![u64::MAX; n.div_ceil(64)];
-    if n % 64 != 0 {
+    if !n.is_multiple_of(64) {
         *b.last_mut().unwrap() = (1u64 << (n % 64)) - 1;
     }
     b
@@ -509,44 +509,42 @@ pub fn fast_fits(t: &Table, aggs: &[(String, super::parse::AggFn, Option<Expr>)]
 }
 
 /// `summarize` by session, agent and role without evaluating each row: the same groups in
-/// the same order (first seen) as the general path.
+/// the same order (first seen) as the general path. A session here is its id as text: the
+/// main agent and its side agents are stored apart and share one.
 pub fn fast_summarize(db: &Db, t: &Table, aggs: &[(String, super::parse::AggFn, Option<Expr>)], by: &[(String, Expr)]) -> Table {
     use super::parse::AggFn;
     use std::collections::HashMap;
-    let agent = by.iter().any(|(_, e)| is_col(e, "agent"));
-    // a group is (session or agent text, role): sessions sharing an agent name share a group
-    let mut names: HashMap<u32, u32> = HashMap::new();
-    let mut agent_ids: HashMap<String, u32> = HashMap::new();
-    let mut key_of = |s: u32| -> u32 {
-        if !agent {
-            return s;
-        }
-        *names.entry(s).or_insert_with(|| {
-            let a = db.session_key(s).1;
-            let next = agent_ids.len() as u32;
-            *agent_ids.entry(a).or_insert(next)
+    // number each distinct session id and agent name the rows have
+    let mut of_stored: HashMap<u32, (u32, u32)> = HashMap::new();
+    let (mut sids, mut agents): (HashMap<String, u32>, HashMap<String, u32>) = Default::default();
+    let mut ids = |s: u32| -> (u32, u32) {
+        *of_stored.entry(s).or_insert_with(|| {
+            let (sid, agent) = db.session_key(s);
+            let (ns, na) = (sids.len() as u32, agents.len() as u32);
+            (*sids.entry(sid).or_insert(ns), *agents.entry(agent).or_insert(na))
         })
     };
     let by_session = by.iter().any(|(_, e)| is_col(e, "session"));
+    let by_agent = by.iter().any(|(_, e)| is_col(e, "agent"));
     let by_role = by.iter().any(|(_, e)| is_col(e, "role"));
-    let mut groups: HashMap<(u32, u32, u32), usize> = HashMap::new();
-    // per group: a row that stands for it, its count, its distinct sessions
-    let mut acc: Vec<(usize, i64, Vec<u32>)> = Vec::new();
     let want_distinct = aggs.iter().any(|(_, f, _)| *f == AggFn::DCount);
+    let mut groups: HashMap<(u32, u32, u32), usize> = HashMap::new();
+    // per group: a row that stands for it, its count, its distinct session ids
+    let mut acc: Vec<(usize, i64, std::collections::HashSet<u32>)> = Vec::new();
     for (i, r) in t.rows.iter().enumerate() {
-        let k = (if by_session { r.session } else { NONE }, if agent { key_of(r.session) } else { NONE }, if by_role { r.steps[2] } else { NONE });
+        let (sid, agent) = ids(r.session);
+        let k = (if by_session { sid } else { NONE }, if by_agent { agent } else { NONE }, if by_role { r.steps[2] } else { NONE });
         let g = *groups.entry(k).or_insert_with(|| {
-            acc.push((i, 0, Vec::new()));
+            acc.push((i, 0, Default::default()));
             acc.len() - 1
         });
         acc[g].1 += 1;
-        // rows come in session order, so a session's rows are next to each other
-        if want_distinct && acc[g].2.last() != Some(&r.session) && !acc[g].2.contains(&r.session) {
-            acc[g].2.push(r.session);
+        if want_distinct {
+            acc[g].2.insert(sid);
         }
     }
     if by.is_empty() && acc.is_empty() {
-        acc.push((usize::MAX, 0, Vec::new()));
+        acc.push((usize::MAX, 0, Default::default()));
     }
     let mut rows = Vec::with_capacity(acc.len());
     for (first, count, sessions) in &acc {

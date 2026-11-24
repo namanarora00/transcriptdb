@@ -334,7 +334,25 @@ fn index_check(db: &Db, d: &Dump, n: usize, rng: &mut Rng, rep: &mut Report) -> 
         let (a, b) = (keys(true)?, keys(false)?);
         rep.index_filters += 1;
         rep.index_rows += b.len() as u64;
-        if a != b {
+        // grouping the rows directly gives what grouping them through the general path does
+        let grouped = |general: bool| -> R<Vec<Vec<String>>> {
+            use crate::query::parse::AggFn;
+            let col = |c: &str| Expr::Ref(vec![c.to_string()]);
+            let by = match k % 3 {
+                0 => vec![("session".to_string(), col("session"))],
+                1 => vec![("role".to_string(), col("role")), ("agent".to_string(), col("agent"))],
+                _ => Vec::new(),
+            };
+            let mut stages = q.stages.clone();
+            if general {
+                stages.push(Stage::Extend(vec![("one".into(), Expr::Lit(Value::Int(1)))]));
+            }
+            stages.push(Stage::Summarize { aggs: vec![("n".into(), AggFn::Count, None), ("s".into(), AggFn::DCount, Some(col("session")))], by });
+            let r = exec::run(db, &Query { source: Source::Messages, stages }, 1).map_err(|e| e.to_string())?;
+            Ok(r.table.rows.iter().map(|r| r.vals.iter().map(|v| v.to_string()).collect()).collect())
+        };
+        let same_groups = grouped(false)? == grouped(true)?;
+        if a != b || !same_groups {
             rep.index_differ += 1;
             if rep.index_first.len() < 10 {
                 rep.index_first.push((rep.index_filters, kind, a.len(), b.len()));
