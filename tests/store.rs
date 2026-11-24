@@ -561,3 +561,80 @@ fn merged_with_dictionary(reqs: &[SynthRequest], frame_kb: usize, cold: bool) {
     drop(db);
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// Merges run on their own thread while writes go on, are put in place at a later flush,
+/// and leave the store as merges done on the spot do. A store closed while one is at work
+/// reopens whole, with no file of the unfinished merge left behind.
+#[test]
+fn merges_run_while_writes_go_on() {
+    let reqs = traffic(77, 14, 40);
+    let small = |background: bool| Options { flush_bytes: 32 << 10, sync: SyncMode::Os, merge_at: 2, seg_bytes: 128 << 10, idle_flushes: 1, cache_bytes: 512 << 10, max_parts: 3, background_merges: background, ..Options::default() };
+    let seg_files = |dir: &std::path::Path| std::fs::read_dir(dir).unwrap().filter(|e| e.as_ref().unwrap().file_name().to_string_lossy().starts_with("seg-")).count();
+
+    // merges on their own thread
+    let da = tmpdir("bgmerge");
+    let mut a = Db::open(&da, small(true)).unwrap();
+    let mut seen_merging = 0;
+    for (i, q) in reqs.iter().enumerate() {
+        put(&mut a, q);
+        if i % 4 == 0 {
+            a.commit().unwrap();
+            seen_merging += a.merging() as usize;
+            if i % 40 == 0 {
+                // reads go on against the files in place while a merge writes new ones
+                check_all(&a, &reqs[..=i]);
+            }
+        }
+    }
+    a.commit().unwrap();
+    assert!(seen_merging > 0, "no merge was ever at work between two commits");
+    check_all(&a, &reqs);
+    a.settle().unwrap();
+    assert!(!a.merging());
+    assert!(a.merge_stats.merges > 0, "no merge was put in place");
+    assert_eq!(seg_files(&da), a.segment_count(), "a segment file is not in the manifest");
+    check_all(&a, &reqs);
+
+    // the same writes with merges done on the spot: the same steps in every session
+    let dbd = tmpdir("fgmerge");
+    let mut b = Db::open(&dbd, small(false)).unwrap();
+    for (i, q) in reqs.iter().enumerate() {
+        put(&mut b, q);
+        if i % 4 == 0 {
+            b.commit().unwrap();
+            assert!(!b.merging());
+        }
+    }
+    b.settle().unwrap();
+    check_all(&b, &reqs);
+    assert_eq!(a.session_count(), b.session_count());
+    let by_key = |db: &Db| -> std::collections::BTreeMap<(String, String), Vec<transcriptdb::steps::StepRow>> { (0..db.session_count() as u32).map(|s| (db.session_key(s), db.steps(s).rows.clone())).collect() };
+    assert_eq!(by_key(&a), by_key(&b));
+    drop(b);
+
+    // closed while a merge is at work: nothing of it stays, and nothing is lost
+    drop(a);
+    let dc = tmpdir("dropmerge");
+    let mut c = Db::open(&dc, small(true)).unwrap();
+    let mut closed_merging = false;
+    for (i, q) in reqs.iter().enumerate() {
+        put(&mut c, q);
+        if i % 4 == 0 {
+            c.commit().unwrap();
+            if c.merging() && i > reqs.len() / 2 {
+                closed_merging = true;
+                drop(c);
+                c = Db::open(&dc, small(true)).unwrap();
+                assert_eq!(seg_files(&dc), c.segment_count(), "a file of the unfinished merge was left behind");
+                check_all(&c, &reqs[..=i]);
+            }
+        }
+    }
+    assert!(closed_merging);
+    c.settle().unwrap();
+    check_all(&c, &reqs);
+    drop(c);
+    for d in [da, dbd, dc] {
+        let _ = std::fs::remove_dir_all(d);
+    }
+}

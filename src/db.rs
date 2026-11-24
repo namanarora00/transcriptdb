@@ -99,6 +99,10 @@ pub struct Options {
     pub cold_run: usize,
     /// Threads compressing frames in merges.
     pub threads: usize,
+    /// Merges of segments run on a thread of their own, reading a view of the files, and
+    /// are put in place at the writer's next flush: a write never waits for one. Without
+    /// it a flush that sets off a merge returns when the merge is done.
+    pub background_merges: bool,
 }
 
 impl Default for Options {
@@ -124,6 +128,7 @@ impl Default for Options {
             cold_after_ms: 7 * 86_400_000,
             cold_run: 4 << 20,
             threads: std::thread::available_parallelism().map_or(4, |n| n.get()),
+            background_merges: true,
         }
     }
 }
@@ -466,6 +471,30 @@ impl StatBlock {
     }
 }
 
+/// What a merge read and wrote, before it is put in place (see [`Db::merge_build`]).
+struct MergeBuild {
+    inputs: BTreeSet<u32>,
+    outputs: Vec<u32>,
+    /// Parts in other segments that folds replaced.
+    dead: BTreeMap<u32, Dead>,
+    bytes_in: u64,
+    fold_read: u64,
+    folded: u64,
+    /// A rewrite of one segment to drop its replaced parts.
+    reclaim: bool,
+}
+
+/// A merge at work on its own thread.
+struct BgMerge {
+    /// (Behind a lock only so the store stays shareable between query threads.)
+    rx: Mutex<std::sync::mpsc::Receiver<Result<MergeBuild>>>,
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+/// File numbers set aside for the outputs of a merge on its own thread.
+const MERGE_FILES: u32 = 4096;
+
 /// What reading steps from a segment does about rule columns (see [`Db::seg_rules`]).
 #[derive(Debug, Default)]
 struct SegRules {
@@ -606,7 +635,10 @@ pub struct Db {
     key_ix: HashMap<(String, String), u32>,
     next_session: u32,
     mem: Mem,
-    wal: WalWriter,
+    /// `None` in a view (see [`Db::view`]), which takes no writes.
+    wal: Option<WalWriter>,
+    /// The merge at work on its own thread, if any.
+    bg: Option<BgMerge>,
     seq: u64,
     sd: StepDicts,
     flushes: u64,
@@ -682,7 +714,103 @@ fn bad(s: impl Into<String>) -> Error {
     Error::Corrupt(s.into())
 }
 
+impl Drop for Db {
+    /// A merge still at work on its own thread is told to stop and waited for: its files
+    /// must not appear after the store is closed (they would be orphans, and their numbers
+    /// could be handed out again by the next open).
+    fn drop(&mut self) {
+        if let Some(mut bg) = self.bg.take() {
+            bg.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+            if let Some(h) = bg.handle.take() {
+                let _ = h.join();
+            }
+            // done before it could be stopped: its outputs were never put in place
+            if let Ok(Ok(b)) = bg.rx.lock().unwrap().try_recv() {
+                for n in b.outputs {
+                    let p = seg_path(&self.dir, n);
+                    crate::block::forget(&p);
+                    let _ = fs::remove_file(p);
+                }
+            }
+        }
+    }
+}
+
 impl Db {
+    /// A store's state with nothing loaded yet.
+    fn blank(dir: PathBuf, lock: fs::File, opts: Options, manifest: Manifest, wal: Option<WalWriter>, cb: usize) -> Db {
+        Db {
+            dir,
+            _lock: lock,
+            manifest,
+            segs: BTreeMap::new(),
+            seg_codes: HashMap::new(),
+            rules: Arc::new(RuleSet::default()),
+            rule_fields: Vec::new(),
+            seg_rules: Mutex::new(HashMap::new()),
+            runs: Vec::new(),
+            blob_files: BTreeMap::new(),
+            dirs: Cache::sharded(cb / 32, 16),
+            blocks: Cache::sharded(cb / 8, 16),
+            ix: Cache::sharded(cb / 16, 16),
+            cores: Cache::new(cb * 3 / 16),
+            stepc: Cache::new(cb / 8),
+            lightc: Cache::new(cb / 16),
+            fieldc: Cache::new(cb / 16),
+            msgtextc: Cache::new(cb / 64),
+            texthead: Cache::new(cb / 32),
+            textpost: Cache::sharded(cb / 32, 16),
+            unitc: Cache::sharded(cb / 32, 4),
+            piecec: Cache::sharded(cb / 32, 4),
+            textc: Cache::sharded(cb / 32, 16),
+            pieces: Cache::sharded(cb / 32, 16),
+            piece_bases: HashMap::new(),
+            skels: Cache::sharded(cb / 32, 16),
+            statc: Cache::new(cb / 12),
+            longc: Cache::sharded(cb / 32, 16),
+            live_masks: Mutex::new(HashMap::new()),
+            key_ids: Mutex::new(KeyIds::default()),
+            active: HashMap::new(),
+            busy: BTreeSet::new(),
+            key_ix: HashMap::new(),
+            next_session: 0,
+            mem: Mem::default(),
+            wal,
+            bg: None,
+            seq: 0,
+            sd: StepDicts::default(),
+            flushes: 0,
+            orphan_results: 0,
+            recovery: RecoveryReport::default(),
+            merge_stats: MergeStats::default(),
+            opts,
+        }
+    }
+
+    /// A second, read-only handle on the store as its files are now, for a merge to read
+    /// from on its own thread while this one goes on taking writes. Everything must be
+    /// flushed. It shares the open segments and index runs, has caches of its own (a
+    /// quarter of the size), and never writes the manifest or a log.
+    fn view(&self) -> Result<Db> {
+        if !self.mem.touched.is_empty() || !self.mem.pieces.is_empty() || !self.mem.opaques.is_empty() {
+            return corrupt("a view of a store with unflushed writes");
+        }
+        // not locked: this handle's owner holds the lock
+        let lock = fs::File::open(self.dir.join("LOCK"))?;
+        let mut v = Db::blank(self.dir.clone(), lock, self.opts.clone(), self.manifest.clone(), None, (self.opts.cache_bytes / 4).max(16 << 20));
+        v.segs = self.segs.clone();
+        v.seg_codes = self.seg_codes.clone();
+        v.rules = self.rules.clone();
+        v.rule_fields = self.rule_fields.clone();
+        v.runs = self.runs.clone();
+        v.blob_files = self.blob_files.iter().map(|(n, b)| (*n, BlobFile { uid: b.uid, path: b.path.clone(), len: b.len })).collect();
+        v.busy = self.busy.clone();
+        v.next_session = self.next_session;
+        v.seq = self.seq;
+        v.sd = self.sd.clone();
+        Ok(v)
+    }
+
     pub fn open(dir: impl AsRef<Path>, opts: Options) -> Result<Db> {
         let dir = dir.as_ref().to_path_buf();
         fs::create_dir_all(&dir)?;
@@ -724,51 +852,7 @@ impl Db {
         let wal = WalWriter::create(&dir, new_wal, opts.sync)?;
         crate::block::set_open_files(opts.open_files);
         let cb = opts.cache_bytes;
-        let mut db = Db {
-            dir,
-            _lock: lock,
-            manifest,
-            segs: BTreeMap::new(),
-            seg_codes: HashMap::new(),
-            rules: Arc::new(RuleSet::default()),
-            rule_fields: Vec::new(),
-            seg_rules: Mutex::new(HashMap::new()),
-            runs: Vec::new(),
-            blob_files: BTreeMap::new(),
-            dirs: Cache::sharded(cb / 32, 16),
-            blocks: Cache::sharded(cb / 8, 16),
-            ix: Cache::sharded(cb / 16, 16),
-            cores: Cache::new(cb * 3 / 16),
-            stepc: Cache::new(cb / 8),
-            lightc: Cache::new(cb / 16),
-            fieldc: Cache::new(cb / 16),
-            msgtextc: Cache::new(cb / 64),
-            texthead: Cache::new(cb / 32),
-            textpost: Cache::sharded(cb / 32, 16),
-            unitc: Cache::sharded(cb / 32, 4),
-            piecec: Cache::sharded(cb / 32, 4),
-            textc: Cache::sharded(cb / 32, 16),
-            pieces: Cache::sharded(cb / 32, 16),
-            piece_bases: HashMap::new(),
-            skels: Cache::sharded(cb / 32, 16),
-            statc: Cache::new(cb / 12),
-            longc: Cache::sharded(cb / 32, 16),
-            live_masks: Mutex::new(HashMap::new()),
-            key_ids: Mutex::new(KeyIds::default()),
-            active: HashMap::new(),
-            busy: BTreeSet::new(),
-            key_ix: HashMap::new(),
-            next_session: 0,
-            mem: Mem::default(),
-            wal,
-            seq: 0,
-            sd: StepDicts::default(),
-            flushes: 0,
-            orphan_results: 0,
-            recovery: RecoveryReport::default(),
-            merge_stats: MergeStats::default(),
-            opts,
-        };
+        let mut db = Db::blank(dir, lock, opts, manifest, Some(wal), cb);
         let _ = fs::remove_file(db.dir.join("RULES.tmp"));
         match fs::read(db.dir.join("RULES")) {
             Ok(b) => db.install_rules(RuleSet::decode(&b)?),
@@ -1458,7 +1542,7 @@ impl Db {
         m.req.skeleton = self.piece_id(PIECE_SKELETON, &sp.skeleton.encode(), &mut m, &mut pp)?;
 
         let k = act.map(|a| a.core.requests.len() as u32).unwrap_or(0);
-        self.wal.append(&m.encode());
+        self.wal.as_mut().ok_or_else(|| bad("a view takes no writes"))?.append(&m.encode());
         self.apply(m)?;
         let a = self.active.get_mut(&sidx).unwrap();
         a.children.extend(learned);
@@ -1657,7 +1741,7 @@ impl Db {
 
     /// Make every `put` so far durable. After this returns they count as saved.
     pub fn commit(&mut self) -> Result<()> {
-        self.wal.commit()?;
+        self.wal.as_mut().ok_or_else(|| bad("a view takes no writes"))?.commit()?;
         if self.mem.bytes >= self.opts.flush_bytes {
             self.flush()?;
         }
@@ -1728,12 +1812,13 @@ impl Db {
     /// Write everything in memory to files (a new segment and index run; values appended
     /// to a blob file), and trim the log.
     pub fn flush(&mut self) -> Result<()> {
-        self.wal.commit()?;
+        self.wal.as_mut().ok_or_else(|| bad("a view takes no writes"))?.commit()?;
         if self.mem.touched.is_empty() && self.mem.pieces.is_empty() && self.mem.opaques.is_empty() {
-            return Ok(());
+            // nothing to write; a merge that finished on its own thread is still put in place
+            return if self.bg.is_some() { self.merge_policy() } else { Ok(()) };
         }
-        let new_wal = self.wal.num + 1;
-        self.wal = WalWriter::create(&self.dir, new_wal, self.opts.sync)?;
+        let new_wal = self.wal.as_ref().unwrap().num + 1;
+        self.wal = Some(WalWriter::create(&self.dir, new_wal, self.opts.sync)?);
         let mut man = self.manifest.clone();
         let mut flushed = 0u64;
 
@@ -1896,6 +1981,14 @@ impl Db {
     /// A segment whose parts were mostly replaced by folds is rewritten on its own.
     /// Index runs merge the same way, `merge_at` neighbours of one tier at a time.
     fn merge_policy(&mut self) -> Result<()> {
+        // a merge at work on its own thread: put it in place if it is done; until then
+        // nothing else replaces files, since it reads them
+        if self.bg.is_some() {
+            match self.merge_done(false)? {
+                Some(b) => self.merge_install(b)?,
+                None => return Ok(()),
+            }
+        }
         // index runs first: they are small, and every lookup reads each one
         let w = self.opts.merge_at.max(2);
         loop {
@@ -1908,24 +2001,86 @@ impl Db {
             let Some(i) = pick else { break };
             self.merge_runs(i, w)?;
         }
-        let l0: BTreeSet<u32> = self.segs.values().filter(|s| s.cat.level == 0).map(|s| s.num).collect();
-        if l0.len() >= self.opts.merge_at {
-            self.merge(l0, true, false)?;
-        }
         loop {
+            // the next merge of segments, if one is due: (inputs, fold, a rewrite to drop replaced parts)
+            let l0: BTreeSet<u32> = self.segs.values().filter(|s| s.cat.level == 0).map(|s| s.num).collect();
             let mut tiers: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
             for sg in self.segs.values().filter(|s| s.cat.level > 0 && s.file_bytes < self.opts.seg_bytes) {
                 tiers.entry(tier(sg.file_bytes, 20)).or_default().push(sg.num);
             }
-            if let Some((_, group)) = tiers.into_iter().find(|(_, v)| v.len() >= self.opts.merge_at) {
-                self.merge(group.into_iter().take(self.opts.merge_at).collect(), true, false)?;
-                continue;
+            let next: Option<(BTreeSet<u32>, bool, bool)> = if l0.len() >= self.opts.merge_at {
+                Some((l0, true, false))
+            } else if let Some((_, group)) = tiers.into_iter().find(|(_, v)| v.len() >= self.opts.merge_at) {
+                Some((group.into_iter().take(self.opts.merge_at).collect(), true, false))
+            } else {
+                // half or more of the segment is parts that folds replaced: rewrite it without them
+                let gc = self.manifest.dead.iter().find(|(n, d)| self.segs.get(n).is_some_and(|sg| sg.cat.level > 0 && d.bytes.saturating_mul(2) >= sg.file_bytes)).map(|x| x.0);
+                gc.map(|n| (BTreeSet::from([n]), false, true))
+            };
+            let Some((inputs, fold, reclaim)) = next else { break };
+            if self.opts.background_merges {
+                // one at a time; the next is looked for when this one is in place
+                return self.merge_start(inputs, fold, reclaim);
             }
-            // half or more of the segment is parts that folds replaced: rewrite it without them
-            let gc = self.manifest.dead.iter().find(|(n, d)| self.segs.get(n).is_some_and(|sg| sg.cat.level > 0 && d.bytes.saturating_mul(2) >= sg.file_bytes)).map(|x| x.0);
-            let Some(n) = gc else { break };
-            self.merge(BTreeSet::from([n]), false, false)?;
-            self.merge_stats.reclaims += 1;
+            self.merge(inputs, fold, false)?;
+            self.merge_stats.reclaims += reclaim as u64;
+        }
+        Ok(())
+    }
+
+    /// Start a merge on a thread of its own, reading a view of the files as they are now.
+    /// Its outputs take file numbers set aside here (and never handed out again).
+    fn merge_start(&mut self, inputs: BTreeSet<u32>, fold: bool, reclaim: bool) -> Result<()> {
+        let first = self.manifest.next_file;
+        let mut man = self.manifest.clone();
+        man.next_file += MERGE_FILES;
+        man.store(&self.dir, self.opts.sync)?;
+        self.manifest = man;
+        let view = self.view()?;
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let stop = cancel.clone();
+        let handle = std::thread::Builder::new().name("tdb-merge".into()).spawn(move || {
+            let r = view.merge_build(inputs, fold, false, first, MERGE_FILES, Some(&stop)).map(|mut b| {
+                b.reclaim = reclaim;
+                b
+            });
+            let _ = tx.send(r);
+        })?;
+        self.bg = Some(BgMerge { rx: Mutex::new(rx), cancel, handle: Some(handle) });
+        Ok(())
+    }
+
+    /// The merge at work on its own thread, once it is done (`wait`: block until it is).
+    fn merge_done(&mut self, wait: bool) -> Result<Option<MergeBuild>> {
+        let Some(bg) = self.bg.as_mut() else { return Ok(None) };
+        let r = if wait {
+            bg.rx.lock().unwrap().recv().unwrap_or_else(|_| Err(bad("the merge thread stopped without an answer")))
+        } else {
+            let got = bg.rx.lock().unwrap().try_recv();
+            match got {
+                Ok(r) => r,
+                Err(std::sync::mpsc::TryRecvError::Empty) => return Ok(None),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => Err(bad("the merge thread stopped without an answer")),
+            }
+        };
+        if let Some(h) = self.bg.take().and_then(|mut bg| bg.handle.take()) {
+            let _ = h.join();
+        }
+        r.map(Some)
+    }
+
+    /// Whether a merge is at work on its own thread.
+    pub fn merging(&self) -> bool {
+        self.bg.is_some()
+    }
+
+    /// Flush, then wait until no merge is at work and none is due.
+    pub fn settle(&mut self) -> Result<()> {
+        self.flush()?;
+        while let Some(b) = self.merge_done(true)? {
+            self.merge_install(b)?;
+            self.merge_policy()?;
         }
         Ok(())
     }
@@ -1990,9 +2145,37 @@ impl Db {
         if inputs.is_empty() {
             return Ok(());
         }
+        let first = self.manifest.next_file;
+        let b = self.merge_build(inputs, fold, last, first, u32::MAX - first, None)?;
+        self.manifest.next_file = first + b.outputs.len() as u32;
+        self.merge_install(b)
+    }
+
+    /// The reading and writing of a merge (see [`Db::merge`]): the outputs are written as
+    /// files numbered from `first` (at most `max_files` of them) and nothing else changes,
+    /// so it can run on a view of the store while the store takes writes. Stops, removing
+    /// what it wrote, when `cancel` is set.
+    fn merge_build(&self, inputs: BTreeSet<u32>, fold: bool, last: bool, first: u32, max_files: u32, cancel: Option<&std::sync::atomic::AtomicBool>) -> Result<MergeBuild> {
+        let mut outputs: Vec<u32> = Vec::new();
+        let r = self.merge_write(&inputs, fold, last, first, max_files, cancel, &mut outputs);
+        match r {
+            Ok((dead, bytes_in, fold_read, folded)) => Ok(MergeBuild { inputs, outputs, dead, bytes_in, fold_read, folded, reclaim: false }),
+            Err(e) => {
+                for n in outputs {
+                    let p = seg_path(&self.dir, n);
+                    crate::block::forget(&p);
+                    let _ = fs::remove_file(p);
+                }
+                Err(e)
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn merge_write(&self, inputs: &BTreeSet<u32>, fold: bool, last: bool, first: u32, max_files: u32, cancel: Option<&std::sync::atomic::AtomicBool>, outputs: &mut Vec<u32>) -> Result<(BTreeMap<u32, Dead>, u64, u64, u64)> {
         let mut sessions = BTreeSet::new();
         let mut bytes_in = 0;
-        for &n in &inputs {
+        for &n in inputs {
             let seg = self.segs.get(&n).ok_or_else(|| bad(format!("merge of a missing segment {n}")))?.clone();
             bytes_in += seg.file_bytes;
             for k in 0..seg.cat.dirs.len() {
@@ -2008,19 +2191,20 @@ impl Db {
         let raw_in: u64 = inputs.iter().filter_map(|n| self.segs.get(n)).map(|s| s.cat.node_bytes).sum();
         let last = (last || full || inputs.iter().any(|n| self.segs.get(n).is_some_and(|s| s.cat.dict.is_some()))) && raw_in >= DICT_MIN_RAW;
         let codec = if last {
-            Codec { level: self.opts.merge_level, block_level: self.opts.merge_level, dict: self.train_dict(&sessions, &inputs)?, threads: self.opts.threads }
+            Codec { level: self.opts.merge_level, block_level: self.opts.merge_level, dict: self.train_dict(&sessions, inputs)?, threads: self.opts.threads }
         } else {
             Codec::plain(self.opts.level)
         };
         // cold sessions, in a merge into full-size segments: runs instead of frames
         let newest = self.segs.values().map(|s| s.cat.time_hi).max().unwrap_or(0);
         let cold_before = if settled && self.opts.cold_run > 0 && newest > 0 { newest - self.opts.cold_after_ms } else { i64::MIN };
-        let mut man = self.manifest.clone();
-        let mut outputs: Vec<u32> = Vec::new();
         let mut w: Option<SegWriter> = None;
         let mut dead: BTreeMap<u32, Dead> = BTreeMap::new();
         let (mut folded, mut fold_read) = (0u64, 0u64);
         for &s in &sessions {
+            if cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed)) {
+                return Err(bad("merge cancelled"));
+            }
             let parts = self.parts(s)?;
             let mut runs = Vec::new();
             let mut i = 0;
@@ -2047,8 +2231,10 @@ impl Db {
                 w.take().unwrap().finish(self.opts.sync)?;
             }
             if w.is_none() {
-                let num = man.next_file;
-                man.next_file += 1;
+                if outputs.len() as u32 >= max_files {
+                    return Err(bad("a merge ran out of the file numbers set aside for it"));
+                }
+                let num = first + outputs.len() as u32;
                 outputs.push(num);
                 w = Some(SegWriter::create(&self.dir, num, self.opts.frame_size, codec.clone(), 1, self.manifest.checkpoint)?);
                 // steps come from `load_steps`, which gives every step today's rule values
@@ -2081,6 +2267,18 @@ impl Db {
         if let Some(w) = w {
             w.finish(self.opts.sync)?;
         }
+        Ok((dead, bytes_in, fold_read, folded))
+    }
+
+    /// Put a merge's outputs in place of its inputs: the manifest first, then this handle's
+    /// own state. Every session must be flushed (the sessions held in memory point at the
+    /// old files and are read again from the new ones), so this runs at the end of a flush.
+    fn merge_install(&mut self, b: MergeBuild) -> Result<()> {
+        let MergeBuild { inputs, outputs, dead, bytes_in, fold_read, folded, reclaim } = b;
+        if let Some(n) = inputs.iter().find(|n| !self.segs.contains_key(n)) {
+            return corrupt(format!("a merge read segment {n}, which is gone"));
+        }
+        let mut man = self.manifest.clone();
         man.generation += 1;
         man.segs.retain(|n| !inputs.contains(n));
         man.segs.extend(&outputs);
@@ -2117,6 +2315,7 @@ impl Db {
         self.merge_stats.bytes_in += bytes_in + fold_read;
         self.merge_stats.bytes_out += bytes_out;
         self.merge_stats.folded += folded;
+        self.merge_stats.reclaims += reclaim as u64;
         Ok(())
     }
 
@@ -2182,7 +2381,7 @@ impl Db {
 
     /// Flush, then merge every segment into level 1: each session stored whole, main line first.
     pub fn compact(&mut self) -> Result<()> {
-        self.flush()?;
+        self.settle()?;
         let all: BTreeSet<u32> = self.segs.keys().copied().collect();
         self.merge(all, false, true)
     }
@@ -2610,7 +2809,7 @@ impl Db {
             level0: self.segs.values().filter(|s| s.cat.level == 0).count(),
             runs: self.runs.len(),
             blobs: self.blob_files.len(),
-            wal_bytes: self.wal.bytes,
+            wal_bytes: self.wal.as_ref().map_or(0, |w| w.bytes),
             mem_bytes: self.mem.bytes,
             tools: self.sd.tools.len(),
             step_fields: self.sd.fields.len(),

@@ -493,7 +493,7 @@ impl Turns {
 
 /// Tool and field names, shared by all sessions: there are few of them, and shared codes
 /// make shape codes and tool tests the same in every session.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct StepDicts {
     pub tools: Dict,
     pub fields: Dict,
