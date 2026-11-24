@@ -337,12 +337,14 @@ pub fn run(db: &Db, n_patterns: usize, seed: u64, work: &Path, top_fields: usize
         tries += 1;
         let di = if k % 2 == 0 || dumps.len() == 1 { 0 } else { 1 + (k / 2) % (dumps.len() - 1) };
         let cs = (k / 2) % 2 == 0;
+        // a field with nothing to draw from gives its turn to the message text
+        let (di, drawn) = match if dumps[di].lines.is_empty() { None } else { draw(&dumps[di], &mut rng, !cs) } {
+            Some(p) => (di, Some(p)),
+            None if !dumps[0].lines.is_empty() => (0, draw(&dumps[0], &mut rng, !cs)),
+            None => (di, None),
+        };
         let d = &dumps[di];
-        if d.lines.is_empty() {
-            k += 1;
-            continue;
-        }
-        let Some(mut pat) = draw(d, &mut rng, !cs) else {
+        let Some(mut pat) = drawn else {
             k += 1;
             continue;
         };
@@ -375,12 +377,13 @@ pub fn run(db: &Db, n_patterns: usize, seed: u64, work: &Path, top_fields: usize
     while k < n_patterns / 2 && tries < n_patterns * 25 {
         tries += 1;
         let di = if k % 2 == 0 || dumps.len() == 1 { 0 } else { 1 + (k / 2) % (dumps.len() - 1) };
+        let (di, drawn) = match if dumps[di].lines.is_empty() { None } else { draw_regex(&dumps[di], &mut rng, k / 2) } {
+            Some(p) => (di, Some(p)),
+            None if !dumps[0].lines.is_empty() => (0, draw_regex(&dumps[0], &mut rng, k / 2)),
+            None => (di, None),
+        };
         let d = &dumps[di];
-        if d.lines.is_empty() {
-            k += 1;
-            continue;
-        }
-        let Some(rx) = draw_regex(d, &mut rng, k / 2) else {
+        let Some(rx) = drawn else {
             k += 1;
             continue;
         };
