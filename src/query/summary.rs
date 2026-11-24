@@ -574,6 +574,16 @@ impl Names {
     }
 }
 
+/// The id of a name that gets one when it is first met (kept out of line: the callers'
+/// loops run once per summary row).
+#[inline(never)]
+fn late_id(cell: &std::cell::Cell<u64>, names: &std::cell::RefCell<Names>, name: &str) -> u64 {
+    if cell.get() == NULL {
+        cell.set(names.borrow_mut().id(name));
+    }
+    cell.get()
+}
+
 /// Field value groups met as text: by group key, with the first value's text.
 #[derive(Default)]
 struct Texts {
@@ -598,8 +608,8 @@ struct Exec<'a> {
     aggs: &'a [(String, AggFn, Option<Expr>)],
     now: i64,
     acc: Accs,
-    sids: Names,
-    agents: Names,
+    sids: std::rc::Rc<std::cell::RefCell<Names>>,
+    agents: std::rc::Rc<std::cell::RefCell<Names>>,
     texts: Texts,
     /// When the field's values come from one segment only: its number, and value ids are group ids.
     single: Option<u32>,
@@ -680,6 +690,9 @@ impl Exec<'_> {
     }
 
     fn segment(&mut self, num: u32, live: Option<&Arc<Vec<bool>>>, pre: &Sp) -> Result<(), QError> {
+        // session and agent names get their ids as parts are met: a query that reaches few
+        // parts does not pay for every session of the segment
+        let (sids, agents) = (self.sids.clone(), self.agents.clone());
         let db = self.db;
         let pl = self.pl;
         let head_b = db.stats_head(num).map_err(qe)?.ok_or_else(|| QError::new("internal: segment without summaries"))?;
@@ -705,8 +718,12 @@ impl Exec<'_> {
             })).collect();
             (resid, state)
         };
-        let sid_g: Vec<u64> = if pl.needs_sid { head.sids.iter().map(|s| self.sids.id(s)).collect() } else { Vec::new() };
-        let agent_g: Vec<u64> = if pl.needs_agent { head.agents.iter().map(|s| self.agents.id(s)).collect() } else { Vec::new() };
+        // (all at once when no field test narrows the parts: then every part is met)
+        let eager = pl.field.is_none();
+        let now = |on: bool, names: &[String], to: &std::cell::RefCell<Names>| -> Vec<u64> { if on && eager { names.iter().map(|s| to.borrow_mut().id(s)).collect() } else { Vec::new() } };
+        let later = |on: bool, n: usize| vec![std::cell::Cell::new(NULL); if on && !eager { n } else { 0 }];
+        let (sid_now, agent_now) = (now(pl.needs_sid, &head.sids, &sids), now(pl.needs_agent, &head.agents, &agents));
+        let (sid_g, agent_g) = (later(pl.needs_sid, head.sids.len()), later(pl.needs_agent, head.agents.len()));
         let mut sbits: Vec<u64> = Vec::with_capacity(head.parts.len());
         if !pl.satoms.is_empty() {
             let mut memo: HashMap<(u32, u32), u64> = HashMap::new();
@@ -729,9 +746,23 @@ impl Exec<'_> {
                 return (0, 0, 0);
             }
             let pi = head.parts[p as usize];
+            let sid = if !pl.needs_sid {
+                0
+            } else if eager {
+                sid_now[pi.sid as usize]
+            } else {
+                late_id(&sid_g[pi.sid as usize], &sids, &head.sids[pi.sid as usize])
+            };
+            let agent = if !pl.needs_agent {
+                0
+            } else if eager {
+                agent_now[pi.agent as usize]
+            } else {
+                late_id(&agent_g[pi.agent as usize], &agents, &head.agents[pi.agent as usize])
+            };
             (
-                if pl.needs_sid { sid_g[pi.sid as usize] } else { 0 },
-                if pl.needs_agent { agent_g[pi.agent as usize] } else { 0 },
+                sid,
+                agent,
                 if pl.satoms.is_empty() { 0 } else { sbits[p as usize] },
             )
         };
@@ -1099,8 +1130,8 @@ impl Exec<'_> {
                 return Ok(());
             }
             let (sid, agent) = if pl.needs_sid || pl.needs_agent { db.session_key(s) } else { (String::new(), String::new()) };
-            let sid = if pl.needs_sid { self.sids.id(&sid) } else { 0 };
-            let agent = if pl.needs_agent { self.agents.id(&agent) } else { 0 };
+            let sid = if pl.needs_sid { self.sids.borrow_mut().id(&sid) } else { 0 };
+            let agent = if pl.needs_agent { self.agents.borrow_mut().id(&agent) } else { 0 };
             let field = pl.field.clone();
             for pos in start..end.min(ss.rows.len() as u32) {
                 self.rows_read += 1;
@@ -1151,8 +1182,8 @@ impl Exec<'_> {
         }
         Ok(match k {
             KeyK::Tool => Value::Str(String::from_utf8_lossy(self.db.step_dicts().tools.get(id as u32)).into()),
-            KeyK::Sid => Value::Str(self.sids.names[id as usize].as_str().into()),
-            KeyK::Agent => Value::Str(self.agents.names[id as usize].as_str().into()),
+            KeyK::Sid => Value::Str(self.sids.borrow().names[id as usize].as_str().into()),
+            KeyK::Agent => Value::Str(self.agents.borrow().names[id as usize].as_str().into()),
             KeyK::Failed | KeyK::Ok => Value::Bool(id == 1),
             KeyK::Field => Value::from_json(&self.field_text(id)?),
             KeyK::Null => Value::Null,
@@ -1256,7 +1287,7 @@ pub fn try_run(db: &Db, pre: &Sp, aggs: &[(String, AggFn, Option<Expr>)], by: &[
     let sets = pl.aggs.iter().any(|a| matches!(a, AggK::DTool | AggK::DSid | AggK::DAgent | AggK::DField | AggK::DNone));
     let sums = pl.aggs.iter().any(|a| matches!(a, AggK::Sum | AggK::Avg));
     let acc = Accs::new(na, sums, minmax, sets, dense_len);
-    let mut ex = Exec { db, pl: &pl, aggs, now, acc, sids: Names::default(), agents: Names::default(), texts: Texts::default(), single, single_dir, test: None, countif_tests: Vec::new(), rows_read: 0 };
+    let mut ex = Exec { db, pl: &pl, aggs, now, acc, sids: Default::default(), agents: Default::default(), texts: Texts::default(), single, single_dir, test: None, countif_tests: Vec::new(), rows_read: 0 };
     let mut segs = 0;
     for s in &sources {
         match s {
