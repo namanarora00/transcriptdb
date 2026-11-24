@@ -195,23 +195,25 @@ impl fmt::Display for Value {
 }
 
 pub fn json_unescape(b: &[u8]) -> String {
-    let mut out = String::with_capacity(b.len());
+    // built as bytes and checked once at the end: one fast pass over valid text
+    let mut out: Vec<u8> = Vec::with_capacity(b.len());
+    let push = |out: &mut Vec<u8>, c: char| out.extend_from_slice(c.encode_utf8(&mut [0; 4]).as_bytes());
     let mut i = 0;
     let mut pending: Option<u16> = None; // a high surrogate waiting for its pair
-    let flush_pending = |pending: &mut Option<u16>, out: &mut String| {
+    let flush_pending = |pending: &mut Option<u16>, out: &mut Vec<u8>| {
         if pending.take().is_some() {
-            out.push('\u{fffd}');
+            push(out, '\u{fffd}');
         }
     };
     while i < b.len() {
         let next = memchr::memchr(b'\\', &b[i..]).map(|k| i + k).unwrap_or(b.len());
         if next > i {
             flush_pending(&mut pending, &mut out);
-            out.push_str(&String::from_utf8_lossy(&b[i..next]));
+            out.extend_from_slice(&b[i..next]);
         }
         if next + 1 >= b.len() {
             if next < b.len() {
-                out.push('\\');
+                out.push(b'\\');
             }
             break;
         }
@@ -223,35 +225,43 @@ pub fn json_unescape(b: &[u8]) -> String {
             match (pending.take(), u) {
                 (Some(hi), 0xdc00..=0xdfff) => {
                     let c = 0x10000 + (((hi as u32) - 0xd800) << 10) + (u as u32 - 0xdc00);
-                    out.push(char::from_u32(c).unwrap_or('\u{fffd}'));
+                    push(&mut out, char::from_u32(c).unwrap_or('\u{fffd}'));
                 }
                 (prev, 0xd800..=0xdbff) => {
                     if prev.is_some() {
-                        out.push('\u{fffd}');
+                        push(&mut out, '\u{fffd}');
                     }
                     pending = Some(u);
                 }
                 (prev, _) => {
                     if prev.is_some() {
-                        out.push('\u{fffd}');
+                        push(&mut out, '\u{fffd}');
                     }
-                    out.push(char::from_u32(u as u32).unwrap_or('\u{fffd}'));
+                    push(&mut out, char::from_u32(u as u32).unwrap_or('\u{fffd}'));
                 }
             }
             continue;
         }
         flush_pending(&mut pending, &mut out);
-        out.push(match e {
-            b'n' => '\n',
-            b't' => '\t',
-            b'r' => '\r',
-            b'b' => '\u{8}',
-            b'f' => '\u{c}',
-            other => other as char,
-        });
+        push(
+            &mut out,
+            match e {
+                b'n' => '\n',
+                b't' => '\t',
+                b'r' => '\r',
+                b'b' => '\u{8}',
+                b'f' => '\u{c}',
+                other => other as char,
+            },
+        );
     }
     flush_pending(&mut pending, &mut out);
-    out
+    // every character pushed is whole, so bytes that are not text are replaced exactly as
+    // they would be piece by piece
+    match String::from_utf8(out) {
+        Ok(s) => s,
+        Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
+    }
 }
 
 /// Glob match (`*`, `?`), on chars.
@@ -305,10 +315,8 @@ fn ascii_ci_contains(h: &[u8], n: &[u8]) -> bool {
     ascii_ci_find(h, n).is_some()
 }
 
-/// Texts at least this long are searched in a lower-cased copy.
+/// Texts at least this long are searched in a lower-cased copy, this much at a time.
 const CI_COPY: usize = 1024;
-/// The copy's buffer is given back when it grew past this.
-const CI_KEEP: usize = 4 << 20;
 
 /// Where `n` first occurs in `h`, ignoring ASCII case.
 pub fn ascii_ci_find(h: &[u8], n: &[u8]) -> Option<usize> {
@@ -317,24 +325,33 @@ pub fn ascii_ci_find(h: &[u8], n: &[u8]) -> Option<usize> {
         return None;
     }
     // a long text: lower-case a copy and search that, both at vector speed whatever the
-    // pattern starts with (the loop below stops at every byte equal to its first)
+    // pattern starts with (the loop below stops at every byte equal to its first). The copy
+    // is made a piece at a time, so a hit near the start costs one piece.
     if h.len() >= CI_COPY {
         thread_local! {
             static LOW: std::cell::RefCell<(Vec<u8>, Vec<u8>)> = const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
         }
         return LOW.with(|c| {
             let (text, pat) = &mut *c.borrow_mut();
-            text.clear();
-            text.extend_from_slice(h);
-            text.make_ascii_lowercase();
             pat.clear();
             pat.extend_from_slice(n);
             pat.make_ascii_lowercase();
-            let at = memchr::memmem::find(text, pat);
-            if text.capacity() > CI_KEEP {
-                *text = Vec::new();
+            let finder = memchr::memmem::Finder::new(pat.as_slice());
+            let mut at = 0;
+            loop {
+                // every place the pattern can start in this piece, with room for all of it
+                let end = (at + CI_COPY + n.len() - 1).min(h.len());
+                text.clear();
+                text.extend_from_slice(&h[at..end]);
+                text.make_ascii_lowercase();
+                if let Some(k) = finder.find(text) {
+                    return Some(at + k);
+                }
+                if end == h.len() {
+                    return None;
+                }
+                at += CI_COPY;
             }
-            at
         });
     }
     let (lo, up) = (first.to_ascii_lowercase(), first.to_ascii_uppercase());
@@ -622,6 +639,12 @@ mod tests {
         assert!(matches!(Value::from_json(b"42"), Value::Int(42)));
         assert_eq!(json_unescape(br#"a\"b\\c\ud83d\ude80d\ud83de"#), "a\"b\\c\u{1f680}d\u{fffd}e");
         assert_eq!(json_unescape(br#"\u00e9t\u00e9"#), "\u{e9}t\u{e9}");
+        // bytes that are not text, next to escapes: replaced as they are piece by piece
+        assert_eq!(json_unescape(b"\xe2\\n"), "\u{fffd}\n");
+        assert_eq!(json_unescape(b"\xe2\x82\\u00e9"), "\u{fffd}\u{e9}");
+        assert_eq!(json_unescape(b"ok\\u00e9\x80"), "ok\u{e9}\u{fffd}");
+        assert_eq!(json_unescape(b"a\\\xe9b"), "a\u{e9}b");
+        assert_eq!(json_unescape(b"tab\\tend\\"), "tab\tend\\");
         assert!(matches!(Value::from_json(b"1.5e-3"), Value::Float(_)));
         assert_eq!(fmt_time(0), "1970-01-01T00:00:00.000Z");
         assert_eq!(fmt_time(951_868_801_500), "2000-03-01T00:00:01.500Z");

@@ -327,32 +327,38 @@ fn tool_name_test(e: &Expr) -> Option<Box<dyn Fn(&str) -> bool>> {
 /// `contains` on the raw text of a JSON string (between the quotes), giving the answer
 /// for the decoded text without decoding it, or `None` when that cannot be done.
 ///
-/// It can when the pattern is ASCII with no character an escape stands for (quote,
-/// backslash, control characters, and `/` if the text has `\/`) and the text has no `\u`
-/// escapes: then the decoded text holds the pattern exactly where the raw text holds it
-/// starting at a character that is not escaped (one not right after an odd run of
-/// backslashes). Case-insensitive tests also need the text free of the two characters
-/// whose lower case is ASCII (U+0130 and U+212A): otherwise lower-casing the decoded text
-/// changes only ASCII letters, as an ASCII-only comparison does.
+/// The pattern must be ASCII with no character an escape stands for (quote, backslash,
+/// control characters). Where the raw text holds it, starting at a character that is not
+/// escaped (one not right after an odd run of backslashes) and not among the digits of a
+/// `\u` escape, the decoded text holds it too: the search stops there, so a text is read
+/// only as far as its first hit. With no such place the decoded text can still hold the
+/// pattern through an escape (`\u`, or `\/` for a pattern with `/`) or, ignoring case,
+/// through one of the two characters whose lower case is ASCII (U+0130 and U+212A): a
+/// text with any of those is handed back.
 pub fn raw_contains(body: &[u8], p: &[u8], cs: bool) -> Option<bool> {
     use memchr::memmem::find;
-    if !p.iter().all(|&c| c.is_ascii() && c >= 0x20 && c != b'"' && c != b'\\') || find(body, b"\\u").is_some() || (p.contains(&b'/') && find(body, b"\\/").is_some()) {
-        return None;
-    }
-    if !cs && !body.is_ascii() && (find(body, "\u{130}".as_bytes()).is_some() || find(body, "\u{212a}".as_bytes()).is_some()) {
+    if !p.iter().all(|&c| c.is_ascii() && c >= 0x20 && c != b'"' && c != b'\\') {
         return None;
     }
     let mut i = 0;
     loop {
         let at = if cs { find(&body[i..], p) } else { super::value::ascii_ci_find(&body[i..], p) };
-        let Some(k) = at else { return Some(false) };
+        let Some(k) = at else { break };
         let a = i + k;
         let slashes = body[..a].iter().rev().take_while(|&&c| c == b'\\').count();
         if slashes % 2 == 0 {
-            return Some(true);
+            // a `\u` just before: the hit may start among its four digits
+            return if find(&body[a.saturating_sub(5)..a], b"\\u").is_some() { None } else { Some(true) };
         }
         i = a + 1;
     }
+    if find(body, b"\\u").is_some() || (p.contains(&b'/') && find(body, b"\\/").is_some()) {
+        return None;
+    }
+    if !cs && !body.is_ascii() && (find(body, "\u{130}".as_bytes()).is_some() || find(body, "\u{212a}".as_bytes()).is_some()) {
+        return None;
+    }
+    Some(false)
 }
 
 /// Test one value (raw JSON text) against a one-column expression, as evaluating it on the
@@ -730,6 +736,14 @@ mod tests {
             (r#"say \"hi\""#, "hi", false),
             (r"line\nnext", "nnext", false),
             (r"line\nnext", "next", false),
+            // a hit among the digits of an escape is not one; right after the escape it is
+            (r"caf\u00e9dit", "9dit", false),
+            (r"caf\u00e9dit", "e9d", false),
+            (r"caf\u00e9dit", "dit", false),
+            (r"caf\u00e9 git commit", "git commit", false),
+            (r"a\\u0041b", "0041", false),
+            (r"x\/y git commit", "git commit", false),
+            ("\u{212a}elvin kelvin", "kelvin", false),
         ];
         for &(body, p, cs) in cases {
             let decoded = crate::query::value::json_unescape(body.as_bytes());
@@ -744,6 +758,11 @@ mod tests {
         // what a raw search cannot decide is handed back
         assert_eq!(raw_contains(br"\u0067it", b"git", false), None);
         assert_eq!(raw_contains(br"a\/b", b"a/b", false), None);
+        assert_eq!(raw_contains(br"caf\u00e9dit", b"9dit", false), None);
+        // a hit that stands clear of every escape is taken where it is found
+        assert_eq!(raw_contains(br"caf\u00e9dit", b"dit", false), Some(true));
+        assert_eq!(raw_contains(br"git commit \u00e9", b"git commit", false), Some(true));
+        assert_eq!(raw_contains("kelvin \u{212a}".as_bytes(), b"kelvin", false), Some(true));
         assert_eq!(raw_contains("\u{212a}".as_bytes(), b"k", false), None);
         assert_eq!(raw_contains("\u{212a}".as_bytes(), b"k", true), Some(false));
     }
