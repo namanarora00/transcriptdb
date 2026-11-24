@@ -629,6 +629,10 @@ pub struct Db {
     /// Per segment holding parts that folds replaced: which of its parts are live, as of a
     /// manifest generation.
     live_masks: Mutex<HashMap<u32, (u64, Arc<Vec<bool>>)>>,
+    /// Directory blocks, decoded once and kept until their segment goes: finding a
+    /// session's parts reads them for every session, and a cache small next to the store
+    /// would decode them over and over. About 250 bytes per part.
+    dir_res: Mutex<HashMap<(u32, u32), Arc<Vec<DirEnt>>>>,
     /// A number for each session id and each agent name seen so far, by stored session.
     key_ids: Mutex<KeyIds>,
     active: HashMap<u32, Active>,
@@ -772,6 +776,7 @@ impl Db {
             statc: Cache::new(cb / 12),
             longc: Cache::sharded(cb / 32, 16),
             live_masks: Mutex::new(HashMap::new()),
+            dir_res: Mutex::new(HashMap::new()),
             key_ids: Mutex::new(KeyIds::default()),
             active: HashMap::new(),
             busy: BTreeSet::new(),
@@ -1062,12 +1067,17 @@ impl Db {
 
     fn dir_block(&self, seg: &Segment, k: usize) -> Result<Arc<Vec<DirEnt>>> {
         let key = (seg.num, k as u32);
-        if let Some(d) = self.dirs.get(&key) {
-            return Ok(d);
+        if let Some(d) = self.dir_res.lock().unwrap().get(&key) {
+            return Ok(d.clone());
         }
-        let d = seg.dir_block(k)?;
-        let size = d.iter().map(|x| 160 + x.key.0.len() + x.key.1.len()).sum();
-        Ok(self.dirs.insert(key, Arc::new(d), size))
+        let d = Arc::new(seg.dir_block(k)?);
+        self.dir_res.lock().unwrap().insert(key, d.clone());
+        Ok(d)
+    }
+
+    /// Bytes the decoded directory blocks take, roughly.
+    pub fn directory_bytes(&self) -> usize {
+        self.dir_res.lock().unwrap().values().flat_map(|d| d.iter()).map(|x| 160 + x.key.0.len() + x.key.1.len()).sum()
     }
 
     fn block(&self, seg: &Segment, r: &BlockRef) -> Result<Arc<Vec<u8>>> {
@@ -2378,6 +2388,7 @@ impl Db {
         }
         for n in &inputs {
             self.segs.remove(n);
+            self.dir_res.lock().unwrap().retain(|k, _| k.0 != *n);
             self.seg_codes.remove(n);
             let p = seg_path(&self.dir, *n);
             crate::block::forget(&p);
@@ -3599,6 +3610,7 @@ impl Db {
         for c in [&self.cores as &dyn Clear, &self.stepc, &self.lightc, &self.dirs, &self.blocks, &self.ix, &self.pieces, &self.skels, &self.statc, &self.longc, &self.fieldc, &self.textc, &self.msgtextc, &self.texthead, &self.textpost, &self.unitc, &self.piecec] {
             c.clear_all();
         }
+        self.dir_res.lock().unwrap().clear();
     }
 
     pub fn dir(&self) -> &Path {
