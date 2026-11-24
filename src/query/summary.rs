@@ -126,6 +126,22 @@ fn regex_spec(req: &super::relit::Req) -> Option<Vec<Vec<(Vec<u8>, WordMatch)>>>
     }
 }
 
+/// What the word index can say about one `where` conjunct: usually one requirement (see
+/// [`index_spec`]); a regular expression gives one for each literal every match holds.
+fn index_specs(sp: &Sp) -> Vec<Vec<Vec<(Vec<u8>, WordMatch)>>> {
+    if let Sp::Field { expr, .. } = sp
+        && let Expr::Str { op: StrOp::Regex, e, pat, neg: false, .. } = &**expr
+        && matches!(&**e, Expr::Ref(_))
+        && let Expr::Lit(Value::Str(p)) = &**pat
+    {
+        return match super::relit::required(p) {
+            super::relit::Req::And(v) => v.iter().filter_map(regex_spec).collect(),
+            other => regex_spec(&other).into_iter().collect(),
+        };
+    }
+    index_spec(sp).into_iter().collect()
+}
+
 /// Words that a value passing this atom must hold (alternatives), when the index can say.
 fn index_spec(sp: &Sp) -> Option<Vec<Vec<(Vec<u8>, WordMatch)>>> {
     let Sp::Field { expr, .. } = sp else { return None };
@@ -145,8 +161,6 @@ fn index_spec(sp: &Sp) -> Option<Vec<Vec<(Vec<u8>, WordMatch)>>> {
     };
     match &**expr {
         Expr::Str { op, e, pat, neg: false, cs } if !matches!(op, StrOp::Matches | StrOp::Regex) && is_ref(e) => Some(vec![words(&lit(pat)?, *cs)?]),
-        // a regular expression: the words of the literals every match holds
-        Expr::Str { op: StrOp::Regex, e, pat, neg: false, .. } if is_ref(e) => regex_spec(&super::relit::required(&lit(pat)?)),
         Expr::Cmp(CmpOp::Eq, a, b) if is_ref(a) => Some(vec![words(&lit(b)?, true)?]),
         Expr::Cmp(CmpOp::Eq, a, b) if is_ref(b) => Some(vec![words(&lit(a)?, true)?]),
         Expr::In { e, list, neg: false } if is_ref(e) => list.iter().map(|x| words(&lit(x)?, true)).collect(),
@@ -255,9 +269,7 @@ impl Plan {
         let mut cs = Vec::new();
         conjuncts(pre, &mut cs);
         for c in cs {
-            if let Some(spec) = index_spec(c) {
-                pl.index.push(spec);
-            }
+            pl.index.extend(index_specs(c));
         }
         Ok(Some(pl))
     }
