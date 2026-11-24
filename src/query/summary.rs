@@ -104,6 +104,28 @@ struct Plan {
     needs_fval: bool,
 }
 
+/// The words a value matching a regular expression must hold, from what the expression
+/// requires: alternatives, each a list of words. Of several requirements that must all
+/// hold, the one whose weakest alternative names the most text is looked up.
+fn regex_spec(req: &super::relit::Req) -> Option<Vec<Vec<(Vec<u8>, WordMatch)>>> {
+    use super::relit::Req;
+    match req {
+        Req::Any => None,
+        Req::Lit(s) => {
+            let w = stats::pattern_words(s);
+            if w.is_empty() { None } else { Some(vec![w]) }
+        }
+        Req::Or(v) => {
+            let mut out = Vec::new();
+            for x in v {
+                out.extend(regex_spec(x)?);
+            }
+            Some(out)
+        }
+        Req::And(v) => v.iter().filter_map(regex_spec).max_by_key(|alts| alts.iter().map(|w| w.iter().map(|x| x.0.len()).sum::<usize>()).min().unwrap_or(0)),
+    }
+}
+
 /// Words that a value passing this atom must hold (alternatives), when the index can say.
 fn index_spec(sp: &Sp) -> Option<Vec<Vec<(Vec<u8>, WordMatch)>>> {
     let Sp::Field { expr, .. } = sp else { return None };
@@ -122,7 +144,9 @@ fn index_spec(sp: &Sp) -> Option<Vec<Vec<(Vec<u8>, WordMatch)>>> {
         _ => None,
     };
     match &**expr {
-        Expr::Str { op, e, pat, neg: false, cs } if *op != StrOp::Matches && is_ref(e) => Some(vec![words(&lit(pat)?, *cs)?]),
+        Expr::Str { op, e, pat, neg: false, cs } if !matches!(op, StrOp::Matches | StrOp::Regex) && is_ref(e) => Some(vec![words(&lit(pat)?, *cs)?]),
+        // a regular expression: the words of the literals every match holds
+        Expr::Str { op: StrOp::Regex, e, pat, neg: false, .. } if is_ref(e) => regex_spec(&super::relit::required(&lit(pat)?)),
         Expr::Cmp(CmpOp::Eq, a, b) if is_ref(a) => Some(vec![words(&lit(b)?, true)?]),
         Expr::Cmp(CmpOp::Eq, a, b) if is_ref(b) => Some(vec![words(&lit(a)?, true)?]),
         Expr::In { e, list, neg: false } if is_ref(e) => list.iter().map(|x| words(&lit(x)?, true)).collect(),

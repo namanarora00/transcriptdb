@@ -218,7 +218,7 @@ impl Mp {
                             StrOp::StartsWith => return h.len() >= n.len() && h[..n.len()].eq_ignore_ascii_case(n),
                             StrOp::EndsWith => return h.len() >= n.len() && h[h.len() - n.len()..].eq_ignore_ascii_case(n),
                             StrOp::Has => return super::value::has_term_ascii_ci(t, pat),
-                            StrOp::Matches => {}
+                            StrOp::Matches | StrOp::Regex => {}
                         }
                     }
                     str_op(*op, t, pat, *cs)
@@ -308,25 +308,26 @@ fn has_in_window(w: &crate::db::PieceText, term: &str) -> bool {
     false
 }
 
-/// The units of a segment that surely pass a text test, and those that may (their whole
-/// text must be read), among the units of `scope`.
-fn text_atom(db: &Db, num: u32, h: &TextHead, op: StrOp, pat: &str, cs: bool, scope: &Bits) -> Result<(Bits, Bits), QError> {
-    let n = h.units();
-    let whole = match op {
-        StrOp::Has => true,
-        StrOp::Contains | StrOp::StartsWith | StrOp::EndsWith => false,
-        StrOp::Matches => return Ok((textindex::bits(n), scope.clone())),
-    };
-    if pat.is_empty() {
-        return Ok((scope.clone(), textindex::bits(n)));
-    }
-    let low = pat.to_lowercase();
-    let (runs, single) = textindex::pattern_runs(&low, whole);
+/// Where the words of a lower-cased pattern put it.
+struct Cand {
+    /// Pieces when `near`, else units.
+    bits: Bits,
+    /// The pattern is short: its words are in one piece or two neighbours, and it lies
+    /// inside that piece's window.
+    near: bool,
+    /// A word of the pattern may sit inside a longer word.
+    open: bool,
+    /// The pattern is exactly one run of letters and digits.
+    single: bool,
+}
+
+/// The pieces (or units) whose words can hold `low`; `None` when no word of it can be
+/// looked up.
+fn candidates(db: &Db, num: u32, h: &TextHead, low: &str, whole: bool) -> Result<Option<Cand>, QError> {
+    let (runs, single) = textindex::pattern_runs(low, whole);
     if runs.is_empty() {
-        return Ok((textindex::bits(n), scope.clone()));
+        return Ok(None);
     }
-    // each run's pieces; a short pattern has every run in the piece of its first run or
-    // the next one, and lies inside that piece's window
     let near = low.len() <= textindex::WINDOW_PATTERN;
     let np = h.pieces();
     let mut cand: Option<Bits> = None;
@@ -354,7 +355,64 @@ fn text_atom(db: &Db, num: u32, h: &TextHead, op: StrOp, pat: &str, cs: bool, sc
             }
         });
     }
-    let cand = cand.unwrap();
+    Ok(Some(Cand { bits: cand.unwrap(), near, open, single }))
+}
+
+/// The units of `scope` that may contain the lower-cased ASCII text `low` ignoring case.
+fn literal_units(db: &Db, num: u32, h: &TextHead, low: &str, scope: &Bits) -> Result<Bits, QError> {
+    let Some(c) = candidates(db, num, h, low, false)? else { return Ok(scope.clone()) };
+    let mut units = if c.near { h.units_with(&c.bits) } else { c.bits };
+    if c.open {
+        or(&mut units, &h.long);
+    }
+    or(&mut units, &h.holes);
+    and(&mut units, scope);
+    Ok(units)
+}
+
+/// The units of `scope` that may hold what a regular expression requires.
+fn required_units(db: &Db, num: u32, h: &TextHead, req: &super::relit::Req, scope: &Bits) -> Result<Bits, QError> {
+    use super::relit::Req;
+    Ok(match req {
+        Req::Any => scope.clone(),
+        Req::Lit(s) => literal_units(db, num, h, s, scope)?,
+        Req::And(v) => {
+            let mut out = scope.clone();
+            for x in v {
+                if !textindex::any(&out) {
+                    break;
+                }
+                out = required_units(db, num, h, x, &out)?;
+            }
+            out
+        }
+        Req::Or(v) => {
+            let mut out = textindex::bits(h.units());
+            for x in v {
+                let u = required_units(db, num, h, x, scope)?;
+                or(&mut out, &u);
+            }
+            out
+        }
+    })
+}
+
+/// The units of a segment that surely pass a text test, and those that may (their whole
+/// text must be read), among the units of `scope`.
+fn text_atom(db: &Db, num: u32, h: &TextHead, op: StrOp, pat: &str, cs: bool, scope: &Bits) -> Result<(Bits, Bits), QError> {
+    let n = h.units();
+    let whole = match op {
+        StrOp::Has => true,
+        StrOp::Contains | StrOp::StartsWith | StrOp::EndsWith => false,
+        StrOp::Matches => return Ok((textindex::bits(n), scope.clone())),
+        // a regular expression is run on the texts that hold the literals it requires
+        StrOp::Regex => return Ok((textindex::bits(n), required_units(db, num, h, &super::relit::required(pat), scope)?)),
+    };
+    if pat.is_empty() {
+        return Ok((scope.clone(), textindex::bits(n)));
+    }
+    let low = pat.to_lowercase();
+    let Some(Cand { bits: cand, near, open, single }) = candidates(db, num, h, &low, whole)? else { return Ok((textindex::bits(n), scope.clone())) };
     // units only their whole text can answer for: a hole in the text, or (when a run may
     // sit inside a longer word) a word cut short in the index
     let mut read_whole = h.holes.clone();

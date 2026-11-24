@@ -359,6 +359,13 @@ fn message_search_matches_a_scan_at_every_stage() {
         r#"messages | where text startswith "the" or text endswith "empty""#,
         r#"messages | where text has "keep going""#,
         r#"messages | where text has "no such word anywhere""#,
+        r#"messages | where text matches regex "test fails""#,
+        r#"messages | where text matches regex "(?i)PARSER returns""#,
+        r#"messages | where text matches regex "(cargo|parser) [a-z]+" and role == "user""#,
+        r#"messages | where text matches regex @"error\[E[0-9]+\]: mis""#,
+        r#"messages | where text matches regex "^the" or text matches regex "empty$""#,
+        r#"messages | where not (text matches regex "(?s)fix.*file")"#,
+        r#"messages | where text matches regex "[a-z]+ über""#,
     ];
     let mut some = 0;
     let mut check = |db: &Db, stage: &str| {
@@ -430,7 +437,7 @@ fn phrases_across_pieces_and_shared_session_ids() {
     ];
     let dir = tmpdir("pieces");
     let mut db = Db::open(&dir, opts()).unwrap();
-    let mut put = |db: &mut Db, session: &str, agent: &str, k: usize, text: &str| {
+    let put = |db: &mut Db, session: &str, agent: &str, k: usize, text: &str| {
         let b = body(&[format!(r#"{{"role":"user","content":"{text}"}}"#)]);
         db.put(&Put { session, agent, id: &format!("r{k}"), time: &format!("{}", 1_700_000_000 + k), meta: b"", body: b.as_bytes() }).unwrap();
     };
@@ -451,6 +458,13 @@ fn phrases_across_pieces_and_shared_session_ids() {
             (r#"messages | where text contains_cs "needle one""#, 5),
             (r#"messages | where not (text contains "needle one") and role == "user""#, 5),
             (r#"messages | where text endswith "needle one" or text startswith "needle one""#, 4),
+            (r#"messages | where text matches regex "needle one""#, 5),
+            (r#"messages | where text matches regex "(?i)needle (one|two)""#, 6),
+            (r#"messages | where text matches regex "(?s)needle.*one""#, 6),
+            (r#"messages | where text matches regex @"needle \.+ +one""#, 1),
+            (r#"messages | where text matches regex "a{50}needle""#, 1),
+            (r#"messages | where text matches regex "x?needle one$""#, 2),
+            (r#"messages | where text matches regex @"^\.+ needle one \.""#, 1),
         ] {
             let (a, b) = (message_rows(db, q, true), message_rows(db, q, false));
             assert_eq!(a, b, "{stage}: index and scan differ on {q}");
@@ -471,4 +485,33 @@ fn phrases_across_pieces_and_shared_session_ids() {
     check(&db, "merged");
     drop(db);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn regex_errors_and_step_fields() {
+    let e = query::run(&Db::open(tmpdir("rxerr"), opts()).unwrap(), r#"messages | where text matches regex "(unclosed""#, 1).err().expect("a bad pattern is refused");
+    assert!(e.to_string().contains("regular expression"), "{e}");
+    // on tool inputs: the summaries' word index and the step scan agree
+    let dir = tmpdir("rxsteps");
+    let mut db = Db::open(&dir, opts()).unwrap();
+    for q in rich_traffic(33, 12, 40) {
+        put_req(&mut db, &q);
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    let rows = |q: &str| -> Vec<Vec<String>> { query::run(&db, q, 1).unwrap_or_else(|e| panic!("{}", e.show(q))).table.rows.iter().map(|r| r.vals.iter().map(|v| v.to_string()).collect()).collect() };
+    let mut found = 0;
+    for rx in ["cargo (test|build)", "(?i)CARGO", r"src/[a-z]+\.rs", "^cargo", r"[0-9]+", "(grep|rg) .*-n", "no such text"] {
+        let fast = rows(&format!(r#"where command matches regex @"{rx}" or file_path matches regex @"{rx}" | summarize n = count()"#));
+        let slow = rows(&format!(r#"where command matches regex @"{rx}" or file_path matches regex @"{rx}" | extend one = 1 | summarize n = count()"#));
+        assert_eq!(fast, slow, "regex {rx}: one test");
+        let fast = rows(&format!(r#"where command matches regex @"{rx}" | summarize n = count(), s = dcount(session) by tool"#));
+        let slow = rows(&format!(r#"where command matches regex @"{rx}" | extend one = 1 | summarize n = count(), s = dcount(session) by tool"#));
+        assert_eq!(fast, slow, "regex {rx}: by tool");
+        found += !slow.is_empty() as usize;
+    }
+    assert!(found >= 3, "only {found} patterns found anything");
+    drop(db);
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(tmpdir("rxerr"));
 }

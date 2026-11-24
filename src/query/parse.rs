@@ -41,6 +41,9 @@ pub enum StrOp {
     EndsWith,
     /// Glob: `*` any run, `?` one character.
     Matches,
+    /// `matches regex`: the regular expression matches somewhere in the text, as written
+    /// (case matters unless the pattern says `(?i)`).
+    Regex,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -162,7 +165,7 @@ pub enum Source {
 
 const RESERVED: &[&str] = &[
     "and", "or", "not", "in", "has", "contains", "startswith", "endswith", "matches", "has_cs", "contains_cs", "startswith_cs", "endswith_cs",
-    "matches_cs", "then", "next", "within", "where", "by", "between", "asc", "desc", "steps", "turns", "messages",
+    "matches_cs", "then", "next", "within", "where", "by", "between", "asc", "desc", "steps", "turns", "messages", "regex",
 ];
 
 struct P {
@@ -569,7 +572,14 @@ impl P {
             _ => return Ok(l),
         };
         self.bump();
+        let op = if op == StrOp::Matches && self.kw("regex") { StrOp::Regex } else { op };
         let pat = self.add()?;
+        if op == StrOp::Regex
+            && let Expr::Lit(Value::Str(p)) = &pat
+            && let Err(e) = regex::Regex::new(p)
+        {
+            return self.err(format!("bad regular expression: {}", e.to_string().lines().last().unwrap_or("").trim().trim_start_matches("error: ")));
+        }
         Ok(Expr::Str { op, e: Box::new(l), pat: Box::new(pat), neg: false, cs })
     }
 

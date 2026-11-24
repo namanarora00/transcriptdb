@@ -732,6 +732,18 @@ pub fn queries() -> Vec<QuerySpec> {
             sessions: false,
         },
         QuerySpec {
+            name: "Text matching root cause ... fix (regex)",
+            engine: r#"messages | where text matches regex "(?is)root cause.*fix" | summarize n = count(), s = dcount(session)"#.into(),
+            sql: "SELECT count(*), count(DISTINCT se.sid) FROM texts t JOIN sessions se ON se.id = t.session WHERE t.lbody ~ 'root cause.*fix'".into(),
+            sessions: false,
+        },
+        QuerySpec {
+            name: "Commands matching git push or pull ... origin (regex)",
+            engine: r#"where command matches regex "(?s)git (push|pull) .*origin" | summarize n = count(), s = dcount(session)"#.into(),
+            sql: "SELECT count(*), count(DISTINCT se.sid) FROM steps s JOIN sessions se ON se.id = s.session WHERE s.command ~ 'git (push|pull) .*origin'".into(),
+            sessions: false,
+        },
+        QuerySpec {
             name: "Commands running git commit",
             engine: r#"where command contains "git commit" | summarize n = count(), s = dcount(session)"#.into(),
             sql: "SELECT count(*), count(DISTINCT se.sid) FROM steps s JOIN sessions se ON se.id = s.session WHERE s.command ILIKE '%git commit%'".into(),

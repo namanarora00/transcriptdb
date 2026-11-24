@@ -88,6 +88,28 @@ pub fn lex(src: &str) -> Result<Vec<Token>, QError> {
             b'<' => (Tok::Lt, 1),
             b'>' if two(b'=') => (Tok::Ge, 2),
             b'>' => (Tok::Gt, 1),
+            // a verbatim string, as in Kusto: `@"..."` keeps backslashes as they are (what a
+            // regular expression wants); a doubled quote is one quote
+            b'@' if matches!(b.get(i + 1), Some(b'"') | Some(b'\'')) => {
+                let q = b[i + 1];
+                let mut s = String::new();
+                let mut j = i + 2;
+                loop {
+                    let Some(&d) = b.get(j) else { return Err(QError::at(at, "unterminated string")) };
+                    if d == q {
+                        if b.get(j + 1) == Some(&q) {
+                            s.push(q as char);
+                            j += 2;
+                            continue;
+                        }
+                        break;
+                    }
+                    let ch = src[j..].chars().next().unwrap();
+                    s.push(ch);
+                    j += ch.len_utf8();
+                }
+                (Tok::Str(s), j + 1 - i)
+            }
             b'"' | b'\'' => {
                 let q = c;
                 let mut s = String::new();

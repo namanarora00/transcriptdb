@@ -758,11 +758,15 @@ fn check_search(a: &Args) {
     for (k, file, eng, grep) in &rep.first {
         println!("  pattern {k} on {file}: engine {eng} units, grep {grep} lines");
     }
+    println!("{} regular expressions, {} hits by grep -E; {} differ", rep.regexes, rep.regex_hits, rep.regex_differ);
+    for (k, file, eng, grep) in &rep.regex_first {
+        println!("  regular expression {k} on {file}: engine {eng} units, grep {grep} lines");
+    }
     println!("{} filters over message text, with the word index and by reading every text: {} rows; {} filters differ", rep.index_filters, rep.index_rows, rep.index_differ);
     for (k, kind, with, by) in &rep.index_first {
         println!("  filter {k} (kind {kind}): {with} rows with the index, {by} by reading");
     }
-    if rep.differ > 0 || rep.index_differ > 0 {
+    if rep.differ > 0 || rep.index_differ > 0 || rep.regex_differ > 0 {
         std::process::exit(1);
     }
 }

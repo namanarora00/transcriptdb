@@ -49,6 +49,11 @@ BUGS=(
   "roles-swapped|src/query/messages.rs|            if *user { and(&mut d, &h.user) } else { and_not(&mut d, &h.user) }|            if *user { and_not(&mut d, &h.user) } else { and(&mut d, &h.user) }|test:message_search_matches_a_scan_at_every_stage"
   "unflushed-messages-not-searched|src/db.rs|            if (a.core.flushed_nodes as usize) < a.core.nodes.len() {|            if false && (a.core.flushed_nodes as usize) < a.core.nodes.len() {|test:message_search_matches_a_scan_at_every_stage"
   "replaced-messages-searched|src/db.rs|            let live = if replaced { Some(self.live_mask(seg)?) } else { None };|            let live: Option<Arc<Vec<bool>>> = if replaced { None } else { None };|test:aggregations_skip_parts_that_folds_replaced"
+  "regex-optional-part-required|src/query/relit.rs|        HirKind::Repetition(r) if r.min >= 1 => req(&r.sub),|        HirKind::Repetition(r) => req(&r.sub),|test:phrases_across_pieces_and_shared_session_ids"
+  "regex-one-branch-enough|src/query/relit.rs|                    Req::Any => return Req::Any,
+                    Req::Or(inner) => out.extend(inner),|                    Req::Any => {}
+                    Req::Or(inner) => out.extend(inner),|lib:nothing_when_unsure"
+  "regex-as-plain-words|src/query/summary.rs|if !matches!(op, StrOp::Matches \| StrOp::Regex) && is_ref(e)|if !matches!(op, StrOp::Matches) && is_ref(e)|test:regex_errors_and_step_fields"
   "word-suffix-as-inside|src/textindex.rs|if if fit == Fit::Suffix { at + run.len() == end } else { at + run.len() <= end } {|if at + run.len() <= end {|lib:round_trip_and_lookups"
 )
 

@@ -1,5 +1,9 @@
 //! Check text search against `grep`.
 //!
+//! Regular expressions are drawn from the text too (two pieces of a line with anything
+//! between, either of two pieces, a piece with a run of letters replaced by `[a-z]+`, the
+//! start or the end of a line) and compared with `/usr/bin/grep -E`.
+//!
 //! Writes every searchable unit to a file, one per line (the user's and the assistant's
 //! text blocks in one file, each of the most used input fields in its own), draws patterns
 //! from the text itself, and for each compares the units a query finds with the lines
@@ -50,6 +54,11 @@ pub struct Report {
     pub differ: usize,
     /// (pattern number, file, hits by the engine, hits by grep) for the first differences.
     pub first: Vec<(usize, String, usize, usize)>,
+    /// Regular expressions compared with `grep -E`.
+    pub regexes: usize,
+    pub regex_hits: u64,
+    pub regex_differ: usize,
+    pub regex_first: Vec<(usize, String, usize, usize)>,
     /// Filters over message text run with the word index and by reading every text.
     pub index_filters: usize,
     pub index_rows: u64,
@@ -100,12 +109,124 @@ fn draw(d: &Dump, rng: &mut Rng, ascii: bool) -> Option<Vec<u8>> {
     None
 }
 
+/// `p` as a regular expression that matches exactly it, in both `grep -E` and the engine.
+fn escape(p: &[u8], out: &mut Vec<u8>) {
+    for &c in p {
+        if b".^$*+?()[]{}|\\".contains(&c) {
+            out.push(b'\\');
+        }
+        out.push(c);
+    }
+}
+
+/// A piece of `l` of 3 to 10 bytes starting at or after `from`, as a byte range.
+fn piece_of(l: &[u8], from: usize, rng: &mut Rng) -> Option<(usize, usize)> {
+    if l.len() < from + 3 {
+        return None;
+    }
+    let mut a = from + rng.below(l.len() - from - 2);
+    while a < l.len() && (l[a] & 0xC0) == 0x80 {
+        a += 1;
+    }
+    let mut b = (a + 3 + rng.below(8)).min(l.len());
+    while b < l.len() && (l[b] & 0xC0) == 0x80 {
+        b += 1;
+    }
+    let p = l.get(a..b)?;
+    (p.len() >= 3 && !p.iter().any(|&c| c < 0x20 || c == 0x7f) && std::str::from_utf8(p).is_ok()).then_some((a, b))
+}
+
+/// A regular expression that matches at least the line it was drawn from.
+fn draw_regex(d: &Dump, rng: &mut Rng, kind: usize) -> Option<Vec<u8>> {
+    for _ in 0..200 {
+        let l = &d.lines[rng.below(d.lines.len())];
+        if l.len() < 8 {
+            continue;
+        }
+        let mut out = Vec::new();
+        match kind % 4 {
+            0 => {
+                let Some((a, b)) = piece_of(l, 0, rng) else { continue };
+                let Some((c, e)) = piece_of(l, b, rng) else { continue };
+                escape(&l[a..b], &mut out);
+                out.extend_from_slice(b".*");
+                escape(&l[c..e], &mut out);
+            }
+            1 => {
+                let Some((a, b)) = piece_of(l, 0, rng) else { continue };
+                let l2 = &d.lines[rng.below(d.lines.len())];
+                let Some((c, e)) = piece_of(l2, 0, rng) else { continue };
+                out.push(b'(');
+                escape(&l[a..b], &mut out);
+                out.push(b'|');
+                escape(&l2[c..e], &mut out);
+                out.push(b')');
+            }
+            2 => {
+                // a run of lower-case letters with text on both sides becomes [a-z]+
+                let start = rng.below(l.len());
+                let Some(a) = (start..l.len()).find(|&i| l[i].is_ascii_lowercase() && (i == 0 || !l[i - 1].is_ascii_lowercase())) else { continue };
+                let b = (a..l.len()).find(|&i| !l[i].is_ascii_lowercase()).unwrap_or(l.len());
+                if a < 3 || b + 3 > l.len() {
+                    continue;
+                }
+                let mut pa = a - 3;
+                while pa > 0 && (l[pa] & 0xC0) == 0x80 {
+                    pa -= 1;
+                }
+                let mut sb = b + 3;
+                while sb < l.len() && (l[sb] & 0xC0) == 0x80 {
+                    sb += 1;
+                }
+                let (pre, post) = (&l[pa..a], &l[b..sb]);
+                if pre.iter().chain(post).any(|&c| c < 0x20 || c == 0x7f) || std::str::from_utf8(pre).is_err() || std::str::from_utf8(post).is_err() {
+                    continue;
+                }
+                escape(pre, &mut out);
+                out.extend_from_slice(b"[a-z]+");
+                escape(post, &mut out);
+            }
+            _ => {
+                let mut n = (4 + rng.below(8)).min(l.len());
+                if rng.below(2) == 0 {
+                    while n < l.len() && (l[n] & 0xC0) == 0x80 {
+                        n += 1;
+                    }
+                    let p = &l[..n];
+                    if p.iter().any(|&c| c < 0x20 || c == 0x7f) || std::str::from_utf8(p).is_err() {
+                        continue;
+                    }
+                    out.push(b'^');
+                    escape(p, &mut out);
+                } else {
+                    let mut a = l.len() - n;
+                    while a > 0 && (l[a] & 0xC0) == 0x80 {
+                        a -= 1;
+                    }
+                    let p = &l[a..];
+                    if p.iter().any(|&c| c < 0x20 || c == 0x7f) || std::str::from_utf8(p).is_err() {
+                        continue;
+                    }
+                    escape(p, &mut out);
+                    out.push(b'$');
+                }
+            }
+        }
+        return Some(out);
+    }
+    None
+}
+
 fn grep(d: &Dump, pat: &[u8], cs: bool) -> R<Vec<u32>> {
+    grep_how(d, pat, if cs { &["-F"] } else { &["-F", "-i"] })
+}
+
+fn grep_how(d: &Dump, pat: &[u8], how: &[&str]) -> R<Vec<u32>> {
     use std::os::unix::ffi::OsStrExt;
     let mut c = Command::new("/usr/bin/grep");
-    c.env("LC_ALL", "C").arg("-a").arg("-n").arg("-F");
-    if !cs {
-        c.arg("-i");
+    c.env("LC_ALL", "C").arg("-a").arg("-n");
+    for h in how {
+        c.arg(h);
     }
     let out = c.arg("-e").arg(std::ffi::OsStr::from_bytes(pat)).arg(&d.path).output().map_err(|e| format!("running grep: {e}"))?;
     if !out.status.success() && out.status.code() != Some(1) {
@@ -122,11 +243,15 @@ fn grep(d: &Dump, pat: &[u8], cs: bool) -> R<Vec<u32>> {
 }
 
 fn engine(db: &Db, d: &Dump, line_of: &HashMap<(u32, u32, u32), u32>, pat: &[u8], cs: bool) -> R<Vec<u32>> {
+    engine_op(db, d, line_of, StrOp::Contains, pat, cs)
+}
+
+fn engine_op(db: &Db, d: &Dump, line_of: &HashMap<(u32, u32, u32), u32>, op: StrOp, pat: &[u8], cs: bool) -> R<Vec<u32>> {
     let col = match &d.field {
         None => vec!["text".to_string()],
         Some(f) => vec!["input".to_string(), f.clone()],
     };
-    let e = Expr::Str { op: StrOp::Contains, e: Box::new(Expr::Ref(col)), pat: Box::new(Expr::Lit(Value::Str(String::from_utf8_lossy(pat).as_ref().into()))), neg: false, cs };
+    let e = Expr::Str { op, e: Box::new(Expr::Ref(col)), pat: Box::new(Expr::Lit(Value::Str(String::from_utf8_lossy(pat).as_ref().into()))), neg: false, cs };
     let q = Query { source: if d.field.is_none() { Source::Messages } else { Source::Steps }, stages: vec![Stage::Where(e)] };
     let run = exec::run(db, &q, 1).map_err(|e| e.to_string())?;
     let mut v = Vec::with_capacity(run.table.rows.len());
@@ -244,6 +369,39 @@ pub fn run(db: &Db, n_patterns: usize, seed: u64, work: &Path, top_fields: usize
         }
         k += 1;
     }
+    // regular expressions: half as many, spread the same way
+    let mut seen_rx: std::collections::HashSet<(usize, Vec<u8>)> = Default::default();
+    let (mut k, mut tries) = (0, 0);
+    while k < n_patterns / 2 && tries < n_patterns * 25 {
+        tries += 1;
+        let di = if k % 2 == 0 || dumps.len() == 1 { 0 } else { 1 + (k / 2) % (dumps.len() - 1) };
+        let d = &dumps[di];
+        if d.lines.is_empty() {
+            k += 1;
+            continue;
+        }
+        let Some(rx) = draw_regex(d, &mut rng, k / 2) else {
+            k += 1;
+            continue;
+        };
+        if !seen_rx.insert((di, rx.clone())) {
+            continue;
+        }
+        // the engine's `.` stops at a line break unless told otherwise; a unit is one line here
+        let mut eng = b"(?s)".to_vec();
+        eng.extend_from_slice(&rx);
+        let a = engine_op(db, d, &maps[di], StrOp::Regex, &eng, true)?;
+        let b = grep_how(d, &rx, &["-E"])?;
+        rep.regexes += 1;
+        rep.regex_hits += b.len() as u64;
+        if a != b {
+            rep.regex_differ += 1;
+            if rep.regex_first.len() < 10 {
+                rep.regex_first.push((rep.regexes, format!("{} (kind {})", d.name, (k / 2) % 4), a.len(), b.len()));
+            }
+        }
+        k += 1;
+    }
     index_check(db, &dumps[0], n_patterns, &mut rng, &mut rep)?;
     std::fs::remove_dir_all(work).map_err(|e| e.to_string())?;
     Ok(rep)
@@ -284,7 +442,7 @@ fn index_check(db: &Db, d: &Dump, n: usize, rng: &mut Rng, rep: &mut Report) -> 
         return Ok(());
     }
     for k in 0..n {
-        let kind = k % 10;
+        let kind = k % 12;
         let flip = |p: &mut Vec<u8>, rng: &mut Rng| {
             for c in p.iter_mut() {
                 if rng.below(3) == 0 {
@@ -309,6 +467,11 @@ fn index_check(db: &Db, d: &Dump, n: usize, rng: &mut Rng, rep: &mut Report) -> 
             7 => draw(d, rng, true).map(|mut p| {
                 flip(&mut p, rng);
                 text_test(StrOp::Contains, &p, true, false)
+            }),
+            10 | 11 => draw_regex(d, rng, k).map(|rx| {
+                let mut eng = if kind == 10 { b"(?s)".to_vec() } else { b"(?is)".to_vec() };
+                eng.extend_from_slice(&rx);
+                text_test(StrOp::Regex, &eng, true, false)
             }),
             8 => {
                 // the start or the end of a text

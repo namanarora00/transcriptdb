@@ -378,7 +378,30 @@ pub fn has_term_ascii_ci(s: &str, term: &str) -> bool {
     false
 }
 
+/// A compiled regular expression for `pat` (`None` when it does not compile), kept per
+/// thread: a test runs once per value.
+pub fn regex_for(pat: &str) -> Option<Rc<regex::Regex>> {
+    thread_local! {
+        static COMPILED: std::cell::RefCell<std::collections::HashMap<String, Option<Rc<regex::Regex>>>> = std::cell::RefCell::new(std::collections::HashMap::new());
+    }
+    COMPILED.with(|c| {
+        let mut c = c.borrow_mut();
+        if let Some(r) = c.get(pat) {
+            return r.clone();
+        }
+        if c.len() >= 256 {
+            c.clear();
+        }
+        let r = regex::Regex::new(pat).ok().map(Rc::new);
+        c.insert(pat.to_string(), r.clone());
+        r
+    })
+}
+
 pub fn str_op(op: StrOp, s: &str, pat: &str, cs: bool) -> bool {
+    if op == StrOp::Regex {
+        return regex_for(pat).is_some_and(|r| r.is_match(s));
+    }
     if !cs && pat.is_ascii() && ascii_case_only(s) {
         let (h, n) = (s.as_bytes(), pat.as_bytes());
         match op {
@@ -395,6 +418,7 @@ pub fn str_op(op: StrOp, s: &str, pat: &str, cs: bool) -> bool {
         StrOp::Contains => s.contains(&pat),
         StrOp::StartsWith => s.starts_with(&pat),
         StrOp::EndsWith => s.ends_with(&pat),
+        StrOp::Regex => unreachable!("handled above"),
         StrOp::Matches => {
             let p: Vec<char> = pat.chars().collect();
             let t: Vec<char> = s.chars().collect();
@@ -570,6 +594,14 @@ mod tests {
         assert!(has_term("cargo test --all", "test"));
         assert!(!has_term("cargo tests", "test"));
         assert!(str_op(StrOp::Contains, "Error: X", "error", false));
+        // regular expressions: anywhere in the text, case as written
+        assert!(str_op(StrOp::Regex, "exit code 137 after 2s", r"code \d+ after", false));
+        assert!(!str_op(StrOp::Regex, "Exit Code 137", "exit code", false));
+        assert!(str_op(StrOp::Regex, "Exit Code 137", "(?i)exit code", false));
+        assert!(str_op(StrOp::Regex, "a\nb", "(?s)a.b", false));
+        assert!(!str_op(StrOp::Regex, "a\nb", "a.b", false));
+        assert!(str_op(StrOp::Regex, "abc", "^abc$", false));
+        assert!(!str_op(StrOp::Regex, "abc", "(unclosed", false));
         // non-ASCII text, ASCII pattern: found ignoring ASCII case without lower-casing the text
         assert!(str_op(StrOp::Contains, "caf\u{e9} \u{2014} Root Cause \u{2705}", "root cause", false));
         assert!(str_op(StrOp::Has, "\u{2705}Done \u{2014} ok", "done", false));
