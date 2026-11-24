@@ -594,6 +594,10 @@ mod tests {
         assert_eq!(units_of(&h, &blocks, "commit", Fit::Exact), vec![0, 1]);
         assert_eq!(units_of(&h, &blocks, "commit", Fit::Prefix), vec![0, 1, 2]);
         assert_eq!(units_of(&h, &blocks, "git", Fit::Suffix), vec![1, 3]);
+        // a word that only holds the run in its middle is not one that ends with it
+        assert_eq!(units_of(&h, &blocks, "omm", Fit::Suffix), Vec::<u32>::new());
+        assert_eq!(units_of(&h, &blocks, "com", Fit::Suffix), Vec::<u32>::new());
+        assert_eq!(units_of(&h, &blocks, "mit", Fit::Suffix), vec![0, 1]);
         assert_eq!(units_of(&h, &blocks, "omm", Fit::Inside), vec![0, 1, 2]);
         assert_eq!(units_of(&h, &blocks, "nothing", Fit::Exact), Vec::<u32>::new());
     }
