@@ -194,6 +194,13 @@ pub struct SessionCore {
 }
 
 impl SessionCore {
+    /// (session id, agent id).
+    pub fn key(&self) -> (&str, &str) {
+        (&self.key.0, &self.key.1)
+    }
+}
+
+impl SessionCore {
     fn bytes(&self) -> usize {
         256 + self.nodes.len() * 56
             + self.nodes.iter().filter_map(|n| n.holes.as_ref()).map(|h| h.len() * 16).sum::<usize>()
@@ -366,6 +373,24 @@ pub enum StepSource {
     Rows { session: u32, start: u32, end: u32 },
 }
 
+/// A text unit read to confirm a match.
+#[derive(Debug)]
+pub struct UnitText {
+    pub text: String,
+    /// Lower-casing it changes only ASCII letters as far as an ASCII pattern can tell (see
+    /// `query::value::ascii_case_only`), so such a pattern is compared ignoring ASCII case.
+    pub plain_case: bool,
+}
+
+/// Numbers for session ids and agent names: stored sessions with the same session id (a
+/// main agent and its side agents) share the first number.
+#[derive(Default)]
+struct KeyIds {
+    of: Vec<Option<(u32, u32)>>,
+    sids: HashMap<String, u32>,
+    agents: HashMap<String, u32>,
+}
+
 /// Where a search finds text units (see [`Db::text_sources`]).
 #[derive(Debug, Clone)]
 pub enum TextSource {
@@ -460,7 +485,7 @@ pub struct Db {
     /// Their postings, by (segment, block).
     textpost: Cache<(u32, u32), Vec<u8>>,
     /// Texts of units a search read to confirm a match, by (session, node, block).
-    unitc: Cache<(u32, u32, u32), String>,
+    unitc: Cache<(u32, u32, u32), UnitText>,
     /// Texts of step values that summaries read from step blocks, by (segment, part,
     /// offset in the part): a search confirms each candidate on its text, and its
     /// candidates are spread over far more step blocks than fit a cache.
@@ -479,6 +504,8 @@ pub struct Db {
     /// Per segment holding parts that folds replaced: which of its parts are live, as of a
     /// manifest generation.
     live_masks: Mutex<HashMap<u32, (u64, Arc<Vec<bool>>)>>,
+    /// A number for each session id and each agent name seen so far, by stored session.
+    key_ids: Mutex<KeyIds>,
     active: HashMap<u32, Active>,
     /// Sessions that took writes in the last `idle_flushes` flushes, as of the last flush
     /// (merges after it drop them from `active`).
@@ -630,6 +657,7 @@ impl Db {
             statc: Cache::new(cb / 12),
             longc: Cache::sharded(cb / 32, 16),
             live_masks: Mutex::new(HashMap::new()),
+            key_ids: Mutex::new(KeyIds::default()),
             active: HashMap::new(),
             busy: BTreeSet::new(),
             key_ix: HashMap::new(),
@@ -2216,6 +2244,36 @@ impl Db {
         self.next_session as usize
     }
 
+    /// For each stored session, a number for its session id and one for its agent name:
+    /// equal numbers mean equal text. Worked out once per stored session.
+    pub fn key_ids(&self, sessions: &[u32]) -> Result<Vec<(u32, u32)>> {
+        let mut g = self.key_ids.lock().unwrap();
+        let mut out = Vec::with_capacity(sessions.len());
+        for &s in sessions {
+            if g.of.len() <= s as usize {
+                g.of.resize(s as usize + 1, None);
+            }
+            let ids = match g.of[s as usize] {
+                Some(x) => x,
+                None => {
+                    let core = self.load_core(s)?;
+                    let (ns, na) = (g.sids.len() as u32, g.agents.len() as u32);
+                    let sid = *g.sids.entry(core.key.0.clone()).or_insert(ns);
+                    let agent = *g.agents.entry(core.key.1.clone()).or_insert(na);
+                    g.of[s as usize] = Some((sid, agent));
+                    (sid, agent)
+                }
+            };
+            out.push(ids);
+        }
+        Ok(out)
+    }
+
+    /// A session's tree and requests (for [`SessionCore::key`] without copying it).
+    pub fn core(&self, s: u32) -> Result<Arc<SessionCore>> {
+        self.load_core(s)
+    }
+
     /// The session's (session id, agent id). Panics if the session cannot be read.
     pub fn session_key(&self, s: u32) -> (String, String) {
         self.load_core(s).expect("read session").key.clone()
@@ -2465,21 +2523,22 @@ impl Db {
 
     /// The text of units of a session, each (node, block): from the cache, the rest read
     /// from their messages (one read for all of them).
-    pub fn unit_texts(&self, s: u32, wants: &[(u32, u16)]) -> Result<Vec<Arc<String>>> {
-        let mut out: Vec<Option<Arc<String>>> = wants.iter().map(|&(n, b)| self.unitc.get(&(s, n, b as u32))).collect();
+    pub fn unit_texts(&self, s: u32, wants: &[(u32, u16)]) -> Result<Vec<Arc<UnitText>>> {
+        let mut out: Vec<Option<Arc<UnitText>>> = wants.iter().map(|&(n, b)| self.unitc.get(&(s, n, b as u32))).collect();
         let mut missing: Vec<u32> = wants.iter().zip(&out).filter(|x| x.1.is_none()).map(|x| x.0.0).collect();
         if !missing.is_empty() {
             missing.sort_unstable();
             missing.dedup();
             let msgs = self.read_messages(s, &missing, &mut ReadStats::default())?;
             // kept here too: the cache may drop an entry before it is asked for again
-            let mut read: HashMap<(u32, u16), Arc<String>> = HashMap::new();
+            let mut read: HashMap<(u32, u16), Arc<UnitText>> = HashMap::new();
             for (&node, m) in missing.iter().zip(&msgs) {
                 let Some((_, spans)) = crate::text::scan_text(m) else { continue };
                 for t in spans {
                     let text = crate::text::unescape(&m[t.span.clone()]);
-                    let size = text.len() + 64;
-                    read.insert((node, t.block), self.unitc.insert((s, node, t.block as u32), Arc::new(text), size));
+                    let plain_case = crate::query::value::ascii_case_only(&text);
+                    let size = text.len() + 96;
+                    read.insert((node, t.block), self.unitc.insert((s, node, t.block as u32), Arc::new(UnitText { text, plain_case }), size));
                 }
             }
             for (o, w) in out.iter_mut().zip(wants) {

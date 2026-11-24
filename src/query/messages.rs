@@ -66,6 +66,8 @@ pub struct U<'a> {
     pub chars: u32,
     pub time: i64,
     pub text: Option<&'a str>,
+    /// The text is known to pass `value::ascii_case_only`.
+    pub plain: bool,
 }
 
 /// A row for a unit: everything but its text travels in the row.
@@ -81,7 +83,7 @@ fn row(u: &U) -> Row {
 }
 
 fn of_row<'a>(r: &Row, text: Option<&'a str>) -> U<'a> {
-    U { s: r.session, node: r.steps[0], block: r.steps[1] as u16, user: r.steps[2] == 1, chars: r.steps[3], time: (r.steps[4] as u64 | (r.steps[5] as u64) << 32) as i64, text }
+    U { s: r.session, node: r.steps[0], block: r.steps[1] as u16, user: r.steps[2] == 1, chars: r.steps[3], time: (r.steps[4] as u64 | (r.steps[5] as u64) << 32) as i64, text, plain: false }
 }
 
 fn qe(e: crate::codec::Error) -> QError {
@@ -93,7 +95,7 @@ fn value(db: &Db, u: &U, col: MsgCol) -> Result<Value, QError> {
         MsgCol::Role => Value::Str(if u.user { "user" } else { "assistant" }.into()),
         MsgCol::Text => match u.text {
             Some(t) => Value::Str(t.into()),
-            None => Value::Str(db.unit_texts(u.s, &[(u.node, u.block)]).map_err(qe)?[0].as_str().into()),
+            None => Value::Str(db.unit_texts(u.s, &[(u.node, u.block)]).map_err(qe)?[0].text.as_str().into()),
         },
         MsgCol::Chars => Value::Int(u.chars as i64),
         MsgCol::Session => Value::Str(db.session_key(u.s).0.into()),
@@ -137,7 +139,8 @@ pub enum Mp {
     Const(bool),
     /// `role == "user"` (`true`) or `role == "assistant"`.
     Role(bool),
-    Text { op: StrOp, pat: String, cs: bool, neg: bool },
+    /// `ascii`: the pattern is ASCII.
+    Text { op: StrOp, pat: String, ascii: bool, cs: bool, neg: bool },
     Generic(Expr),
     And(Vec<Mp>),
     Or(Vec<Mp>),
@@ -173,7 +176,7 @@ pub fn compile(e: &Expr) -> Mp {
         Expr::And(v) => Mp::And(v.iter().map(compile).collect()),
         Expr::Or(v) => Mp::Or(v.iter().map(compile).collect()),
         Expr::Not(x) => Mp::Not(Box::new(compile(x))),
-        Expr::Str { op, e: col, pat, neg, cs } if is_col(col, "text") && lit_str(pat).is_some() => Mp::Text { op: *op, pat: lit_str(pat).unwrap().to_string(), cs: *cs, neg: *neg },
+        Expr::Str { op, e: col, pat, neg, cs } if is_col(col, "text") && lit_str(pat).is_some() => Mp::Text { op: *op, pat: lit_str(pat).unwrap().to_string(), ascii: lit_str(pat).unwrap().is_ascii(), cs: *cs, neg: *neg },
         Expr::Cmp(op @ (CmpOp::Eq | CmpOp::Ne), a, b) => {
             let role = if is_col(a, "role") { lit_str(b) } else if is_col(b, "role") { lit_str(a) } else { None };
             match role {
@@ -204,13 +207,31 @@ impl Mp {
         Ok(match self {
             Mp::Const(b) => *b,
             Mp::Role(user) => u.user == *user,
-            Mp::Text { op, pat, cs, neg } => match u.text {
-                Some(t) => str_op(*op, t, pat, *cs) != *neg,
-                None => {
-                    let t = db.unit_texts(u.s, &[(u.node, u.block)]).map_err(qe)?;
-                    str_op(*op, &t[0], pat, *cs) != *neg
-                }
-            },
+            Mp::Text { op, pat, ascii, cs, neg } => {
+                // an ASCII pattern on a text known to lower-case plainly: compared ignoring
+                // ASCII case, without looking for the characters that would forbid it
+                let test = |t: &str, plain: bool| {
+                    if !*cs && *ascii && plain {
+                        let (h, n) = (t.as_bytes(), pat.as_bytes());
+                        match op {
+                            StrOp::Contains => return super::value::ascii_ci_find(h, n).is_some(),
+                            StrOp::StartsWith => return h.len() >= n.len() && h[..n.len()].eq_ignore_ascii_case(n),
+                            StrOp::EndsWith => return h.len() >= n.len() && h[h.len() - n.len()..].eq_ignore_ascii_case(n),
+                            StrOp::Has => return super::value::has_term_ascii_ci(t, pat),
+                            StrOp::Matches => {}
+                        }
+                    }
+                    str_op(*op, t, pat, *cs)
+                };
+                let hit = match u.text {
+                    Some(t) => test(t, u.plain),
+                    None => {
+                        let t = db.unit_texts(u.s, &[(u.node, u.block)]).map_err(qe)?;
+                        test(&t[0].text, t[0].plain_case)
+                    }
+                };
+                hit != *neg
+            }
             Mp::Generic(e) => eval(e, &UnitCtx { db, u, now })?.truthy(),
             Mp::And(v) => {
                 for x in v {
@@ -334,7 +355,7 @@ fn plan(db: &Db, num: u32, h: &TextHead, mp: &Mp) -> Result<(Bits, Bits), QError
             if *user { and(&mut d, &h.user) } else { and_not(&mut d, &h.user) }
             (d, textindex::bits(n))
         }
-        Mp::Text { op, pat, cs, neg } => {
+        Mp::Text { op, pat, cs, neg, .. } => {
             let (d, m) = text_atom(db, num, h, *op, pat, *cs)?;
             if *neg {
                 let mut nd = full(n);
@@ -384,7 +405,7 @@ fn plan(db: &Db, num: u32, h: &TextHead, mp: &Mp) -> Result<(Bits, Bits), QError
 
 fn unit_of<'a>(h: &TextHead, i: u32, text: Option<&'a str>) -> U<'a> {
     let k = i as usize;
-    U { s: h.parts[h.part_of[k] as usize].0, node: h.node[k], block: h.block[k], user: textindex::get(&h.user, i), chars: h.chars[k], time: h.time[k], text }
+    U { s: h.parts[h.part_of[k] as usize].0, node: h.node[k], block: h.block[k], user: textindex::get(&h.user, i), chars: h.chars[k], time: h.time[k], text, plain: false }
 }
 
 fn scan_segment(db: &Db, num: u32, live: Option<&[bool]>, pre: &Mp, reads_text: bool, now: i64, tested: &AtomicUsize) -> Result<Vec<Row>, QError> {
@@ -422,7 +443,8 @@ fn scan_segment(db: &Db, num: u32, live: Option<&[bool]>, pre: &Mp, reads_text: 
                 None
             };
             for (k, &i) in ids[a..b].iter().enumerate() {
-                let u = unit_of(&h, i, texts.as_ref().map(|t| t[k].as_str()));
+                let mut u = unit_of(&h, i, texts.as_ref().map(|t| t[k].text.as_str()));
+                u.plain = texts.as_ref().is_some_and(|t| t[k].plain_case);
                 if pre.test(db, &u, now)? {
                     rows.push(row(&u));
                 }
@@ -441,7 +463,7 @@ fn scan_nodes(db: &Db, s: u32, start: u32, end: u32, pre: &Mp, now: i64, tested:
             continue;
         }
         tested.fetch_add(1, Ordering::Relaxed);
-        let u = U { s, node: x.node, block: x.block, user: x.user, chars: x.len, time: t.node_time.get(x.node as usize).copied().unwrap_or(0), text: Some(t.text_of(k)) };
+        let u = U { s, node: x.node, block: x.block, user: x.user, chars: x.len, time: t.node_time.get(x.node as usize).copied().unwrap_or(0), text: Some(t.text_of(k)), plain: false };
         if pre.test(db, &u, now)? {
             rows.push(row(&u));
         }
@@ -513,41 +535,53 @@ pub fn fast_fits(t: &Table, aggs: &[(String, super::parse::AggFn, Option<Expr>)]
 /// main agent and its side agents are stored apart and share one.
 pub fn fast_summarize(db: &Db, t: &Table, aggs: &[(String, super::parse::AggFn, Option<Expr>)], by: &[(String, Expr)]) -> Table {
     use super::parse::AggFn;
-    use std::collections::HashMap;
-    // number each distinct session id and agent name the rows have
-    let mut of_stored: HashMap<u32, (u32, u32)> = HashMap::new();
-    let (mut sids, mut agents): (HashMap<String, u32>, HashMap<String, u32>) = Default::default();
-    let mut ids = |s: u32| -> (u32, u32) {
-        *of_stored.entry(s).or_insert_with(|| {
-            let (sid, agent) = db.session_key(s);
-            let (ns, na) = (sids.len() as u32, agents.len() as u32);
-            (*sids.entry(sid).or_insert(ns), *agents.entry(agent).or_insert(na))
-        })
-    };
     let by_session = by.iter().any(|(_, e)| is_col(e, "session"));
     let by_agent = by.iter().any(|(_, e)| is_col(e, "agent"));
     let by_role = by.iter().any(|(_, e)| is_col(e, "role"));
     let want_distinct = aggs.iter().any(|(_, f, _)| *f == AggFn::DCount);
-    let mut groups: HashMap<(u32, u32, u32), usize> = HashMap::new();
-    // per group: a row that stands for it, its count, its distinct session ids
-    let mut acc: Vec<(usize, i64, std::collections::HashSet<u32>)> = Vec::new();
+    // rows come in stored-session order: count each run of rows with one stored session and
+    // role first, then name the stored sessions and fold the runs into groups
+    let mut runs: Vec<(usize, u32, u32, i64)> = Vec::new();
     for (i, r) in t.rows.iter().enumerate() {
-        let (sid, agent) = ids(r.session);
-        let k = (if by_session { sid } else { NONE }, if by_agent { agent } else { NONE }, if by_role { r.steps[2] } else { NONE });
-        let g = *groups.entry(k).or_insert_with(|| {
-            acc.push((i, 0, Default::default()));
+        let role = if by_role { r.steps[2] } else { NONE };
+        match runs.last_mut() {
+            Some(x) if x.1 == r.session && x.2 == role => x.3 += 1,
+            _ => runs.push((i, r.session, role, 1)),
+        }
+    }
+    // the stored sessions of the runs, each with a number for its session id and one for
+    // its agent name
+    let mut stored: Vec<u32> = Vec::new();
+    for &(_, s, _, _) in &runs {
+        if stored.last() != Some(&s) {
+            stored.push(s);
+        }
+    }
+    let ids = db.key_ids(&stored).expect("read session");
+    // per group: its key, a row that stands for it, its count, its distinct session ids
+    let mut acc: Vec<((u32, u32, u32), usize, i64, Vec<u32>)> = Vec::new();
+    let mut group_of: std::collections::BTreeMap<(u32, u32, u32), usize> = Default::default();
+    let mut at = 0;
+    for &(first, s, role, n) in &runs {
+        while stored[at] != s {
+            at += 1;
+        }
+        let (sid, agent) = ids[at];
+        let k = (if by_session { sid } else { NONE }, if by_agent { agent } else { NONE }, role);
+        let g = *group_of.entry(k).or_insert_with(|| {
+            acc.push((k, first, 0, Vec::new()));
             acc.len() - 1
         });
-        acc[g].1 += 1;
+        acc[g].2 += n;
         if want_distinct {
-            acc[g].2.insert(sid);
+            acc[g].3.push(sid);
         }
     }
     if by.is_empty() && acc.is_empty() {
-        acc.push((usize::MAX, 0, Default::default()));
+        acc.push(((NONE, NONE, NONE), usize::MAX, 0, Vec::new()));
     }
     let mut rows = Vec::with_capacity(acc.len());
-    for (first, count, sessions) in &acc {
+    for (_, first, count, sessions) in &acc {
         let mut vals = Vec::with_capacity(by.len() + aggs.len());
         for (_, e) in by {
             let r = &t.rows[*first];
@@ -559,8 +593,16 @@ pub fn fast_summarize(db: &Db, t: &Table, aggs: &[(String, super::parse::AggFn, 
                 Value::Str(if r.steps[2] == 1 { "user" } else { "assistant" }.into())
             });
         }
+        let distinct = if want_distinct {
+            let mut d = sessions.clone();
+            d.sort_unstable();
+            d.dedup();
+            d.len() as i64
+        } else {
+            0
+        };
         for (_, f, _) in aggs {
-            vals.push(Value::Int(if *f == AggFn::Count { *count } else { sessions.len() as i64 }));
+            vals.push(Value::Int(if *f == AggFn::Count { *count } else { distinct }));
         }
         rows.push(Row { session: NONE, steps: [NONE; MAX_ELEMS], vals });
     }

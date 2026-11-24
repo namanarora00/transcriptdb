@@ -281,7 +281,7 @@ pub fn glob(pat: &[char], s: &[char]) -> bool {
 }
 
 /// Kusto's `has`: the term appears as a whole word (alphanumeric runs).
-fn has_term(s: &str, term: &str) -> bool {
+pub fn has_term(s: &str, term: &str) -> bool {
     if term.is_empty() {
         return true;
     }
@@ -354,12 +354,12 @@ pub fn ascii_ci_find(h: &[u8], n: &[u8]) -> Option<usize> {
 /// tell: true unless it has one of the two characters whose lower case holds an ASCII
 /// letter (U+0130 and U+212A). Then an ASCII pattern is in the lower-cased text exactly
 /// where it is in the text ignoring ASCII case.
-fn ascii_case_only(s: &str) -> bool {
+pub fn ascii_case_only(s: &str) -> bool {
     s.is_ascii() || (memchr::memmem::find(s.as_bytes(), "\u{130}".as_bytes()).is_none() && memchr::memmem::find(s.as_bytes(), "\u{212a}".as_bytes()).is_none())
 }
 
 /// `has` ignoring case, for an ASCII term on text where [`ascii_case_only`] holds.
-fn has_term_ascii_ci(s: &str, term: &str) -> bool {
+pub fn has_term_ascii_ci(s: &str, term: &str) -> bool {
     if term.is_empty() {
         return true;
     }
