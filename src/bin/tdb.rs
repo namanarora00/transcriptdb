@@ -6,7 +6,7 @@
 //!   tdb stats         --store DIR
 //!   tdb compact       --store DIR
 //!   tdb bench         --store DIR [--n 300] [--seed S]
-//!   tdb crash-test    --store DIR [--kills 1000] [--seed S] [--sync full|fsync|os]
+//!   tdb crash-test    --store DIR [--kills 1000] [--seed S] [--sync full|fsync|os] [--rules x]
 //!   tdb growth        --store DIR [--rounds 5] [--base 300] [--wake 0.1] [--cache-mb 256] [--flush-mb 64] [--seg-mb 256] [--max-parts 4]
 //!   tdb ceiling       --store DIR [--out DIR]
 //!   tdb screen        --store DIR [--repeat 5]
@@ -1064,11 +1064,29 @@ fn crash_child(a: &Args) {
     }
 }
 
+/// Column rules for `crash-test --rules x`, as (name, rest of the rule); `{p}` stands
+/// before the names of rules a rule reads, so the same rules can be defined a second time
+/// under other names.
+const CRASH_RULES: &[(&str, &str)] = &[
+    ("program", r#"on tool == "Bash" = extract(command, @"^\s*(\S+)")"#),
+    ("outlen", "= strlen(output)"),
+    ("big", "on not failed = out_bytes > 200"),
+    ("plen", "= strlen({p}program) + {p}outlen"),
+];
+
 fn crash_test(a: &Args) {
     let dir = a.store();
     let kills = a.num("kills", 1000);
     let seed = a.num("seed", 1);
     let _ = std::fs::remove_dir_all(&dir);
+    // with rules, every step written, replayed or merged between kills gets rule values
+    let with_rules = a.get("rules").is_some();
+    if with_rules {
+        let mut db = Db::open(&dir, a.opts()).expect("create store");
+        for (name, body) in CRASH_RULES {
+            db.define_rule(&format!("{name} {}", body.replace("{p}", ""))).expect("define rule");
+        }
+    }
     let exe = std::env::current_exe().unwrap();
     let mut r = Rng::new(seed.wrapping_add(99));
     let mut acked: Vec<String> = Vec::new();
@@ -1204,8 +1222,29 @@ fn crash_test(a: &Args) {
     println!("  merges seen to finish before a kill: at least {folded} sessions folded, {reclaims} segments rewritten to drop replaced parts; replaced parts left {}", mb(db.stats().dead_bytes));
     let (cold, cold_bytes) = db.cold_sessions().expect("cold sessions");
     println!("  sessions in cold runs at the end: {cold} of {} ({})", db.session_count(), mb(cold_bytes));
+    // the values the kills left behind against the same rules defined afresh under other
+    // names, which are worked out as the sessions are read
+    let mut rules_differ = 0;
+    if with_rules {
+        drop(db);
+        let mut db = Db::open(&dir, a.opts()).expect("open store");
+        for (name, body) in CRASH_RULES {
+            db.define_rule(&format!("x_{name} {}", body.replace("{p}", "x_"))).expect("define rule");
+        }
+        let mut values = 0;
+        for (name, _) in CRASH_RULES {
+            let ask = |col: &str| -> Vec<Vec<String>> {
+                let q = format!("summarize n = count() by {col} | sort by {col} asc");
+                transcriptdb::query::run(&db, &q, 1).expect("query").table.rows.iter().map(|r| r.vals.iter().map(|v| format!("{v:?}")).collect()).collect()
+            };
+            let (stored, fresh) = (ask(name), ask(&format!("x_{name}")));
+            values += stored.len();
+            rules_differ += (stored != fresh) as usize;
+        }
+        println!("  rule columns after all kills: {} rules, {values} distinct values; {rules_differ} differ from the same rules worked out afresh", CRASH_RULES.len());
+    }
     println!("  {:.0}s", t0.elapsed().as_secs_f64());
-    if lost + wrong + missing_final + stored_wrong > 0 || !sc.ok() {
+    if lost + wrong + missing_final + stored_wrong + rules_differ > 0 || !sc.ok() {
         std::process::exit(1);
     }
 }
