@@ -233,12 +233,49 @@ pub fn pg_rebuild(pg: &mut Pg, id: &str) -> R<Vec<u8>> {
     }
 }
 
+/// The whole words of lower-cased text as a `tsvector` literal: each maximal run of
+/// letters and digits, which is what the engine's `has` matches (runs over 255 bytes are
+/// left out).
+fn terms_vector(low: &str) -> String {
+    let mut words: BTreeSet<&str> = BTreeSet::new();
+    let mut start = None;
+    for (i, ch) in low.char_indices() {
+        match (ch.is_alphanumeric(), start) {
+            (true, None) => start = Some(i),
+            (false, Some(a)) => {
+                if i - a <= 255 {
+                    words.insert(&low[a..i]);
+                }
+                start = None;
+            }
+            _ => {}
+        }
+    }
+    if let Some(a) = start
+        && low.len() - a <= 255
+    {
+        words.insert(&low[a..]);
+    }
+    let mut out = String::new();
+    for w in words {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push('\'');
+        out.push_str(w);
+        out.push('\'');
+    }
+    out
+}
+
 /// Load the store into PostgreSQL (tables dropped first).
 pub fn load(db: &Db, pg: &mut Pg) -> R<String> {
     let t0 = Instant::now();
     pg.exec(
-        "DROP TABLE IF EXISTS sessions, messages, nodes, requests, steps, path_steps, pieces, blocks, metas CASCADE;
+        "DROP TABLE IF EXISTS sessions, messages, nodes, requests, steps, path_steps, pieces, blocks, metas, texts CASCADE;
+         CREATE EXTENSION IF NOT EXISTS pg_trgm;
          BEGIN;
+         CREATE TABLE texts (session int, unit int, node int, role text, time_ms bigint, lbody text, terms tsvector);
          CREATE TABLE sessions (id int PRIMARY KEY, sid text NOT NULL, agent text NOT NULL);
          CREATE TABLE messages (id int, body text NOT NULL);
          CREATE TABLE nodes (session int, node int, parent int, msg int);
@@ -474,8 +511,41 @@ pub fn load(db: &Db, pg: &mut Pg) -> R<String> {
         Ok(())
     })
     .map_err(pe)?;
+    // text units: lower-cased text for substring search and its words for whole-word search
+    let mut err = None;
+    pg.copy_in("COPY texts FROM STDIN", |c| {
+        for s in 0..ns {
+            let t = match db.session_texts(s) {
+                Ok(t) => t,
+                Err(e) => {
+                    err = Some(e.to_string());
+                    return Ok(());
+                }
+            };
+            for (u, x) in t.units.iter().enumerate() {
+                let low = t.text_of(u).to_lowercase();
+                c.int(s as i64);
+                c.int(u as i64);
+                c.int(x.node as i64);
+                c.field(Some(if x.user { b"u" } else { b"a" }));
+                c.int(t.node_time[x.node as usize]);
+                c.field(Some(low.as_bytes()));
+                c.field(Some(terms_vector(&low).as_bytes()));
+                c.end_row()?;
+            }
+        }
+        Ok(())
+    })
+    .map_err(pe)?;
+    if let Some(e) = err {
+        return Err(e);
+    }
     pg.exec(
-        "ALTER TABLE messages ADD PRIMARY KEY (id);
+        "ALTER TABLE texts ADD PRIMARY KEY (session, unit);
+         CREATE INDEX texts_trgm ON texts USING gin (lbody gin_trgm_ops);
+         CREATE INDEX texts_terms ON texts USING gin (terms);
+         CREATE INDEX steps_command_trgm ON steps USING gin (command gin_trgm_ops);
+         ALTER TABLE messages ADD PRIMARY KEY (id);
          ALTER TABLE nodes ADD PRIMARY KEY (session, node);
          ALTER TABLE requests ADD PRIMARY KEY (id);
          ALTER TABLE pieces ADD PRIMARY KEY (id);
@@ -641,6 +711,24 @@ pub fn queries() -> Vec<QuerySpec> {
             name: "Sessions using browser tools, per day",
             engine: r#"where tool startswith "mcp__Claude_Browser" | summarize s = dcount(session) by d = bin(time, 1d) | sort by d asc"#.into(),
             sql: r"SELECT (s.time_ms / 86400000) * 86400000 AS d, count(DISTINCT se.sid) FROM steps s JOIN sessions se ON se.id = s.session WHERE s.tool ILIKE 'mcp\_\_claude\_browser%' GROUP BY d ORDER BY d".into(),
+            sessions: false,
+        },
+        QuerySpec {
+            name: "User text with the word error, top sessions",
+            engine: r#"messages | where role == "user" and text has "error" | summarize n = count() by session | sort by n desc, session asc | take 10"#.into(),
+            sql: "SELECT se.sid, count(*) AS n FROM texts t JOIN sessions se ON se.id = t.session WHERE t.role = 'u' AND t.terms @@ 'error'::tsquery GROUP BY se.sid ORDER BY n DESC, se.sid ASC LIMIT 10".into(),
+            sessions: false,
+        },
+        QuerySpec {
+            name: "Assistant text containing root cause",
+            engine: r#"messages | where role == "assistant" and text contains "root cause" | summarize n = count(), s = dcount(session)"#.into(),
+            sql: "SELECT count(*), count(DISTINCT se.sid) FROM texts t JOIN sessions se ON se.id = t.session WHERE t.role = 'a' AND t.lbody LIKE '%root cause%'".into(),
+            sessions: false,
+        },
+        QuerySpec {
+            name: "Text saying still failing or try again",
+            engine: r#"messages | where text contains "still failing" or text contains "try again" | summarize n = count() by role | sort by role asc"#.into(),
+            sql: "SELECT CASE role WHEN 'u' THEN 'user' ELSE 'assistant' END AS r, count(*) FROM texts WHERE lbody LIKE '%still failing%' OR lbody LIKE '%try again%' GROUP BY r ORDER BY r".into(),
             sessions: false,
         },
         QuerySpec {

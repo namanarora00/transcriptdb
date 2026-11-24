@@ -366,6 +366,15 @@ pub enum StepSource {
     Rows { session: u32, start: u32, end: u32 },
 }
 
+/// Where a search finds text units (see [`Db::text_sources`]).
+#[derive(Debug, Clone)]
+pub enum TextSource {
+    /// A segment's word index; with `live`, only the parts marked live count.
+    Seg { num: u32, live: Option<Arc<Vec<bool>>> },
+    /// Messages `start..end` of a session that no index covers yet, read from the session.
+    Nodes { session: u32, start: u32, end: u32 },
+}
+
 /// A decoded block of a segment's summaries.
 pub enum StatBlock {
     Head(StatsHead),
@@ -446,6 +455,12 @@ pub struct Db {
     fieldc: Cache<u32, SessionSteps>,
     /// Sessions' text units (what the user wrote and the assistant said), read whole.
     msgtextc: Cache<u32, crate::text::SessionTexts>,
+    /// Segments' word indexes over message text: units and word lists.
+    texthead: Cache<u32, crate::textindex::TextHead>,
+    /// Their postings, by (segment, block).
+    textpost: Cache<(u32, u32), Vec<u8>>,
+    /// Texts of units a search read to confirm a match, by (session, node, block).
+    unitc: Cache<(u32, u32, u32), String>,
     /// Texts of step values that summaries read from step blocks, by (segment, part,
     /// offset in the part): a search confirms each candidate on its text, and its
     /// candidates are spread over far more step blocks than fit a cache.
@@ -597,16 +612,19 @@ impl Db {
             seg_codes: HashMap::new(),
             runs: Vec::new(),
             blob_files: BTreeMap::new(),
-            dirs: Cache::sharded(cb / 16, 16),
+            dirs: Cache::sharded(cb / 32, 16),
             blocks: Cache::sharded(cb / 8, 16),
-            ix: Cache::sharded(cb / 8, 16),
+            ix: Cache::sharded(cb / 16, 16),
             cores: Cache::new(cb * 3 / 16),
             stepc: Cache::new(cb / 8),
             lightc: Cache::new(cb / 16),
             fieldc: Cache::new(cb / 16),
-            msgtextc: Cache::new(cb / 16),
+            msgtextc: Cache::new(cb / 64),
+            texthead: Cache::new(cb / 32),
+            textpost: Cache::sharded(cb / 32, 16),
+            unitc: Cache::sharded(cb / 16, 4),
             textc: Cache::sharded(cb / 32, 16),
-            pieces: Cache::sharded(cb / 16, 16),
+            pieces: Cache::sharded(cb / 32, 16),
             piece_bases: HashMap::new(),
             skels: Cache::sharded(cb / 32, 16),
             statc: Cache::new(cb / 12),
@@ -1535,7 +1553,8 @@ impl Db {
             let (mut cp, stream) = self.core_part(core, core.flushed_nodes..core.nodes.len() as u32, core.flushed_reqs..core.requests.len() as u32)?;
             cp.frames = w.frames(&stream)?;
             let sp = self.step_part(&mut w, s, ss, ss.flushed..ss.rows.len() as u32)?;
-            w.add(s, core.key.clone(), &cp, &sp)?;
+            let units = crate::textindex::part_units(&cp, &stream);
+            w.add(s, core.key.clone(), &cp, &sp, units)?;
             written.push((s, cp));
         }
         w.finish(self.opts.sync)?;
@@ -2325,6 +2344,9 @@ impl Db {
             ("steps without values", self.lightc.stats()),
             ("steps with some fields' values", self.fieldc.stats()),
             ("sessions' text", self.msgtextc.stats()),
+            ("text index heads", self.texthead.stats()),
+            ("text index postings", self.textpost.stats()),
+            ("unit texts", self.unitc.stats()),
             ("step values read by summaries", self.textc.stats()),
             ("step summaries", self.statc.stats()),
             ("long input values", self.longc.stats()),
@@ -2385,6 +2407,88 @@ impl Db {
         let ss = self.read_steps(s)?.with_fields(&keep);
         let size = ss.bytes();
         Ok(self.fieldc.insert(s, Arc::new(ss), size))
+    }
+
+    /// Where every text unit is: each segment with a word index as a whole (with which of
+    /// its parts are live, when folds replaced some), and as node ranges the messages not
+    /// yet flushed. Every unit is in exactly one source.
+    pub fn text_sources(&self) -> Result<Vec<TextSource>> {
+        let mut out = Vec::new();
+        for (&num, seg) in &self.segs {
+            if seg.cat.text.is_none() {
+                // a segment without a word index has no text units
+                continue;
+            }
+            let live = if self.manifest.dead.iter().any(|(n, _)| *n == num) { Some(self.live_mask(seg)?) } else { None };
+            out.push(TextSource::Seg { num, live });
+        }
+        let mut act: Vec<(&u32, &Active)> = self.active.iter().collect();
+        act.sort_by_key(|x| *x.0);
+        for (&s, a) in act {
+            if (a.core.flushed_nodes as usize) < a.core.nodes.len() {
+                out.push(TextSource::Nodes { session: s, start: a.core.flushed_nodes, end: a.core.nodes.len() as u32 });
+            }
+        }
+        Ok(out)
+    }
+
+    /// A segment's word index over message text: its units and word list.
+    pub fn text_head(&self, num: u32) -> Result<Arc<crate::textindex::TextHead>> {
+        if let Some(h) = self.texthead.get(&num) {
+            return Ok(h);
+        }
+        let seg = self.segs.get(&num).ok_or_else(|| bad(format!("segment {num} is gone")))?;
+        let Some(r) = &seg.cat.text else { return Err(bad(format!("segment {num} has no text index"))) };
+        let dir = crate::textindex::decode_dir(&seg.block(r)?)?;
+        let h = crate::textindex::TextHead::decode(&dir, &seg.block(&dir.units)?, &seg.block(&dir.words)?)?;
+        let size = h.bytes();
+        Ok(self.texthead.insert(num, Arc::new(h), size))
+    }
+
+    /// Add the units holding word `word` of a segment's index to `out`.
+    pub fn text_postings(&self, num: u32, head: &crate::textindex::TextHead, word: usize, out: &mut crate::textindex::Bits) -> Result<()> {
+        let (c, a, b) = head.postings_at(word);
+        let block = match self.textpost.get(&(num, c as u32)) {
+            Some(x) => x,
+            None => {
+                let seg = self.segs.get(&num).ok_or_else(|| bad(format!("segment {num} is gone")))?;
+                let raw = seg.block(&head.chunks[c].1)?;
+                let size = raw.len() + 64;
+                self.textpost.insert((num, c as u32), Arc::new(raw), size)
+            }
+        };
+        if b > block.len() {
+            return corrupt("a word's postings run past their block");
+        }
+        crate::textindex::add_postings(&block[a..b], out)
+    }
+
+    /// The text of units of a session, each (node, block): from the cache, the rest read
+    /// from their messages (one read for all of them).
+    pub fn unit_texts(&self, s: u32, wants: &[(u32, u16)]) -> Result<Vec<Arc<String>>> {
+        let mut out: Vec<Option<Arc<String>>> = wants.iter().map(|&(n, b)| self.unitc.get(&(s, n, b as u32))).collect();
+        let mut missing: Vec<u32> = wants.iter().zip(&out).filter(|x| x.1.is_none()).map(|x| x.0.0).collect();
+        if !missing.is_empty() {
+            missing.sort_unstable();
+            missing.dedup();
+            let msgs = self.read_messages(s, &missing, &mut ReadStats::default())?;
+            // kept here too: the cache may drop an entry before it is asked for again
+            let mut read: HashMap<(u32, u16), Arc<String>> = HashMap::new();
+            for (&node, m) in missing.iter().zip(&msgs) {
+                let Some((_, spans)) = crate::text::scan_text(m) else { continue };
+                for t in spans {
+                    let text = crate::text::unescape(&m[t.span.clone()]);
+                    let size = text.len() + 64;
+                    read.insert((node, t.block), self.unitc.insert((s, node, t.block as u32), Arc::new(text), size));
+                }
+            }
+            for (o, w) in out.iter_mut().zip(wants) {
+                if o.is_none() {
+                    *o = read.get(w).cloned();
+                }
+            }
+        }
+        out.into_iter().map(|o| o.ok_or_else(|| bad("a text unit is not in its message".to_string()))).collect()
     }
 
     /// Every text unit of a session (user and assistant text blocks) with its text, read
@@ -2828,7 +2932,7 @@ impl Db {
 
     /// Drop everything read from files from the caches (sessions taking writes stay).
     pub fn clear_caches(&self) {
-        for c in [&self.cores as &dyn Clear, &self.stepc, &self.lightc, &self.dirs, &self.blocks, &self.ix, &self.pieces, &self.skels, &self.statc, &self.longc, &self.fieldc, &self.textc, &self.msgtextc] {
+        for c in [&self.cores as &dyn Clear, &self.stepc, &self.lightc, &self.dirs, &self.blocks, &self.ix, &self.pieces, &self.skels, &self.statc, &self.longc, &self.fieldc, &self.textc, &self.msgtextc, &self.texthead, &self.textpost, &self.unitc] {
             c.clear_all();
         }
     }

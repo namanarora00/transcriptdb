@@ -77,7 +77,7 @@ impl Ctx for RowCtx<'_> {
         match &self.t.kind {
             Kind::Plain => Err(QError::new(format!("unknown column '{}'", path.join(".")))),
             Kind::Steps => step_value(self.db, self.row.session, self.row.steps[0], &resolve(path)?),
-            Kind::Messages => super::messages::row_value(self.db, self.row.session, self.row.steps[0], path),
+            Kind::Messages => super::messages::row_value(self.db, self.row, path),
             Kind::Matches(vars) => {
                 if let Some(k) = vars.iter().position(|v| *v == path[0]) {
                     if path.len() == 1 {
@@ -737,6 +737,7 @@ fn apply_stage(db: &Db, mut t: Table, stage: &Stage, now: i64) -> Result<Table, 
             Table { kind: Kind::Plain, cols: v.iter().map(|(n, _)| n.clone()).collect(), rows }
         }
         Stage::Summarize { aggs, by } if fast_summarize_fits(&t, aggs, by) => fast_summarize(db, &t, aggs, by, now)?,
+        Stage::Summarize { aggs, by } if super::messages::fast_fits(&t, aggs, by) => super::messages::fast_summarize(db, &t, aggs, by),
         Stage::Summarize { aggs, by } => {
             struct Acc {
                 key: Vec<Value>,

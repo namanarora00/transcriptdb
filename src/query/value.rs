@@ -305,11 +305,37 @@ fn ascii_ci_contains(h: &[u8], n: &[u8]) -> bool {
     ascii_ci_find(h, n).is_some()
 }
 
+/// Texts at least this long are searched in a lower-cased copy.
+const CI_COPY: usize = 1024;
+/// The copy's buffer is given back when it grew past this.
+const CI_KEEP: usize = 4 << 20;
+
 /// Where `n` first occurs in `h`, ignoring ASCII case.
 pub fn ascii_ci_find(h: &[u8], n: &[u8]) -> Option<usize> {
     let Some(&first) = n.first() else { return Some(0) };
     if h.len() < n.len() {
         return None;
+    }
+    // a long text: lower-case a copy and search that, both at vector speed whatever the
+    // pattern starts with (the loop below stops at every byte equal to its first)
+    if h.len() >= CI_COPY {
+        thread_local! {
+            static LOW: std::cell::RefCell<(Vec<u8>, Vec<u8>)> = const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
+        }
+        return LOW.with(|c| {
+            let (text, pat) = &mut *c.borrow_mut();
+            text.clear();
+            text.extend_from_slice(h);
+            text.make_ascii_lowercase();
+            pat.clear();
+            pat.extend_from_slice(n);
+            pat.make_ascii_lowercase();
+            let at = memchr::memmem::find(text, pat);
+            if text.capacity() > CI_KEEP {
+                *text = Vec::new();
+            }
+            at
+        });
     }
     let (lo, up) = (first.to_ascii_lowercase(), first.to_ascii_uppercase());
     let last_start = h.len() - n.len();
@@ -324,13 +350,42 @@ pub fn ascii_ci_find(h: &[u8], n: &[u8]) -> Option<usize> {
     None
 }
 
+/// Whether lower-casing `s` changes only its ASCII letters as far as an ASCII pattern can
+/// tell: true unless it has one of the two characters whose lower case holds an ASCII
+/// letter (U+0130 and U+212A). Then an ASCII pattern is in the lower-cased text exactly
+/// where it is in the text ignoring ASCII case.
+fn ascii_case_only(s: &str) -> bool {
+    s.is_ascii() || (memchr::memmem::find(s.as_bytes(), "\u{130}".as_bytes()).is_none() && memchr::memmem::find(s.as_bytes(), "\u{212a}".as_bytes()).is_none())
+}
+
+/// `has` ignoring case, for an ASCII term on text where [`ascii_case_only`] holds.
+fn has_term_ascii_ci(s: &str, term: &str) -> bool {
+    if term.is_empty() {
+        return true;
+    }
+    let (h, n) = (s.as_bytes(), term.as_bytes());
+    let mut start = 0;
+    while let Some(i) = ascii_ci_find(&h[start..], n) {
+        let a = start + i;
+        let b = a + n.len();
+        let before = s[..a].chars().next_back().is_none_or(|c| !c.is_alphanumeric());
+        let after = s[b..].chars().next().is_none_or(|c| !c.is_alphanumeric());
+        if before && after {
+            return true;
+        }
+        start = a + 1;
+    }
+    false
+}
+
 pub fn str_op(op: StrOp, s: &str, pat: &str, cs: bool) -> bool {
-    if !cs && s.is_ascii() && pat.is_ascii() {
+    if !cs && pat.is_ascii() && ascii_case_only(s) {
         let (h, n) = (s.as_bytes(), pat.as_bytes());
         match op {
             StrOp::Contains => return ascii_ci_contains(h, n),
             StrOp::StartsWith => return h.len() >= n.len() && h[..n.len()].eq_ignore_ascii_case(n),
             StrOp::EndsWith => return h.len() >= n.len() && h[h.len() - n.len()..].eq_ignore_ascii_case(n),
+            StrOp::Has => return has_term_ascii_ci(s, pat),
             _ => {}
         }
     }
@@ -515,6 +570,14 @@ mod tests {
         assert!(has_term("cargo test --all", "test"));
         assert!(!has_term("cargo tests", "test"));
         assert!(str_op(StrOp::Contains, "Error: X", "error", false));
+        // non-ASCII text, ASCII pattern: found ignoring ASCII case without lower-casing the text
+        assert!(str_op(StrOp::Contains, "caf\u{e9} \u{2014} Root Cause \u{2705}", "root cause", false));
+        assert!(str_op(StrOp::Has, "\u{2705}Done \u{2014} ok", "done", false));
+        assert!(!str_op(StrOp::Has, "\u{e9}done", "done", false));
+        assert!(str_op(StrOp::EndsWith, "na\u{ef}ve END", "end", false));
+        // the two characters whose lower case holds an ASCII letter still match as before
+        assert!(str_op(StrOp::Contains, "\u{212a}elvin", "kelvin", false));
+        assert!(str_op(StrOp::Contains, "\u{130}stanbul", "i", false));
         assert!(str_op(StrOp::Contains, "run CARGO Test now", "cargo test", false));
         assert!(!str_op(StrOp::Contains, "cargo tes", "cargo test", false));
         assert!(str_op(StrOp::Contains, "x", "", false));

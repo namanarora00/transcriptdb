@@ -36,8 +36,8 @@ struct Dump {
     /// `Some(field)` for an input field, `None` for message text.
     field: Option<String>,
     path: std::path::PathBuf,
-    /// (session, unit or step) per line.
-    at: Vec<(u32, u32)>,
+    /// (session, node, block) of a text unit or (session, step, 0) per line.
+    at: Vec<(u32, u32, u32)>,
     lines: Vec<Vec<u8>>,
 }
 
@@ -50,6 +50,12 @@ pub struct Report {
     pub differ: usize,
     /// (pattern number, file, hits by the engine, hits by grep) for the first differences.
     pub first: Vec<(usize, String, usize, usize)>,
+    /// Filters over message text run with the word index and by reading every text.
+    pub index_filters: usize,
+    pub index_rows: u64,
+    pub index_differ: usize,
+    /// (filter number, kind, rows with the index, rows by reading) for the first differences.
+    pub index_first: Vec<(usize, usize, usize, usize)>,
 }
 
 type R<T> = std::result::Result<T, String>;
@@ -115,7 +121,7 @@ fn grep(d: &Dump, pat: &[u8], cs: bool) -> R<Vec<u32>> {
     Ok(v)
 }
 
-fn engine(db: &Db, d: &Dump, line_of: &HashMap<(u32, u32), u32>, pat: &[u8], cs: bool) -> R<Vec<u32>> {
+fn engine(db: &Db, d: &Dump, line_of: &HashMap<(u32, u32, u32), u32>, pat: &[u8], cs: bool) -> R<Vec<u32>> {
     let col = match &d.field {
         None => vec!["text".to_string()],
         Some(f) => vec!["input".to_string(), f.clone()],
@@ -125,7 +131,8 @@ fn engine(db: &Db, d: &Dump, line_of: &HashMap<(u32, u32), u32>, pat: &[u8], cs:
     let run = exec::run(db, &q, 1).map_err(|e| e.to_string())?;
     let mut v = Vec::with_capacity(run.table.rows.len());
     for r in &run.table.rows {
-        match line_of.get(&(r.session, r.steps[0])) {
+        let k = if d.field.is_none() { (r.session, r.steps[0], r.steps[1]) } else { (r.session, r.steps[0], 0) };
+        match line_of.get(&k) {
             Some(&l) => v.push(l),
             None => return Err("the engine returned a unit that is not in the dump".into()),
         }
@@ -143,7 +150,7 @@ pub fn run(db: &Db, n_patterns: usize, seed: u64, work: &Path, top_fields: usize
     for s in 0..ns {
         let t = db.session_texts(s).map_err(e)?;
         for u in 0..t.units.len() {
-            msgs.at.push((s, u as u32));
+            msgs.at.push((s, t.units[u].node, t.units[u].block as u32));
             msgs.lines.push(line_bytes(t.text_of(u).as_bytes()));
         }
     }
@@ -184,7 +191,7 @@ pub fn run(db: &Db, n_patterns: usize, seed: u64, work: &Path, top_fields: usize
                     Value::Str(t) => t.to_string(),
                     other => other.to_string(),
                 };
-                d.at.push((s, pos));
+                d.at.push((s, pos, 0));
                 d.lines.push(line_bytes(text.as_bytes()));
             }
         }
@@ -237,6 +244,102 @@ pub fn run(db: &Db, n_patterns: usize, seed: u64, work: &Path, top_fields: usize
         }
         k += 1;
     }
+    index_check(db, &dumps[0], n_patterns, &mut rng, &mut rep)?;
     std::fs::remove_dir_all(work).map_err(|e| e.to_string())?;
     Ok(rep)
+}
+
+fn text_test(op: StrOp, pat: &[u8], cs: bool, neg: bool) -> Expr {
+    Expr::Str { op, e: Box::new(Expr::Ref(vec!["text".into()])), pat: Box::new(Expr::Lit(Value::Str(String::from_utf8_lossy(pat).as_ref().into()))), neg, cs }
+}
+
+fn role_is(r: &str) -> Expr {
+    Expr::Cmp(crate::query::parse::CmpOp::Eq, Box::new(Expr::Ref(vec!["role".into()])), Box::new(Expr::Lit(Value::Str(r.into()))))
+}
+
+/// A whole word (a run of letters and digits) of a random line, or several in a row.
+fn draw_words(d: &Dump, rng: &mut Rng, n_words: usize) -> Option<Vec<u8>> {
+    for _ in 0..200 {
+        let l = &d.lines[rng.below(d.lines.len())];
+        let Ok(t) = std::str::from_utf8(l) else { continue };
+        let mut runs: Vec<(usize, usize)> = Vec::new();
+        crate::textindex::runs(t, |a, r| runs.push((a, a + r.len())));
+        if runs.len() < n_words {
+            continue;
+        }
+        let k = rng.below(runs.len() - n_words + 1);
+        let p = &l[runs[k].0..runs[k + n_words - 1].1];
+        if p.len() >= 2 && p.len() <= 80 && !p.iter().any(|&c| c < 0x20 || c == 0x7f) {
+            return Some(p.to_vec());
+        }
+    }
+    None
+}
+
+/// Random filters over message text, each run with the word index and by reading every
+/// text: the rows must be the same.
+fn index_check(db: &Db, d: &Dump, n: usize, rng: &mut Rng, rep: &mut Report) -> R<()> {
+    use crate::query::messages::set_index;
+    if d.lines.is_empty() {
+        return Ok(());
+    }
+    for k in 0..n {
+        let kind = k % 10;
+        let flip = |p: &mut Vec<u8>, rng: &mut Rng| {
+            for c in p.iter_mut() {
+                if rng.below(3) == 0 {
+                    *c = if c.is_ascii_lowercase() { c.to_ascii_uppercase() } else { c.to_ascii_lowercase() };
+                }
+            }
+        };
+        let e = match kind {
+            0 => draw_words(d, rng, 1).map(|mut w| {
+                flip(&mut w, rng);
+                text_test(StrOp::Has, &w, false, false)
+            }),
+            1 => draw(d, rng, false).map(|p| text_test(StrOp::Contains, &p, false, false)),
+            2 => draw_words(d, rng, 1).map(|w| Expr::And(vec![role_is("user"), text_test(StrOp::Has, &w, false, false)])),
+            3 => match (draw(d, rng, false), draw_words(d, rng, 2)) {
+                (Some(a), Some(b)) => Some(Expr::Or(vec![text_test(StrOp::Contains, &a, false, false), text_test(StrOp::Contains, &b, false, false)])),
+                _ => None,
+            },
+            4 => draw_words(d, rng, 1).map(|w| Expr::And(vec![text_test(StrOp::Has, &w, false, true), role_is("assistant")])),
+            5 => draw_words(d, rng, 2).map(|w| text_test(StrOp::Has, &w, false, false)),
+            6 => draw_words(d, rng, 1).map(|w| text_test(StrOp::Has, &w, true, false)),
+            7 => draw(d, rng, true).map(|mut p| {
+                flip(&mut p, rng);
+                text_test(StrOp::Contains, &p, true, false)
+            }),
+            8 => {
+                // the start or the end of a text
+                let l = &d.lines[rng.below(d.lines.len())];
+                let want = 3 + rng.below(20);
+                let mut cut = want.min(l.len());
+                while cut < l.len() && (l[cut] & 0xC0) == 0x80 {
+                    cut += 1;
+                }
+                let p = &l[..cut];
+                if p.len() >= 3 && !p.iter().any(|&c| c < 0x20 || c == 0x7f) && std::str::from_utf8(p).is_ok() { Some(text_test(StrOp::StartsWith, p, false, false)) } else { None }
+            }
+            _ => draw_words(d, rng, 3).map(|w| Expr::Not(Box::new(Expr::Or(vec![text_test(StrOp::Contains, &w, false, false), role_is("user")])))),
+        };
+        let Some(e) = e else { continue };
+        let q = Query { source: Source::Messages, stages: vec![Stage::Where(e)] };
+        let keys = |on: bool| -> R<Vec<(u32, u32, u32)>> {
+            set_index(on);
+            let r = exec::run(db, &q, 1).map_err(|e| e.to_string());
+            set_index(true);
+            Ok(r?.table.rows.iter().map(|r| (r.session, r.steps[0], r.steps[1])).collect())
+        };
+        let (a, b) = (keys(true)?, keys(false)?);
+        rep.index_filters += 1;
+        rep.index_rows += b.len() as u64;
+        if a != b {
+            rep.index_differ += 1;
+            if rep.index_first.len() < 10 {
+                rep.index_first.push((rep.index_filters, kind, a.len(), b.len()));
+            }
+        }
+    }
+    Ok(())
 }

@@ -29,6 +29,7 @@ pub mod stats;
 pub mod steps;
 pub mod synth;
 pub mod text;
+pub mod textindex;
 pub mod trace;
 pub mod wal;
 

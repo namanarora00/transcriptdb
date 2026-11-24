@@ -24,6 +24,7 @@ use crate::bloom::{key_hash, Bloom};
 use crate::codec::{corrupt, Dec, Enc, Result};
 use crate::record::ReqRec;
 use crate::stats::StatsBuilder;
+use crate::textindex::{self, TextIndexBuilder, UnitBuild};
 use crate::steps::{self, StepRow};
 use crate::wal::{sync_file, SyncMode};
 use std::cell::RefCell;
@@ -34,7 +35,7 @@ use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-const SEG_MAGIC: &[u8; 8] = b"TDBSEG10";
+const SEG_MAGIC: &[u8; 8] = b"TDBSEG11";
 /// Raw bytes per group block of encoded parts, and per directory block.
 const GROUP: usize = 64 * 1024;
 /// Bloom filter bits per key: about 0.2% false positives.
@@ -132,6 +133,9 @@ pub struct SegCat {
     /// The step summaries (`stats.rs`) and their size on disk.
     pub stats: Option<BlockRef>,
     pub stats_bytes: u64,
+    /// The word index over message text (`textindex.rs`) and its size on disk.
+    pub text: Option<BlockRef>,
+    pub text_bytes: u64,
 }
 
 impl SegCat {
@@ -179,6 +183,14 @@ impl SegCat {
                 e.var(self.stats_bytes);
             }
         }
+        match &self.text {
+            None => e.u8(0),
+            Some(r) => {
+                e.u8(1);
+                r.encode(&mut e);
+                e.var(self.text_bytes);
+            }
+        }
         e.buf
     }
 
@@ -212,6 +224,14 @@ impl SegCat {
             1 => {
                 c.stats = Some(BlockRef::decode(&mut d)?);
                 c.stats_bytes = d.var()?;
+            }
+            _ => return corrupt("bad segment catalog"),
+        }
+        match d.u8()? {
+            0 => {}
+            1 => {
+                c.text = Some(BlockRef::decode(&mut d)?);
+                c.text_bytes = d.var()?;
             }
             _ => return corrupt("bad segment catalog"),
         }
@@ -689,6 +709,7 @@ struct Pending {
     core: CorePart,
     stream: Vec<u8>,
     steps: StepPart,
+    units: Vec<UnitBuild>,
 }
 
 /// Raw message bytes of parts waiting for their frames to be compressed (merges).
@@ -714,6 +735,7 @@ pub struct SegWriter {
     pending: Vec<Pending>,
     pending_raw: usize,
     stats: StatsBuilder,
+    text: TextIndexBuilder,
 }
 
 impl SegWriter {
@@ -743,6 +765,7 @@ impl SegWriter {
             pending: Vec::new(),
             pending_raw: 0,
             stats: StatsBuilder::default(),
+            text: TextIndexBuilder::default(),
         })
     }
 
@@ -778,14 +801,15 @@ impl SegWriter {
     /// Add a part whose stream is cut into frames of `core.frame` bytes (compressed in
     /// batches with other parts' frames when the segment has no single compressor).
     pub fn add_stream(&mut self, session: u32, key: (String, String), mut core: CorePart, stream: Vec<u8>, steps: StepPart) -> Result<()> {
+        let units = textindex::part_units(&core, &stream);
         if self.comp.is_some() {
             let c = self.comp.as_mut().unwrap();
             let packed = stream.chunks(core.frame as usize).map(|ch| c.compress(ch)).collect::<std::io::Result<Vec<_>>>()?;
             core.frames = self.write_frames(packed)?;
-            return self.add(session, key, &core, &steps);
+            return self.add(session, key, &core, &steps, units);
         }
         self.pending_raw += stream.len();
-        self.pending.push(Pending { session, key, core, stream, steps });
+        self.pending.push(Pending { session, key, core, stream, steps, units });
         if self.pending_raw >= PENDING_BYTES {
             self.flush_pending()?;
         }
@@ -802,7 +826,7 @@ impl SegWriter {
             let nf = p.stream.len().div_ceil(p.core.frame as usize);
             let mine: Vec<Vec<u8>> = packed.by_ref().take(nf).collect();
             p.core.frames = self.write_frames(mine)?;
-            self.add(p.session, p.key, &p.core, &p.steps)?;
+            self.add(p.session, p.key, &p.core, &p.steps, p.units)?;
         }
         Ok(())
     }
@@ -855,7 +879,8 @@ impl SegWriter {
 
     /// Add one part of a session. Parts must come in order of (session, first request); the
     /// part's frames must already be written with [`SegWriter::frames`].
-    pub fn add(&mut self, session: u32, key: (String, String), core: &CorePart, steps: &StepPart) -> Result<()> {
+    /// `units` are the part's text units ([`textindex::part_units`] of its stream).
+    pub fn add(&mut self, session: u32, key: (String, String), core: &CorePart, steps: &StepPart, units: Vec<UnitBuild>) -> Result<()> {
         if self.dir.last().is_some_and(|d| (d.session, d.first_req) >= (session, core.first_req)) {
             return corrupt("session parts added to a segment out of order");
         }
@@ -868,6 +893,7 @@ impl SegWriter {
         let mut e = Enc::new();
         let value_at = encode_steps(steps, &mut e);
         self.stats.add_part(session, &key, steps, &steps.long_text, &value_at)?;
+        self.text.add_part(session, units);
         let steps_ref = (BlockRef::default(), self.steps_buf.len() as u32, e.buf.len() as u32);
         self.steps_buf.extend_from_slice(&e.buf);
         self.steps_waiting.push(i);
@@ -929,6 +955,17 @@ impl SegWriter {
         })?;
         self.cat.stats = Some(head);
         self.cat.stats_bytes = stats_bytes;
+        let text = std::mem::take(&mut self.text);
+        if !text.is_empty() {
+            let mut text_bytes = 0u64;
+            let head = text.finish(&mut |raw| {
+                let r = write_block(f, pos, raw, level)?;
+                text_bytes += r.clen as u64;
+                Ok(r)
+            })?;
+            self.cat.text = Some(head);
+            self.cat.text_bytes = text_bytes;
+        }
         // the directory in blocks of about GROUP bytes, each starting at a new entry
         let mut a = 0;
         while a < self.dir.len() {
