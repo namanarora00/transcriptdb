@@ -11,6 +11,7 @@
 //!   tdb ceiling       --store DIR [--out DIR]
 //!   tdb screen        --store DIR [--repeat 5]
 //!   tdb check-rules   --store DIR --work DIR [--rules 100] [--seed 7] [--batch 10] [--write-time x]
+//!   tdb scale         --from STORE --store DIR [--copies 10] [--threads N] [--sync full|fsync|os] [--check 2000]
 //!   tdb rules         --store DIR [--add 'NAME [on TEST] = EXPRESSION'] [--file RULES.txt] [--drop NAME] [--benchmark x]
 //!   tdb check-search  --store DIR [--patterns 200] [--seed 7] [--fields 5] [--work DIR]
 //!   tdb h2h           --store DIR [--pg ADDR] [--split x] [--sizes-only x]
@@ -230,7 +231,8 @@ fn ingest_claude(a: &Args) {
     }
     let t = Instant::now();
     db.commit().expect("commit");
-    db.flush().expect("flush");
+    // merges at work on their own thread finish before the numbers below are taken
+    db.settle().expect("flush and finish merges");
     put_time += t.elapsed();
     let secs = t0.elapsed().as_secs_f64();
     println!("log files: {} found, {} with recorded requests", files.len(), files_with_requests);
@@ -1064,6 +1066,155 @@ fn crash_child(a: &Args) {
     }
 }
 
+/// A request body of copy `copy` (1 or more) of a store being scaled up: every tool call
+/// id and every text block gets the copy's mark, so no message of one copy equals a
+/// message of another, while the words queries look for stay. The marks go where the raw
+/// JSON has `"toolu_` and `"text":"`, which inside a string value would be escaped.
+fn scale_mark(body: &[u8], copy: u64) -> Vec<u8> {
+    let (id_mark, text_mark) = (format!("c{copy}x"), format!("~c{copy} "));
+    let mut out = Vec::with_capacity(body.len() + body.len() / 64);
+    let mut at = 0;
+    let (ids, texts) = (memchr::memmem::Finder::new(b"\"toolu_"), memchr::memmem::Finder::new(b"\"text\":\""));
+    let (mut next_id, mut next_text) = (ids.find(body), texts.find(body));
+    loop {
+        let (pos, len, mark) = match (next_id, next_text) {
+            (Some(i), Some(t)) if i < t => (i, 7, &id_mark),
+            (Some(i), None) => (i, 7, &id_mark),
+            (_, Some(t)) => (t, 8, &text_mark),
+            (None, None) => break,
+        };
+        out.extend_from_slice(&body[at..pos + len]);
+        out.extend_from_slice(mark.as_bytes());
+        at = pos + len;
+        if len == 7 {
+            next_id = ids.find(&body[at..]).map(|k| at + k);
+        } else {
+            next_text = texts.find(&body[at..]).map(|k| at + k);
+        }
+    }
+    out.extend_from_slice(&body[at..]);
+    out
+}
+
+/// A request time moved on by `by_ms`, in the form it came in (seconds, or a date and time).
+fn scale_time(time: &str, by_ms: i64) -> String {
+    match time.parse::<i64>() {
+        Ok(secs) => (secs + by_ms / 1000).to_string(),
+        Err(_) => transcriptdb::query::value::fmt_time(transcriptdb::steps::parse_time_ms(time) + by_ms),
+    }
+}
+
+fn percentile(sorted: &[u32], p: f64) -> f64 {
+    if sorted.is_empty() {
+        return 0.0;
+    }
+    sorted[((sorted.len() as f64 * p) as usize).min(sorted.len() - 1)] as f64 / 1e3
+}
+
+/// Fill a store with `--copies` copies of every request of the store at `--from`: copy 0
+/// as it is, each later copy as sessions of its own (ids and times moved on, messages
+/// marked so that none repeats an earlier copy's). Each request is written and made
+/// durable on its own, and the time that takes is reported apart for requests that
+/// arrived while a merge was at work.
+fn scale(a: &Args) {
+    let src = Db::open(a.get("from").expect("--from STORE"), a.opts()).expect("open the source store");
+    let mut dst = Db::open(a.store(), a.opts()).expect("open store");
+    let copies = a.num("copies", 10);
+    let check_every = (src.request_count() as u64 * copies / a.num("check", 2000).max(1)).max(1);
+    let ns = src.session_count() as u64;
+    let (mut lo, mut hi) = (i64::MAX, 0i64);
+    for s in 0..ns as u32 {
+        for ri in src.session_requests(s) {
+            let t = transcriptdb::steps::parse_time_ms(&src.request(ri).expect("request").time);
+            if t > 0 {
+                (lo, hi) = (lo.min(t), hi.max(t));
+            }
+        }
+    }
+    // each copy is the source's whole span later, in whole days
+    let span = if hi > lo { ((hi - lo) / 86_400_000 + 1) * 86_400_000 } else { 86_400_000 };
+    struct Item {
+        session: String,
+        agent: String,
+        id: String,
+        time: String,
+        meta: Vec<u8>,
+        body: Vec<u8>,
+    }
+    let (tx, rx) = mpsc::sync_channel::<Item>(64);
+    let next = std::sync::atomic::AtomicU64::new(0);
+    let t0 = Instant::now();
+    let (mut quiet, mut busy): (Vec<u32>, Vec<u32>) = (Vec::new(), Vec::new());
+    let (mut bytes_in, mut worst_quiet, mut worst_busy) = (0u64, 0u32, 0u32);
+    let mut kept: Vec<(String, [u8; 32])> = Vec::new();
+    std::thread::scope(|sc| {
+        for _ in 0..a.threads().saturating_sub(1).clamp(1, 6) {
+            let (tx, src, next) = (tx.clone(), &src, &next);
+            sc.spawn(move || loop {
+                let k = next.fetch_add(1, Ordering::Relaxed);
+                if k >= copies * ns {
+                    break;
+                }
+                let (copy, s) = (k / ns, (k % ns) as u32);
+                let (sid, agent) = src.session_key(s);
+                for ri in src.session_requests(s) {
+                    let r = src.request(ri).expect("request");
+                    let mut body = Vec::new();
+                    src.rebuild_into(ri, &mut body, &mut ReadStats::default()).expect("rebuild");
+                    let it = if copy == 0 {
+                        Item { session: sid.clone(), agent: agent.clone(), id: r.id.to_string(), time: r.time.to_string(), meta: r.meta.to_vec(), body }
+                    } else {
+                        Item { session: format!("{sid}~c{copy}"), agent: agent.clone(), id: format!("{}~c{copy}", r.id), time: scale_time(&r.time, copy as i64 * span), meta: r.meta.to_vec(), body: scale_mark(&body, copy) }
+                    };
+                    if tx.send(it).is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+        drop(tx);
+        for (k, it) in rx.into_iter().enumerate() {
+            let merging = dst.merging();
+            let t = Instant::now();
+            dst.put(&Put { session: &it.session, agent: &it.agent, id: &it.id, time: &it.time, meta: &it.meta, body: &it.body }).expect("put");
+            dst.commit().expect("commit");
+            let us = t.elapsed().as_micros().min(u32::MAX as u128) as u32;
+            if merging {
+                busy.push(us);
+                worst_busy = worst_busy.max(us);
+            } else {
+                quiet.push(us);
+                worst_quiet = worst_quiet.max(us);
+            }
+            bytes_in += it.body.len() as u64;
+            if k as u64 % check_every == 0 {
+                kept.push((it.id, sha256(&it.body)));
+            }
+        }
+    });
+    let secs = t0.elapsed().as_secs_f64();
+    let t = Instant::now();
+    dst.settle().expect("flush and finish merges");
+    let settle_s = t.elapsed().as_secs_f64();
+    // a sample of the requests, rebuilt once every merge is in place
+    let wrong = kept.iter().filter(|(id, want)| dst.request_index(id).map(|ri| sha256(&dst.rebuild(ri).expect("rebuild"))) != Some(*want)).count();
+    quiet.sort_unstable();
+    busy.sort_unstable();
+    let n = quiet.len() + busy.len();
+    println!("scale: {copies} copies of {ns} sessions: {n} requests, {} of request bodies in {secs:.0}s ({:.0} MB/s, {:.0} requests/s); merges done {settle_s:.0}s after the last write", mb(bytes_in), bytes_in as f64 / 1e6 / secs, n as f64 / secs);
+    for (name, v, worst) in [("no merge at work", &quiet, worst_quiet), ("a merge at work", &busy, worst_busy)] {
+        let slow = v.iter().filter(|&&us| us > 10_000).count();
+        println!("  write and commit, {name}: {} requests; median {:.2} ms, p99 {:.2} ms, p99.9 {:.2} ms, worst {:.0} ms; {slow} took over 10 ms", v.len(), percentile(v, 0.5), percentile(v, 0.99), percentile(v, 0.999), worst as f64 / 1e3);
+    }
+    let ms = &dst.merge_stats;
+    println!("  merges put in place: {} (read {}, wrote {}); written by flushes {}", ms.merges, mb(ms.bytes_in), mb(ms.bytes_out), mb(ms.flushed));
+    println!("  rebuilt and compared after the merges: {} requests, {wrong} different", kept.len());
+    println!("  store: {} in {} segments", mb(dst.stats().store_bytes()), dst.segment_count());
+    if wrong > 0 {
+        std::process::exit(1);
+    }
+}
+
 /// Column rules for `crash-test --rules x`, as (name, rest of the rule); `{p}` stands
 /// before the names of rules a rule reads, so the same rules can be defined a second time
 /// under other names.
@@ -1263,6 +1414,7 @@ fn main() {
         "check-search" => check_search(&a),
         "screen" => screen(&a),
         "rules" => rules(&a),
+        "scale" => scale(&a),
         "check-rules" => check_rules(&a),
         "h2h" => head_to_head(&a),
         "synth" => synth_store(&a),
