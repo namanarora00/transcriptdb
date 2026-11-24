@@ -9,6 +9,7 @@
 //!   tdb crash-test    --store DIR [--kills 1000] [--seed S] [--sync full|fsync|os]
 //!   tdb growth        --store DIR [--rounds 5] [--base 300] [--wake 0.1] [--cache-mb 256] [--flush-mb 64] [--seg-mb 256] [--max-parts 4]
 //!   tdb ceiling       --store DIR [--out DIR]
+//!   tdb screen        --store DIR [--repeat 5]
 //!   tdb check-search  --store DIR [--patterns 200] [--seed 7] [--fields 5] [--work DIR]
 //!   tdb h2h           --store DIR [--pg ADDR] [--split x] [--sizes-only x]
 //!
@@ -674,6 +675,61 @@ fn head_to_head(a: &Args) {
 }
 
 /// Generated match queries: the engine against the slow reference, session by session.
+/// Screen every session with a fixed set of filters, the way a first pass before a costly
+/// review would: how long each filter takes on one thread and what share of sessions it
+/// passes on.
+fn screen(a: &Args) {
+    let db = Db::open(a.store(), a.opts()).expect("open store");
+    let reps = a.num("repeat", 5) as usize;
+    let mut filters: Vec<(String, String)> = transcriptdb::h2h::queries().into_iter().filter(|q| q.sessions).map(|q| (q.name.to_string(), q.engine)).collect();
+    for (name, q) in [
+        ("User says it still fails or does not work", r#"messages | where role == "user" and (text contains "still failing" or text contains "not working" or text contains "doesn't work")"#),
+        ("User says revert or undo", r#"messages | where role == "user" and (text has "revert" or text has "undo")"#),
+        ("User says wrong", r#"messages | where role == "user" and text has "wrong""#),
+        ("Assistant says you're right or apologizes", r#"messages | where role == "assistant" and (text contains "you're right" or text contains "i apologize")"#),
+        ("Assistant names a root cause", r#"messages | where role == "assistant" and text contains "root cause""#),
+        ("Assistant tries a different approach", r#"messages | where role == "assistant" and text contains "different approach""#),
+        ("Text with TODO", r#"messages | where text contains_cs "TODO""#),
+        ("Command forces a push or removes a tree", r#"where command contains "push --force" or command contains "rm -rf""#),
+    ] {
+        filters.push((name.to_string(), q.to_string()));
+    }
+    let all: Vec<u32> = (0..db.session_count() as u32).collect();
+    let ids = db.key_ids(&all).expect("read sessions");
+    let total: std::collections::HashSet<u32> = ids.iter().map(|x| x.0).collect();
+    let mut flagged: std::collections::HashSet<u32> = Default::default();
+    let mut sum_ms = 0.0;
+    println!("{:<52} {:>10} {:>9} {:>7}", "filter (one thread)", "ms", "sessions", "share");
+    for (name, q) in &filters {
+        let mut best = f64::MAX;
+        let mut hit: std::collections::HashSet<u32> = Default::default();
+        for _ in 0..reps.max(1) {
+            let t = Instant::now();
+            let run = match transcriptdb::query::run(&db, q, 1) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("{name}: {}", e.show(q));
+                    std::process::exit(1);
+                }
+            };
+            best = best.min(t.elapsed().as_secs_f64() * 1e3);
+            hit = run.table.rows.iter().map(|r| ids[r.session as usize].0).collect();
+        }
+        sum_ms += best;
+        println!("{:<52} {:>10.3} {:>9} {:>6.1}%", name, best, hit.len(), 100.0 * hit.len() as f64 / total.len().max(1) as f64);
+        flagged.extend(hit);
+    }
+    println!(
+        "{} filters over {} sessions ({} requests): {:.1} ms in all on one thread, {:.0} session checks a second; {:.1}% of sessions pass at least one filter",
+        filters.len(),
+        total.len(),
+        db.request_count(),
+        sum_ms,
+        filters.len() as f64 * total.len() as f64 / (sum_ms / 1e3),
+        100.0 * flagged.len() as f64 / total.len().max(1) as f64
+    );
+}
+
 /// Compare text search with `/usr/bin/grep` on patterns drawn from the store's own text.
 fn check_search(a: &Args) {
     let db = Db::open(a.store(), a.opts()).expect("open store");
@@ -1094,6 +1150,7 @@ fn main() {
         "query" => query(&a),
         "check-queries" => check_queries(&a),
         "check-search" => check_search(&a),
+        "screen" => screen(&a),
         "h2h" => head_to_head(&a),
         "synth" => synth_store(&a),
         "steps" => steps_summary(&a),
