@@ -9,6 +9,7 @@
 //!   tdb crash-test    --store DIR [--kills 1000] [--seed S] [--sync full|fsync|os]
 //!   tdb growth        --store DIR [--rounds 5] [--base 300] [--wake 0.1] [--cache-mb 256] [--flush-mb 64] [--seg-mb 256] [--max-parts 4]
 //!   tdb ceiling       --store DIR [--out DIR]
+//!   tdb check-search  --store DIR [--patterns 200] [--seed 7] [--fields 5] [--work DIR]
 //!   tdb h2h           --store DIR [--pg ADDR] [--split x] [--sizes-only x]
 //!
 //! Writing commands take --merge-level 19 --dict-kb 1024 --dict-content-kb 8192 --zstd-threads N
@@ -673,6 +674,39 @@ fn head_to_head(a: &Args) {
 }
 
 /// Generated match queries: the engine against the slow reference, session by session.
+/// Compare text search with `/usr/bin/grep` on patterns drawn from the store's own text.
+fn check_search(a: &Args) {
+    let db = Db::open(a.store(), a.opts()).expect("open store");
+    let work = a.get("work").map(PathBuf::from).unwrap_or_else(|| std::env::temp_dir().join(format!("transcriptdb-check-search-{}", std::process::id())));
+    let t = Instant::now();
+    let rep = match transcriptdb::search_check::run(&db, a.num("patterns", 200) as usize, a.num("seed", 7), &work, a.num("fields", 5) as usize) {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&work);
+            eprintln!("check-search failed: {e}");
+            std::process::exit(1);
+        }
+    };
+    for (name, lines, bytes) in &rep.files {
+        println!("  {name}: {lines} units, {:.1} MB", *bytes as f64 / 1e6);
+    }
+    println!(
+        "{} patterns ({} exact case, {} ignoring case), {} hits by grep; {} patterns differ; {:.1}s",
+        rep.patterns,
+        rep.exact,
+        rep.patterns - rep.exact,
+        rep.hits,
+        rep.differ,
+        t.elapsed().as_secs_f64()
+    );
+    for (k, file, eng, grep) in &rep.first {
+        println!("  pattern {k} on {file}: engine {eng} units, grep {grep} lines");
+    }
+    if rep.differ > 0 {
+        std::process::exit(1);
+    }
+}
+
 fn check_queries(a: &Args) {
     use transcriptdb::query::reference;
     let db = Db::open(a.store(), a.opts()).expect("open store");
@@ -1055,6 +1089,7 @@ fn main() {
         "serve" => serve(&a),
         "query" => query(&a),
         "check-queries" => check_queries(&a),
+        "check-search" => check_search(&a),
         "h2h" => head_to_head(&a),
         "synth" => synth_store(&a),
         "steps" => steps_summary(&a),
