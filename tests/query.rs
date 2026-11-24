@@ -313,3 +313,79 @@ fn patterns_follow_sessions_taking_writes() {
     }
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// Rows of a `messages` query as (session, node, block), with the word index or by
+/// reading every text.
+fn message_rows(db: &Db, q: &str, index: bool) -> Vec<(u32, u32, u32)> {
+    query::messages::set_index(index);
+    let r = query::run(db, q, 2);
+    query::messages::set_index(true);
+    let r = r.unwrap_or_else(|e| panic!("{}", e.show(q)));
+    assert_eq!(r.table.kind, Kind::Messages);
+    r.table.rows.iter().map(|row| (row.session, row.steps[0], row.steps[1])).collect()
+}
+
+/// Text search gives the same rows from the word index as from reading every text, while
+/// messages are still in memory, after flushes, across segments, after a merge and after
+/// reopening.
+#[test]
+fn message_search_matches_a_scan_at_every_stage() {
+    let dir = tmpdir("msgsearch");
+    let mut db = Db::open(&dir, opts()).unwrap();
+    let traffic = rich_traffic(21, 10, 30);
+    let filters = [
+        r#"messages | where text has "parser""#,
+        r#"messages | where text has "PARSER" and role == "assistant""#,
+        r#"messages | where text contains "test fails""#,
+        r#"messages | where text contains "ils beca" or text has "cargo""#,
+        r#"messages | where role == "user" and not (text has "empty")"#,
+        r#"messages | where text contains "error[E0308]: mismatched""#,
+        r#"messages | where text has "über" or text contains "naïve""#,
+        r#"messages | where text contains "日本""#,
+        r#"messages | where text contains_cs "None" and chars > 20"#,
+        r#"messages | where text startswith "the" or text endswith "empty""#,
+        r#"messages | where text has "keep going""#,
+        r#"messages | where text has "no such word anywhere""#,
+    ];
+    let mut some = 0;
+    let mut check = |db: &Db, stage: &str| {
+        for q in &filters {
+            let (a, b) = (message_rows(db, q, true), message_rows(db, q, false));
+            assert_eq!(a, b, "{stage}: index and scan differ on {q}");
+            some += !b.is_empty() as usize;
+        }
+    };
+    let third = traffic.len() / 3;
+    for (k, q) in traffic.iter().enumerate() {
+        db.put(&Put { session: &q.session, agent: &q.agent, id: &q.id, time: &q.time, meta: b"", body: &q.body }).unwrap();
+        if k + 1 == third {
+            db.commit().unwrap();
+            check(&db, "in memory");
+            db.flush().unwrap();
+            check(&db, "one segment");
+        }
+        if k + 1 == 2 * third {
+            db.commit().unwrap();
+            check(&db, "one segment and memory");
+            db.flush().unwrap();
+            check(&db, "two segments");
+        }
+    }
+    db.commit().unwrap();
+    check(&db, "two segments and memory");
+    db.compact().unwrap();
+    check(&db, "merged");
+    drop(db);
+    let db = Db::open(&dir, opts()).unwrap();
+    check(&db, "reopened");
+    assert!(some >= 40, "the filters should find text at most stages ({some})");
+    // grouping the rows directly gives what the general path gives
+    for by in ["session", "role", "agent, role"] {
+        let fast = format!(r#"messages | where text has "parser" | summarize n = count(), s = dcount(session) by {by}"#);
+        let slow = format!(r#"messages | where text has "parser" | extend one = 1 | summarize n = count(), s = dcount(session) by {by}"#);
+        let rows = |q: &str| -> Vec<Vec<String>> { query::run(&db, q, 1).unwrap_or_else(|e| panic!("{}", e.show(q))).table.rows.iter().map(|r| r.vals.iter().map(|v| v.to_string()).collect()).collect() };
+        assert_eq!(rows(&fast), rows(&slow), "grouping by {by}");
+    }
+    drop(db);
+    let _ = std::fs::remove_dir_all(&dir);
+}
