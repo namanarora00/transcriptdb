@@ -290,33 +290,62 @@ fn and_not(a: &mut Bits, b: &Bits) {
     a.iter_mut().zip(b).for_each(|(x, y)| *x &= !*y);
 }
 
-/// The units of a segment that surely pass a text test, and those that may.
-fn text_atom(db: &Db, num: u32, h: &TextHead, op: StrOp, pat: &str, cs: bool) -> Result<(Bits, Bits), QError> {
+/// `has` on a window of a text: an occurrence touching an edge the text goes on past does
+/// not count (its neighbour is not in the window).
+fn has_in_window(w: &crate::db::PieceText, term: &str) -> bool {
+    let s = w.text.as_str();
+    let mut start = 0;
+    while let Some(i) = s[start..].find(term) {
+        let a = start + i;
+        let b = a + term.len();
+        let before = if a == 0 { !w.cut_left } else { s[..a].chars().next_back().is_none_or(|c| !c.is_alphanumeric()) };
+        let after = if b == s.len() { !w.cut_right } else { s[b..].chars().next().is_none_or(|c| !c.is_alphanumeric()) };
+        if before && after {
+            return true;
+        }
+        start = a + term.chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+    }
+    false
+}
+
+/// The units of a segment that surely pass a text test, and those that may (their whole
+/// text must be read), among the units of `scope`.
+fn text_atom(db: &Db, num: u32, h: &TextHead, op: StrOp, pat: &str, cs: bool, scope: &Bits) -> Result<(Bits, Bits), QError> {
     let n = h.units();
     let whole = match op {
         StrOp::Has => true,
         StrOp::Contains | StrOp::StartsWith | StrOp::EndsWith => false,
-        StrOp::Matches => return Ok((textindex::bits(n), full(n))),
+        StrOp::Matches => return Ok((textindex::bits(n), scope.clone())),
     };
     if pat.is_empty() {
-        return Ok((full(n), textindex::bits(n)));
+        return Ok((scope.clone(), textindex::bits(n)));
     }
     let low = pat.to_lowercase();
     let (runs, single) = textindex::pattern_runs(&low, whole);
     if runs.is_empty() {
-        return Ok((textindex::bits(n), full(n)));
+        return Ok((textindex::bits(n), scope.clone()));
     }
+    // each run's pieces; a short pattern has every run in the piece of its first run or
+    // the next one, and lies inside that piece's window
+    let near = low.len() <= textindex::WINDOW_PATTERN;
+    let np = h.pieces();
     let mut cand: Option<Bits> = None;
     let mut open = false;
     let mut words = Vec::new();
-    for (r, fit) in &runs {
+    for (k, (r, fit)) in runs.iter().enumerate() {
         words.clear();
         h.find(r.as_bytes(), *fit, &mut words);
-        let mut b = textindex::bits(n);
+        let mut b = textindex::bits(np);
         for &w in &words {
             db.text_postings(num, h, w, &mut b).map_err(qe)?;
         }
         open |= matches!(fit, Fit::Suffix | Fit::Inside);
+        if !near {
+            b = h.units_with(&b);
+        } else if k > 0 {
+            let down = textindex::down_one(&b);
+            or(&mut b, &down);
+        }
         cand = Some(match cand {
             None => b,
             Some(mut c) => {
@@ -325,40 +354,82 @@ fn text_atom(db: &Db, num: u32, h: &TextHead, op: StrOp, pat: &str, cs: bool) ->
             }
         });
     }
-    let mut cand = cand.unwrap();
-    // a pattern that is one run of letters and digits: a unit with a fitting word matches
-    // (a word cut short may hold it past its kept start; a text with a hole is read)
-    if single && !cs && matches!(op, StrOp::Has | StrOp::Contains) {
-        let mut maybe = h.holes.clone();
-        if open {
-            or(&mut maybe, &h.long);
-        }
-        and_not(&mut cand, &h.holes);
-        and_not(&mut maybe, &cand);
-        return Ok((cand, maybe));
-    }
+    let cand = cand.unwrap();
+    // units only their whole text can answer for: a hole in the text, or (when a run may
+    // sit inside a longer word) a word cut short in the index
+    let mut read_whole = h.holes.clone();
     if open {
-        or(&mut cand, &h.long);
+        or(&mut read_whole, &h.long);
     }
-    or(&mut cand, &h.holes);
-    Ok((textindex::bits(n), cand))
+    and(&mut read_whole, scope);
+    if !near {
+        let mut m = cand;
+        and(&mut m, scope);
+        or(&mut m, &read_whole);
+        return Ok((textindex::bits(n), m));
+    }
+    // a pattern that is one run of letters and digits: a unit with a fitting word matches
+    if single && !cs && matches!(op, StrOp::Has | StrOp::Contains) {
+        let mut def = h.units_with(&cand);
+        and(&mut def, scope);
+        and_not(&mut def, &h.holes);
+        and_not(&mut read_whole, &def);
+        return Ok((def, read_whole));
+    }
+    if cs || !matches!(op, StrOp::Has | StrOp::Contains) {
+        let mut m = h.units_with(&cand);
+        and(&mut m, scope);
+        or(&mut m, &read_whole);
+        return Ok((textindex::bits(n), m));
+    }
+    // confirm each candidate piece on its window of the text
+    let mut wants: Vec<(u32, u32)> = Vec::new();
+    textindex::each(&cand, |p| {
+        let u = h.piece_unit[p as usize];
+        if textindex::get(scope, u) && !textindex::get(&read_whole, u) {
+            wants.push((u, p - h.piece_at[u as usize]));
+        }
+    });
+    let mut def = textindex::bits(n);
+    let finder = memchr::memmem::Finder::new(low.as_bytes());
+    let mut a = 0;
+    while a < wants.len() {
+        let part = h.part_of[wants[a].0 as usize];
+        let mut b = a;
+        while b < wants.len() && h.part_of[wants[b].0 as usize] == part {
+            b += 1;
+        }
+        let keys: Vec<(u32, u16, u32)> = wants[a..b].iter().map(|&(u, p)| (h.node[u as usize], h.block[u as usize], p)).collect();
+        let texts = db.piece_texts(h.parts[part as usize].0, &keys).map_err(qe)?;
+        for (k, &(u, _)) in wants[a..b].iter().enumerate() {
+            if textindex::get(&def, u) {
+                continue;
+            }
+            let hit = if whole { has_in_window(&texts[k], &low) } else { finder.find(texts[k].text.as_bytes()).is_some() };
+            if hit {
+                textindex::set(&mut def, u);
+            }
+        }
+        a = b;
+    }
+    Ok((def, read_whole))
 }
 
-/// (surely pass, may pass) for a filter over a segment's units.
-fn plan(db: &Db, num: u32, h: &TextHead, mp: &Mp) -> Result<(Bits, Bits), QError> {
-    let n = h.units();
+/// (surely pass, may pass) for a filter over the units of `scope` in a segment.
+fn plan(db: &Db, num: u32, h: &TextHead, mp: &Mp, scope: &Bits) -> Result<(Bits, Bits), QError> {
+    let zero = || textindex::bits(h.units());
     Ok(match mp {
-        Mp::Const(true) => (full(n), textindex::bits(n)),
-        Mp::Const(false) => (textindex::bits(n), textindex::bits(n)),
+        Mp::Const(true) => (scope.clone(), zero()),
+        Mp::Const(false) => (zero(), zero()),
         Mp::Role(user) => {
-            let mut d = full(n);
+            let mut d = scope.clone();
             if *user { and(&mut d, &h.user) } else { and_not(&mut d, &h.user) }
-            (d, textindex::bits(n))
+            (d, zero())
         }
         Mp::Text { op, pat, cs, neg, .. } => {
-            let (d, m) = text_atom(db, num, h, *op, pat, *cs)?;
+            let (d, m) = text_atom(db, num, h, *op, pat, *cs, scope)?;
             if *neg {
-                let mut nd = full(n);
+                let mut nd = scope.clone();
                 and_not(&mut nd, &d);
                 and_not(&mut nd, &m);
                 (nd, m)
@@ -366,17 +437,21 @@ fn plan(db: &Db, num: u32, h: &TextHead, mp: &Mp) -> Result<(Bits, Bits), QError
                 (d, m)
             }
         }
-        Mp::Generic(_) => (textindex::bits(n), full(n)),
+        Mp::Generic(_) => (zero(), scope.clone()),
         Mp::And(v) => {
-            let (mut d, mut m) = (full(n), textindex::bits(n));
-            for x in v {
-                let (d2, m2) = plan(db, num, h, x)?;
-                // what may still pass: possible on both sides
-                let mut p = d.clone();
-                or(&mut p, &m);
-                let mut p2 = d2.clone();
-                or(&mut p2, &m2);
-                and(&mut p, &p2);
+            // tests the index answers without reading text first: they narrow what the
+            // text tests have to confirm
+            let (mut d, mut m) = (scope.clone(), zero());
+            let cheap = |x: &Mp| matches!(x, Mp::Const(_) | Mp::Role(_));
+            for x in v.iter().filter(|x| cheap(x)).chain(v.iter().filter(|x| !cheap(x))) {
+                let mut left = d.clone();
+                or(&mut left, &m);
+                if !textindex::any(&left) {
+                    return Ok((zero(), zero()));
+                }
+                let (d2, m2) = plan(db, num, h, x, &left)?;
+                let mut p = d2.clone();
+                or(&mut p, &m2);
                 and(&mut d, &d2);
                 and_not(&mut p, &d);
                 m = p;
@@ -384,9 +459,9 @@ fn plan(db: &Db, num: u32, h: &TextHead, mp: &Mp) -> Result<(Bits, Bits), QError
             (d, m)
         }
         Mp::Or(v) => {
-            let (mut d, mut m) = (textindex::bits(n), textindex::bits(n));
+            let (mut d, mut m) = (zero(), zero());
             for x in v {
-                let (d2, m2) = plan(db, num, h, x)?;
+                let (d2, m2) = plan(db, num, h, x, scope)?;
                 or(&mut d, &d2);
                 or(&mut m, &m2);
             }
@@ -394,8 +469,8 @@ fn plan(db: &Db, num: u32, h: &TextHead, mp: &Mp) -> Result<(Bits, Bits), QError
             (d, m)
         }
         Mp::Not(x) => {
-            let (d, m) = plan(db, num, h, x)?;
-            let mut nd = full(n);
+            let (d, m) = plan(db, num, h, x, scope)?;
+            let mut nd = scope.clone();
             and_not(&mut nd, &d);
             and_not(&mut nd, &m);
             (nd, m)
@@ -410,17 +485,15 @@ fn unit_of<'a>(h: &TextHead, i: u32, text: Option<&'a str>) -> U<'a> {
 
 fn scan_segment(db: &Db, num: u32, live: Option<&[bool]>, pre: &Mp, reads_text: bool, now: i64, tested: &AtomicUsize) -> Result<Vec<Row>, QError> {
     let h = db.text_head(num).map_err(qe)?;
-    let (mut def, mut maybe) = plan(db, num, &h, pre)?;
+    let mut scope = full(h.units());
     if let Some(live) = live {
-        let mut dead = textindex::bits(h.units());
         for (p, &(_, first, n)) in h.parts.iter().enumerate() {
             if !live.get(p).copied().unwrap_or(false) {
-                (first..first + n).for_each(|i| textindex::set(&mut dead, i));
+                (first..first + n).for_each(|i| scope[(i >> 6) as usize] &= !(1 << (i & 63)));
             }
         }
-        and_not(&mut def, &dead);
-        and_not(&mut maybe, &dead);
     }
+    let (def, maybe) = plan(db, num, &h, pre, &scope)?;
     let mut rows = Vec::new();
     textindex::each(&def, |i| rows.push(row(&unit_of(&h, i, None))));
     if textindex::any(&maybe) {
@@ -509,7 +582,9 @@ pub fn scan(db: &Db, q: &Query, threads: usize, now: i64, st: &mut QStats) -> Re
         parallel(db.session_count(), threads, |s| scan_nodes(db, s, 0, u32::MAX, &pre, now, &tested))?
     };
     let mut rows: Vec<Row> = per.into_iter().flat_map(|x| x.1).collect();
-    rows.sort_unstable_by_key(|r| (r.session, r.steps[0], r.steps[1]));
+    if !rows.is_sorted_by_key(|r| (r.session, r.steps[0], r.steps[1])) {
+        rows.sort_unstable_by_key(|r| (r.session, r.steps[0], r.steps[1]));
+    }
     st.steps_scanned = tested.load(Ordering::Relaxed);
     st.matches = rows.len();
     Ok((Table { kind: Kind::Messages, cols: Vec::new(), rows }, i))

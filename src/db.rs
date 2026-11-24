@@ -373,6 +373,15 @@ pub enum StepSource {
     Rows { session: u32, start: u32, end: u32 },
 }
 
+/// A window of a unit's lower-cased text (see [`Db::piece_texts`]).
+#[derive(Debug)]
+pub struct PieceText {
+    pub text: String,
+    /// The unit's text goes on before the window, or after it.
+    pub cut_left: bool,
+    pub cut_right: bool,
+}
+
 /// A text unit read to confirm a match.
 #[derive(Debug)]
 pub struct UnitText {
@@ -486,6 +495,9 @@ pub struct Db {
     textpost: Cache<(u32, u32), Vec<u8>>,
     /// Texts of units a search read to confirm a match, by (session, node, block).
     unitc: Cache<(u32, u32, u32), UnitText>,
+    /// Windows of lower-cased unit text a search read to confirm a match, by (session,
+    /// node, block, piece).
+    piecec: Cache<(u32, u32, u32, u32), PieceText>,
     /// Texts of step values that summaries read from step blocks, by (segment, part,
     /// offset in the part): a search confirms each candidate on its text, and its
     /// candidates are spread over far more step blocks than fit a cache.
@@ -649,7 +661,8 @@ impl Db {
             msgtextc: Cache::new(cb / 64),
             texthead: Cache::new(cb / 32),
             textpost: Cache::sharded(cb / 32, 16),
-            unitc: Cache::sharded(cb / 16, 4),
+            unitc: Cache::sharded(cb / 32, 4),
+            piecec: Cache::sharded(cb / 32, 4),
             textc: Cache::sharded(cb / 32, 16),
             pieces: Cache::sharded(cb / 32, 16),
             piece_bases: HashMap::new(),
@@ -2405,6 +2418,7 @@ impl Db {
             ("text index heads", self.texthead.stats()),
             ("text index postings", self.textpost.stats()),
             ("unit texts", self.unitc.stats()),
+            ("unit text windows", self.piecec.stats()),
             ("step values read by summaries", self.textc.stats()),
             ("step summaries", self.statc.stats()),
             ("long input values", self.longc.stats()),
@@ -2544,6 +2558,45 @@ impl Db {
             for (o, w) in out.iter_mut().zip(wants) {
                 if o.is_none() {
                     *o = read.get(w).cloned();
+                }
+            }
+        }
+        out.into_iter().map(|o| o.ok_or_else(|| bad("a text unit is not in its message".to_string()))).collect()
+    }
+
+    /// Windows of the lower-cased text of units of a session, each (node, block, piece):
+    /// the piece with [`crate::textindex::WINDOW`] bytes on each side, so a pattern whose
+    /// first word starts in the piece lies inside the window. From the cache, the rest
+    /// read from their messages (one read for all of them).
+    pub fn piece_texts(&self, s: u32, wants: &[(u32, u16, u32)]) -> Result<Vec<Arc<PieceText>>> {
+        use crate::textindex::{PIECE, WINDOW};
+        let mut out: Vec<Option<Arc<PieceText>>> = wants.iter().map(|&(n, b, p)| self.piecec.get(&(s, n, b as u32, p))).collect();
+        let mut missing: Vec<u32> = wants.iter().zip(&out).filter(|x| x.1.is_none()).map(|x| x.0.0).collect();
+        if !missing.is_empty() {
+            missing.sort_unstable();
+            missing.dedup();
+            let msgs = self.read_messages(s, &missing, &mut ReadStats::default())?;
+            for (&node, m) in missing.iter().zip(&msgs) {
+                let Some((_, spans)) = crate::text::scan_text(m) else { continue };
+                for t in spans {
+                    let mut low: Option<String> = None;
+                    for (o, &(n, b, p)) in out.iter_mut().zip(wants) {
+                        if o.is_some() || n != node || b != t.block {
+                            continue;
+                        }
+                        let low = low.get_or_insert_with(|| crate::text::unescape(&m[t.span.clone()]).to_lowercase());
+                        let mut a = (p as usize * PIECE).saturating_sub(WINDOW).min(low.len());
+                        while !low.is_char_boundary(a) {
+                            a -= 1;
+                        }
+                        let mut e = ((p as usize + 1) * PIECE + WINDOW).min(low.len());
+                        while !low.is_char_boundary(e) {
+                            e += 1;
+                        }
+                        let w = PieceText { text: low[a..e].to_string(), cut_left: a > 0, cut_right: e < low.len() };
+                        let size = w.text.len() + 96;
+                        *o = Some(self.piecec.insert((s, n, b as u32, p), Arc::new(w), size));
+                    }
                 }
             }
         }
@@ -2991,7 +3044,7 @@ impl Db {
 
     /// Drop everything read from files from the caches (sessions taking writes stay).
     pub fn clear_caches(&self) {
-        for c in [&self.cores as &dyn Clear, &self.stepc, &self.lightc, &self.dirs, &self.blocks, &self.ix, &self.pieces, &self.skels, &self.statc, &self.longc, &self.fieldc, &self.textc, &self.msgtextc, &self.texthead, &self.textpost, &self.unitc] {
+        for c in [&self.cores as &dyn Clear, &self.stepc, &self.lightc, &self.dirs, &self.blocks, &self.ix, &self.pieces, &self.skels, &self.statc, &self.longc, &self.fieldc, &self.textc, &self.msgtextc, &self.texthead, &self.textpost, &self.unitc, &self.piecec] {
             c.clear_all();
         }
     }

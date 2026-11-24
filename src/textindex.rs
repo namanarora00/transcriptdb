@@ -1,9 +1,14 @@
 //! The word index over message text, kept in each segment and written with it.
 //!
 //! For every text unit of the segment's parts (see [`crate::text`]): which message and
-//! block it is, who wrote it, its length and time; and for every word, the units that
-//! hold it. A *word* is a maximal run of letters and digits of the lower-cased text, three
-//! bytes or longer; a run over [`MAX_WORD`] bytes is kept by its first bytes.
+//! block it is, who wrote it, its length and time; and for every word, where it is. A
+//! *word* is a maximal run of letters and digits of the lower-cased text, three bytes or
+//! longer; a run over [`MAX_WORD`] bytes is kept by its first bytes.
+//!
+//! A unit's text is indexed in *pieces* of [`PIECE`] bytes (a word belongs to the piece it
+//! starts in), and a word's postings are pieces, not units: the words of a phrase must
+//! then be in one piece or two neighbours, so a long text that merely has all of them
+//! somewhere is not read.
 //!
 //! A whole-word test (`has`) with one word is answered from the index alone. A substring
 //! test (`contains`) reads the units whose words can hold the pattern and confirms each on
@@ -21,7 +26,14 @@ use std::collections::BTreeMap;
 
 pub const MIN_WORD: usize = 3;
 pub const MAX_WORD: usize = 64;
-const VERSION: u8 = 1;
+/// Bytes of lower-cased text per piece.
+pub const PIECE: usize = 1024;
+/// Bytes of text read on each side of a piece to confirm a match that starts in it.
+pub const WINDOW: usize = 512;
+/// The longest lower-cased pattern confirmed on such a window: with a first word of up to
+/// [`MAX_WORD`] bytes before it and a character on each side, it fits in the margin.
+pub const WINDOW_PATTERN: usize = 256;
+const VERSION: u8 = 2;
 /// Raw bytes of postings per block.
 const POST_CHUNK: usize = 256 * 1024;
 
@@ -67,8 +79,10 @@ pub struct UnitBuild {
     pub hole: bool,
     /// It has a word longer than [`MAX_WORD`].
     pub long: bool,
-    /// Its distinct words, as indexed.
-    pub words: Vec<String>,
+    /// How many pieces its text has (at least one).
+    pub pieces: u32,
+    /// Its words as indexed, each with the piece it starts in; sorted, each pair once.
+    pub words: Vec<(u32, String)>,
 }
 
 /// The text units of a part, in node order then block order, from its stored bytes.
@@ -100,22 +114,29 @@ pub fn part_units(core: &CorePart, stream: &[u8]) -> Vec<UnitBuild> {
             let hole = x.holes.iter().any(|h| (h.0 as usize) >= t.span.start && (h.0 as usize) <= t.span.end);
             let s = text::unescape(&b[t.span.clone()]);
             let low = s.to_lowercase();
-            let mut words: Vec<String> = Vec::new();
-            let mut long = false;
-            runs(&low, |_, r| {
-                if r.len() >= MIN_WORD {
-                    long |= r.len() > MAX_WORD;
-                    words.push(key(r).to_string());
-                }
-            });
-            words.sort_unstable();
-            words.dedup();
+            let (words, pieces, long) = words_of(&low);
             let idx = if x.id >= lo && x.id - lo < n { (x.id - lo) as usize } else { usize::MAX };
-            out.push(UnitBuild { node: x.id, block: t.block, user, chars: s.len() as u32, time: time.get(idx).copied().unwrap_or(0), hole, long, words });
+            out.push(UnitBuild { node: x.id, block: t.block, user, chars: s.len() as u32, time: time.get(idx).copied().unwrap_or(0), hole, long, pieces, words });
         }
     }
     out.sort_by_key(|u| (u.node, u.block));
     out
+}
+
+/// The indexed words of lower-cased text with their pieces, how many pieces the text has,
+/// and whether a word was cut short.
+pub fn words_of(low: &str) -> (Vec<(u32, String)>, u32, bool) {
+    let mut words: Vec<(u32, String)> = Vec::new();
+    let mut long = false;
+    runs(low, |a, r| {
+        if r.len() >= MIN_WORD {
+            long |= r.len() > MAX_WORD;
+            words.push(((a / PIECE) as u32, key(r).to_string()));
+        }
+    });
+    words.sort_unstable();
+    words.dedup();
+    (words, (low.len().div_ceil(PIECE) as u32).max(1), long)
 }
 
 /// Collects a segment's text index as its parts are added (in directory order).
@@ -123,6 +144,7 @@ pub fn part_units(core: &CorePart, stream: &[u8]) -> Vec<UnitBuild> {
 pub struct TextIndexBuilder {
     parts: Vec<(u32, u32)>,
     units: Vec<UnitBuild>,
+    pieces: u32,
     post: BTreeMap<String, Vec<u32>>,
 }
 
@@ -138,10 +160,11 @@ impl TextIndexBuilder {
     pub fn add_part(&mut self, session: u32, units: Vec<UnitBuild>) {
         self.parts.push((session, units.len() as u32));
         for mut u in units {
-            let id = self.units.len() as u32;
-            for w in std::mem::take(&mut u.words) {
-                self.post.entry(w).or_default().push(id);
+            let first = self.pieces;
+            for (piece, w) in std::mem::take(&mut u.words) {
+                self.post.entry(w).or_default().push(first + piece);
             }
+            self.pieces += u.pieces;
             self.units.push(u);
         }
     }
@@ -162,6 +185,7 @@ impl TextIndexBuilder {
                 e.var(u.block as u64);
                 e.u8(u.user as u8 | (u.hole as u8) << 1 | (u.long as u8) << 2);
                 e.var(u.chars as u64);
+                e.var(u.pieces as u64);
                 e.var(zig(u.time - prev_time));
                 prev_node = u.node;
                 prev_time = u.time;
@@ -284,6 +308,10 @@ pub struct TextHead {
     pub block: Vec<u16>,
     pub chars: Vec<u32>,
     pub time: Vec<i64>,
+    /// The first piece of each unit, and one past the last piece at the end.
+    pub piece_at: Vec<u32>,
+    /// The unit of each piece.
+    pub piece_unit: Vec<u32>,
     pub user: Bits,
     /// Units with an opaque value cut out of their text.
     pub holes: Bits,
@@ -312,6 +340,7 @@ impl TextHead {
         let mut h = TextHead { user: bits(n), holes: bits(n), long: bits(n), chunks: dir.chunks.clone(), ..TextHead::default() };
         let mut d = Dec::new(units);
         let (mut prev_node, mut prev_time) = (0u32, 0i64);
+        let mut pieces = 0u32;
         for (pi, &(s, pn)) in dir.parts.iter().enumerate() {
             h.parts.push((s, h.node.len() as u32, pn));
             for k in 0..pn {
@@ -332,6 +361,10 @@ impl TextHead {
                     set(&mut h.long, id);
                 }
                 h.chars.push(d.var32()?);
+                h.piece_at.push(pieces);
+                let n_pieces = d.var32()?.max(1);
+                h.piece_unit.resize((pieces + n_pieces) as usize, id);
+                pieces += n_pieces;
                 let t = prev_time + unzig(d.var()?);
                 h.time.push(t);
                 h.part_of.push(pi as u32);
@@ -339,6 +372,7 @@ impl TextHead {
                 prev_time = t;
             }
         }
+        h.piece_at.push(pieces);
         let mut d = Dec::new(words);
         let nw = d.var()? as usize;
         h.word_at.reserve(nw + 1);
@@ -368,6 +402,17 @@ impl TextHead {
         self.node.len()
     }
 
+    pub fn pieces(&self) -> usize {
+        *self.piece_at.last().unwrap_or(&0) as usize
+    }
+
+    /// The units that have a piece in `pieces`.
+    pub fn units_with(&self, pieces: &Bits) -> Bits {
+        let mut out = bits(self.units());
+        each(pieces, |p| set(&mut out, self.piece_unit[p as usize]));
+        out
+    }
+
     pub fn n_words(&self) -> usize {
         self.word_at.len() - 1
     }
@@ -377,7 +422,7 @@ impl TextHead {
     }
 
     pub fn bytes(&self) -> usize {
-        256 + self.node.len() * 23 + self.words.len() + self.word_at.len() * 12 + self.parts.len() * 12 + self.user.len() * 24
+        256 + self.node.len() * 27 + self.piece_unit.len() * 4 + self.words.len() + self.word_at.len() * 12 + self.parts.len() * 12 + self.user.len() * 24
     }
 
     /// The words a run of a pattern can sit in, by index.
@@ -435,7 +480,16 @@ impl TextHead {
     }
 }
 
-/// Add the units of one posting list (as stored) to `out`.
+/// `b` with every piece moved one place down: piece `p` is set where `p + 1` was.
+pub fn down_one(b: &Bits) -> Bits {
+    let mut out = vec![0u64; b.len()];
+    for i in 0..b.len() {
+        out[i] = b[i] >> 1 | b.get(i + 1).map_or(0, |n| n << 63);
+    }
+    out
+}
+
+/// Add the pieces of one posting list (as stored) to `out`.
 pub fn add_postings(list: &[u8], out: &mut Bits) -> Result<()> {
     let mut d = Dec::new(list);
     let n = d.var()?;
@@ -443,7 +497,7 @@ pub fn add_postings(list: &[u8], out: &mut Bits) -> Result<()> {
     for _ in 0..n {
         id += d.var32()?;
         if (id >> 6) as usize >= out.len() {
-            return corrupt("posting past the last unit");
+            return corrupt("posting past the last piece");
         }
         set(out, id);
     }
@@ -491,18 +545,8 @@ mod tests {
     use super::*;
 
     fn unit(node: u32, block: u16, user: bool, text: &str) -> UnitBuild {
-        let low = text.to_lowercase();
-        let mut words = Vec::new();
-        let mut long = false;
-        runs(&low, |_, r| {
-            if r.len() >= MIN_WORD {
-                long |= r.len() > MAX_WORD;
-                words.push(key(r).to_string());
-            }
-        });
-        words.sort_unstable();
-        words.dedup();
-        UnitBuild { node, block, user, chars: text.len() as u32, time: 1000 + node as i64, hole: false, long, words }
+        let (words, pieces, long) = words_of(&text.to_lowercase());
+        UnitBuild { node, block, user, chars: text.len() as u32, time: 1000 + node as i64, hole: false, long, pieces, words }
     }
 
     fn build(parts: Vec<(u32, Vec<UnitBuild>)>) -> (TextHead, Vec<Vec<u8>>) {
@@ -525,13 +569,13 @@ mod tests {
     fn units_of(h: &TextHead, blocks: &[Vec<u8>], run: &str, fit: Fit) -> Vec<u32> {
         let mut ws = Vec::new();
         h.find(run.as_bytes(), fit, &mut ws);
-        let mut b = bits(h.units());
+        let mut b = bits(h.pieces());
         for w in ws {
             let (c, a, e) = h.postings_at(w);
             add_postings(&blocks[h.chunks[c].1.off as usize][a..e], &mut b).unwrap();
         }
         let mut v = Vec::new();
-        each(&b, |i| v.push(i));
+        each(&h.units_with(&b), |i| v.push(i));
         v
     }
 
@@ -573,5 +617,37 @@ mod tests {
         let (r, single) = pattern_runs(&long, true);
         assert_eq!(r, vec![("a".repeat(MAX_WORD), Fit::Prefix)]);
         assert!(!single);
+    }
+
+    #[test]
+    fn long_texts_are_indexed_by_piece() {
+        // "alpha" at the start, "omega" three pieces later, "beta gamma" together in between
+        let filler = "x ".repeat(PIECE);
+        let text = format!("alpha {filler} beta gamma {filler} omega");
+        let (h, blocks) = build(vec![(0, vec![unit(0, 0, true, &text), unit(1, 0, false, "alpha omega")])]);
+        assert_eq!(h.piece_at, vec![0, text.len().div_ceil(PIECE) as u32, text.len().div_ceil(PIECE) as u32 + 1]);
+        let pieces = |w: &str| {
+            let mut ws = Vec::new();
+            h.find(w.as_bytes(), Fit::Exact, &mut ws);
+            let mut b = bits(h.pieces());
+            for w in ws {
+                let (c, a, e) = h.postings_at(w);
+                add_postings(&blocks[h.chunks[c].1.off as usize][a..e], &mut b).unwrap();
+            }
+            b
+        };
+        // a phrase needs its second word in the first word's piece or the next
+        let near = |a: &str, b: &str| {
+            let (x, y) = (pieces(a), pieces(b));
+            let mut ok = y.clone();
+            ok.iter_mut().zip(down_one(&y)).for_each(|(p, q)| *p |= q);
+            ok.iter_mut().zip(&x).for_each(|(p, q)| *p &= *q);
+            let mut v = Vec::new();
+            each(&h.units_with(&ok), |i| v.push(i));
+            v
+        };
+        assert_eq!(near("alpha", "omega"), vec![1]);
+        assert_eq!(near("beta", "gamma"), vec![0]);
+        assert_eq!(units_of(&h, &blocks, "alpha", Fit::Exact), vec![0, 1]);
     }
 }
