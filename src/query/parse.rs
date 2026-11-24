@@ -146,12 +146,23 @@ pub enum Stage {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Query {
+    pub source: Source,
     pub stages: Vec<Stage>,
+}
+
+/// What a query's rows are before its first stage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Source {
+    /// Tool calls paired with their results (the default).
+    #[default]
+    Steps,
+    /// Text the user wrote and the assistant said, one row per text block.
+    Messages,
 }
 
 const RESERVED: &[&str] = &[
     "and", "or", "not", "in", "has", "contains", "startswith", "endswith", "matches", "has_cs", "contains_cs", "startswith_cs", "endswith_cs",
-    "matches_cs", "then", "next", "within", "where", "by", "between", "asc", "desc", "steps", "turns",
+    "matches_cs", "then", "next", "within", "where", "by", "between", "asc", "desc", "steps", "turns", "messages",
 ];
 
 struct P {
@@ -222,7 +233,12 @@ impl P {
 
     fn query(&mut self) -> Result<Query, QError> {
         let mut stages = Vec::new();
-        self.kw("steps");
+        let source = if self.kw("messages") {
+            Source::Messages
+        } else {
+            self.kw("steps");
+            Source::Steps
+        };
         loop {
             match self.peek() {
                 Tok::End => break,
@@ -234,7 +250,7 @@ impl P {
                 _ => return self.err("expected '|' or the end of the query"),
             }
         }
-        Ok(Query { stages })
+        Ok(Query { source, stages })
     }
 
     fn stage(&mut self) -> Result<Stage, QError> {

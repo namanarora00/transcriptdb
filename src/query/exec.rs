@@ -18,6 +18,8 @@ use std::time::Instant;
 pub enum Kind {
     Steps,
     Matches(Vec<String>),
+    /// Rows are text units: `steps[0]` is the unit's number in its session.
+    Messages,
     Plain,
 }
 
@@ -75,6 +77,7 @@ impl Ctx for RowCtx<'_> {
         match &self.t.kind {
             Kind::Plain => Err(QError::new(format!("unknown column '{}'", path.join(".")))),
             Kind::Steps => step_value(self.db, self.row.session, self.row.steps[0], &resolve(path)?),
+            Kind::Messages => super::messages::row_value(self.db, self.row.session, self.row.steps[0], path),
             Kind::Matches(vars) => {
                 if let Some(k) = vars.iter().position(|v| *v == path[0]) {
                     if path.len() == 1 {
@@ -534,7 +537,7 @@ fn session_matches_in(db: &Db, c: &Compiled, s: u32, ss: &steps::SessionSteps, n
     Ok(Some(out))
 }
 
-fn parallel<T: Send>(n: usize, threads: usize, f: impl Fn(u32) -> Result<T, QError> + Sync) -> Result<Vec<(u32, T)>, QError> {
+pub(super) fn parallel<T: Send>(n: usize, threads: usize, f: impl Fn(u32) -> Result<T, QError> + Sync) -> Result<Vec<(u32, T)>, QError> {
     if threads <= 1 {
         // on the caller's thread: no thread to start, and per-thread caches stay warm
         return (0..n as u32).map(|i| f(i).map(|v| (i, v))).collect();
@@ -581,6 +584,18 @@ pub fn run(db: &Db, q: &Query, threads: usize) -> Result<Run, QError> {
     plan::clear_cache();
     let t0 = Instant::now();
     let mut st = QStats { sessions: db.session_count(), ..QStats::default() };
+    if q.source == super::parse::Source::Messages {
+        st.plan_ms = t0.elapsed().as_secs_f64() * 1e3;
+        let t1 = Instant::now();
+        let (mut table, used) = super::messages::scan(db, q, threads, now, &mut st)?;
+        st.scan_ms = t1.elapsed().as_secs_f64() * 1e3;
+        let t2 = Instant::now();
+        for stage in &q.stages[used..] {
+            table = apply_stage(db, table, stage, now)?;
+        }
+        st.rest_ms = t2.elapsed().as_secs_f64() * 1e3;
+        return Ok(Run { table, stats: st });
+    }
     // leading where stages filter steps
     let mut i = 0;
     let mut pre = Sp::Const(true);
@@ -1265,6 +1280,12 @@ pub fn render(db: &Db, t: &Table, limit: usize) -> Result<(Vec<String>, Vec<Vec<
             let last = vars.last().unwrap();
             heads.push(format!("{last}.time"));
             exprs.push(r(&format!("{last}.time")));
+        }
+        Kind::Messages => {
+            for c in ["session", "node", "role", "time", "chars"] {
+                heads.push(c.into());
+                exprs.push(r(c));
+            }
         }
         Kind::Plain => {}
     }

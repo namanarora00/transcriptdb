@@ -19,6 +19,7 @@
 pub mod exec;
 pub mod lex;
 pub mod matcher;
+pub mod messages;
 pub mod parse;
 pub mod plan;
 pub mod reference;

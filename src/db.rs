@@ -444,6 +444,8 @@ pub struct Db {
     lightc: Cache<u32, SessionSteps>,
     /// Sessions' steps with the values of only the fields queries tested.
     fieldc: Cache<u32, SessionSteps>,
+    /// Sessions' text units (what the user wrote and the assistant said), read whole.
+    msgtextc: Cache<u32, crate::text::SessionTexts>,
     /// Texts of step values that summaries read from step blocks, by (segment, part,
     /// offset in the part): a search confirms each candidate on its text, and its
     /// candidates are spread over far more step blocks than fit a cache.
@@ -602,6 +604,7 @@ impl Db {
             stepc: Cache::new(cb / 8),
             lightc: Cache::new(cb / 16),
             fieldc: Cache::new(cb / 16),
+            msgtextc: Cache::new(cb / 16),
             textc: Cache::sharded(cb / 32, 16),
             pieces: Cache::sharded(cb / 16, 16),
             piece_bases: HashMap::new(),
@@ -984,6 +987,7 @@ impl Db {
         self.stepc.remove(&s);
         self.lightc.remove(&s);
         self.fieldc.remove(&s);
+        self.msgtextc.remove(&s);
         let mut ss = Arc::unwrap_or_clone(steps);
         // per node: last step at or above it on its path
         let mut last_at = vec![NONE; core.nodes.len()];
@@ -1785,7 +1789,7 @@ impl Db {
             return corrupt("merge with unflushed sessions");
         }
         self.key_ix.clear();
-        for c in [&self.cores as &dyn Clear, &self.stepc, &self.lightc, &self.fieldc, &self.dirs, &self.blocks, &self.statc, &self.longc, &self.textc] {
+        for c in [&self.cores as &dyn Clear, &self.stepc, &self.lightc, &self.fieldc, &self.dirs, &self.blocks, &self.statc, &self.longc, &self.textc, &self.msgtextc] {
             c.clear_all();
         }
         let mut bytes_out = 0;
@@ -2320,6 +2324,7 @@ impl Db {
             ("steps", self.stepc.stats()),
             ("steps without values", self.lightc.stats()),
             ("steps with some fields' values", self.fieldc.stats()),
+            ("sessions' text", self.msgtextc.stats()),
             ("step values read by summaries", self.textc.stats()),
             ("step summaries", self.statc.stats()),
             ("long input values", self.longc.stats()),
@@ -2380,6 +2385,40 @@ impl Db {
         let ss = self.read_steps(s)?.with_fields(&keep);
         let size = ss.bytes();
         Ok(self.fieldc.insert(s, Arc::new(ss), size))
+    }
+
+    /// Every text unit of a session (user and assistant text blocks) with its text, read
+    /// from the session's messages. The slow way to search: it reads the whole session.
+    pub fn session_texts(&self, s: u32) -> Result<Arc<crate::text::SessionTexts>> {
+        let active = self.active.contains_key(&s);
+        if !active && let Some(c) = self.msgtextc.get(&s) {
+            return Ok(c);
+        }
+        let core = self.load_core(s)?;
+        let ids: Vec<u32> = (0..core.nodes.len() as u32).collect();
+        let msgs = self.read_messages(s, &ids, &mut ReadStats::default())?;
+        let mut st = crate::text::SessionTexts::default();
+        for (id, m) in ids.iter().zip(&msgs) {
+            st.push_message(*id, m);
+        }
+        // a node's time is that of the first request that carried it
+        st.node_time = vec![0; core.nodes.len()];
+        let mut seen = vec![false; core.nodes.len()];
+        for r in core.requests.iter() {
+            let t = steps::parse_time_ms(&r.time);
+            let mut c = r.tip;
+            while c != NONE && !seen[c as usize] {
+                seen[c as usize] = true;
+                st.node_time[c as usize] = t;
+                c = core.nodes[c as usize].parent;
+            }
+        }
+        let st = Arc::new(st);
+        if active {
+            return Ok(st);
+        }
+        let size = st.bytes();
+        Ok(self.msgtextc.insert(s, st, size))
     }
 
     /// The text of a step value a summary points at: `vlen` bytes at `voff` in part
@@ -2789,7 +2828,7 @@ impl Db {
 
     /// Drop everything read from files from the caches (sessions taking writes stay).
     pub fn clear_caches(&self) {
-        for c in [&self.cores as &dyn Clear, &self.stepc, &self.lightc, &self.dirs, &self.blocks, &self.ix, &self.pieces, &self.skels, &self.statc, &self.longc, &self.fieldc, &self.textc] {
+        for c in [&self.cores as &dyn Clear, &self.stepc, &self.lightc, &self.dirs, &self.blocks, &self.ix, &self.pieces, &self.skels, &self.statc, &self.longc, &self.fieldc, &self.textc, &self.msgtextc] {
             c.clear_all();
         }
     }
