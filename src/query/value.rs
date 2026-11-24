@@ -415,6 +415,23 @@ pub fn regex_for(pat: &str) -> Option<Rc<regex::Regex>> {
     })
 }
 
+/// `extract(text, regex[, group])`: what the group of the first match holds (group 1 when
+/// the expression has one and none is named, else the whole match); null without a match
+/// or for a value that is not text.
+fn extract(s: &Value, re: &str, group: Option<i64>) -> Result<Value, QError> {
+    let Some(r) = regex_for(re) else { return Err(QError::new(format!("bad regular expression in extract(): {re}"))) };
+    let Value::Str(s) = s else { return Ok(Value::Null) };
+    let g = match group {
+        Some(g) if g >= 0 => g as usize,
+        Some(_) => return Ok(Value::Null),
+        None => (r.captures_len() > 1) as usize,
+    };
+    Ok(match r.captures(s).and_then(|c| c.get(g)) {
+        Some(m) => Value::Str(m.as_str().into()),
+        None => Value::Null,
+    })
+}
+
 pub fn str_op(op: StrOp, s: &str, pat: &str, cs: bool) -> bool {
     if op == StrOp::Regex {
         return regex_for(pat).is_some_and(|r| r.is_match(s));
@@ -584,6 +601,15 @@ pub fn eval(e: &Expr, ctx: &dyn Ctx) -> Result<Value, QError> {
                 ("isnull", [v]) => Value::Bool(matches!(v, Value::Null)),
                 ("isnotnull", [v]) => Value::Bool(!matches!(v, Value::Null)),
                 ("tostring", [v]) => Value::Str(v.to_string().into()),
+                ("extract", [s, Value::Str(re)]) => extract(s, re, None)?,
+                ("extract", [s, Value::Str(re), Value::Int(g)]) => extract(s, re, Some(*g))?,
+                ("toint" | "tolong", [v]) => match v {
+                    Value::Int(i) => Value::Int(*i),
+                    Value::Float(f) if f.is_finite() => Value::Int(f.trunc() as i64),
+                    Value::Bool(b) => Value::Int(*b as i64),
+                    Value::Str(s) => s.trim().parse::<i64>().map(Value::Int).unwrap_or(Value::Null),
+                    _ => Value::Null,
+                },
                 ("iff" | "iif", [c, x, y]) => {
                     if c.truthy() {
                         x.clone()

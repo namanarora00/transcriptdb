@@ -136,6 +136,9 @@ pub struct SegCat {
     /// The word index over message text (`textindex.rs`) and its size on disk.
     pub text: Option<BlockRef>,
     pub text_bytes: u64,
+    /// The column rules (`rules.rs`) the steps' rule values were worked out with, as
+    /// (name, version).
+    pub rules: Vec<(Vec<u8>, u64)>,
 }
 
 impl SegCat {
@@ -191,6 +194,11 @@ impl SegCat {
                 e.var(self.text_bytes);
             }
         }
+        e.var(self.rules.len() as u64);
+        for (n, v) in &self.rules {
+            e.bytes(n);
+            e.raw(&v.to_le_bytes());
+        }
         e.buf
     }
 
@@ -234,6 +242,13 @@ impl SegCat {
                 c.text_bytes = d.var()?;
             }
             _ => return corrupt("bad segment catalog"),
+        }
+        // a segment written before rules existed ends here
+        if !d.done() {
+            for _ in 0..d.var()? {
+                let n = d.bytes()?.to_vec();
+                c.rules.push((n, u64::from_le_bytes(d.raw(8)?.try_into().unwrap())));
+            }
         }
         if !d.done() || c.dirs.windows(2).any(|w| w[0].0 > w[1].0) || (c.sessions > 0) != !c.dirs.is_empty() {
             return corrupt("bad segment catalog");
@@ -829,6 +844,11 @@ impl SegWriter {
             self.add(p.session, p.key, &p.core, &p.steps, p.units)?;
         }
         Ok(())
+    }
+
+    /// Record the column rules this segment's steps carry values of.
+    pub fn set_rules(&mut self, rules: Vec<(Vec<u8>, u64)>) {
+        self.cat.rules = rules;
     }
 
     pub fn tool_code(&mut self, name: &[u8]) -> u32 {

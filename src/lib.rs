@@ -22,6 +22,7 @@ pub mod manifest;
 pub mod pg;
 pub mod query;
 pub mod record;
+pub mod rules;
 pub mod search_check;
 pub mod segment;
 pub mod split;

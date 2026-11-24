@@ -35,13 +35,16 @@ use crate::index::{self, IxBlock, OpaqueEnt, PieceEnt, Run, RunWriter, IDS, K_OP
 use crate::codec::{corrupt, Error, Result};
 use crate::layout;
 use crate::manifest::{Dead, Manifest};
+use crate::query::value::Value;
 use crate::record::*;
+use crate::rules::RuleSet;
 use crate::segment::{decode_core, decode_steps, key_bytes, seg_path, Codec, CorePart, DirEnt, SegNode, SegWriter, Segment, StepPart};
 use crate::split::{self, HoleKind, Keep, OpaqueEnc, OpaqueHole, OpaqueKind, Skeleton};
 use crate::stats::{self, FieldDir, FieldRows, StatsHead, ValChunk, Words};
 use crate::steps::{self, FieldVal, SessionSteps, StepDicts, StepRow};
 use crate::wal::{self, SyncMode, WalWriter};
 use sha2::{Digest, Sha256};
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -463,6 +466,79 @@ impl StatBlock {
     }
 }
 
+/// What reading steps from a segment does about rule columns (see [`Db::seg_rules`]).
+#[derive(Debug, Default)]
+struct SegRules {
+    /// Per field code of the segment: its stored values are not what the rules give now
+    /// (another version of the rule, a rule that is gone, or an input field a rule hides).
+    drop: Vec<bool>,
+    /// Rules to work out for the segment's steps, in order.
+    todo: Vec<usize>,
+}
+
+/// A step as a rule reads it, while the step is read from a segment or being written.
+struct RuleView<'a> {
+    db: &'a Db,
+    s: u32,
+    ss: &'a SessionSteps,
+    row: &'a StepRow,
+    fields: &'a [(u32, FieldVal)],
+    /// The message holding the step's result, when it is at hand (a step being written).
+    result_msg: Option<&'a [u8]>,
+    /// The result message last read, by node: steps of one turn share it.
+    last: &'a RefCell<Option<(u32, Arc<Vec<u8>>)>>,
+    err: RefCell<Option<Error>>,
+}
+
+impl crate::rules::StepView for RuleView<'_> {
+    fn tool(&self) -> Value {
+        Value::Str(String::from_utf8_lossy(self.db.sd.tools.get(self.row.tool)).into())
+    }
+    fn failed(&self) -> bool {
+        self.row.failed
+    }
+    fn out_bytes(&self) -> u32 {
+        self.row.out_bytes
+    }
+    fn input(&self, name: &str) -> Value {
+        let Some(f) = self.db.sd.fields.code(name.as_bytes()) else { return Value::Null };
+        match self.fields.iter().find(|x| x.0 == f) {
+            None => Value::Null,
+            Some((_, FieldVal::Code(c))) => Value::from_json(self.ss.value(f, *c)),
+            Some((_, FieldVal::Long { off, len })) => match self.db.long_input(self.s, self.row, *off, *len, name) {
+                Ok(Some(t)) => Value::from_json(&t),
+                Ok(None) => Value::Null,
+                Err(e) => {
+                    *self.err.borrow_mut() = Some(e);
+                    Value::Null
+                }
+            },
+        }
+    }
+    fn output(&self) -> Value {
+        let text = |m: &[u8]| steps::result_text(m, self.row.result_block).map_or(Value::Null, |t| Value::Str(t.into()));
+        if let Some(m) = self.result_msg {
+            return text(m);
+        }
+        if let Some((n, m)) = &*self.last.borrow()
+            && *n == self.row.result_node
+        {
+            return text(m);
+        }
+        match self.db.stored_message(self.s, self.row.result_node) {
+            Ok((m, _)) => {
+                let v = text(&m);
+                *self.last.borrow_mut() = Some((self.row.result_node, Arc::new(m)));
+                v
+            }
+            Err(e) => {
+                *self.err.borrow_mut() = Some(e);
+                Value::Null
+            }
+        }
+    }
+}
+
 pub struct Db {
     dir: PathBuf,
     /// Held with an exclusive lock while the store is open.
@@ -472,6 +548,11 @@ pub struct Db {
     segs: BTreeMap<u32, Arc<Segment>>,
     /// Per segment: its tool and field codes mapped to the store's.
     seg_codes: HashMap<u32, (Vec<u32>, Vec<u32>)>,
+    /// Column rules (`rules.rs`) and the store's field code of each rule's column.
+    rules: Arc<RuleSet>,
+    rule_fields: Vec<u32>,
+    /// Per segment: what reading its steps does about rule columns.
+    seg_rules: Mutex<HashMap<u32, Arc<SegRules>>>,
     /// Index runs in id order (oldest first), so piece and opaque id ranges ascend.
     runs: Vec<Arc<Run>>,
     blob_files: BTreeMap<u32, BlobFile>,
@@ -649,6 +730,9 @@ impl Db {
             manifest,
             segs: BTreeMap::new(),
             seg_codes: HashMap::new(),
+            rules: Arc::new(RuleSet::default()),
+            rule_fields: Vec::new(),
+            seg_rules: Mutex::new(HashMap::new()),
             runs: Vec::new(),
             blob_files: BTreeMap::new(),
             dirs: Cache::sharded(cb / 32, 16),
@@ -685,6 +769,12 @@ impl Db {
             merge_stats: MergeStats::default(),
             opts,
         };
+        let _ = fs::remove_file(db.dir.join("RULES.tmp"));
+        match fs::read(db.dir.join("RULES")) {
+            Ok(b) => db.install_rules(RuleSet::decode(&b)?),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
         let mut segs = db.manifest.segs.clone();
         segs.sort_unstable();
         for n in segs {
@@ -739,6 +829,123 @@ impl Db {
         let fields = seg.cat.fields.iter().map(|f| self.sd.field(f)).collect();
         self.seg_codes.insert(seg.num, (tools, fields));
         self.segs.insert(seg.num, Arc::new(seg));
+    }
+
+    // ------------------------------------------------------------------ column rules
+
+    pub fn rules(&self) -> &RuleSet {
+        &self.rules
+    }
+
+    /// Per rule: how many segments with steps carry its values as today's rule gives them,
+    /// and how many segments with steps there are.
+    pub fn rule_coverage(&self) -> Vec<(usize, usize)> {
+        let with_steps: Vec<&Arc<Segment>> = self.segs.values().filter(|s| s.cat.steps > 0).collect();
+        self.rules.rules.iter().map(|r| (with_steps.iter().filter(|s| s.cat.rules.iter().any(|x| x.0 == r.name.as_bytes() && x.1 == r.ver)).count(), with_steps.len())).collect()
+    }
+
+    fn install_rules(&mut self, rs: RuleSet) {
+        self.rule_fields = rs.rules.iter().map(|r| self.sd.field(r.name.as_bytes())).collect();
+        self.rules = Arc::new(rs);
+        self.seg_rules.lock().unwrap().clear();
+    }
+
+    /// Add a column rule, or put it in place of the rule of its name. Steps written from
+    /// now on carry its values; older steps get them when their sessions are read, and
+    /// keep them once a merge has rewritten them.
+    pub fn define_rule(&mut self, def: &str) -> Result<()> {
+        let rs = self.rules.with(def).map_err(|e| Error::BadRequest(e.to_string()))?;
+        self.set_rules(rs)
+    }
+
+    /// Remove a column rule. Its stored values are no longer read, and go at the next merge.
+    pub fn drop_rule(&mut self, name: &str) -> Result<()> {
+        let rs = self.rules.without(name).map_err(|e| Error::BadRequest(e.to_string()))?;
+        self.set_rules(rs)
+    }
+
+    fn set_rules(&mut self, rs: RuleSet) -> Result<()> {
+        // steps still in memory go to a segment under the rules they were worked out with
+        self.flush()?;
+        let tmp = self.dir.join("RULES.tmp");
+        {
+            let mut f = fs::File::create(&tmp)?;
+            std::io::Write::write_all(&mut f, &rs.encode())?;
+            wal::sync_file(&f, self.opts.sync)?;
+        }
+        fs::rename(&tmp, self.dir.join("RULES"))?;
+        wal::sync_dir(&self.dir, self.opts.sync)?;
+        // sessions held in memory carry the old rules' values: they are read again when needed
+        for (_, a) in self.active.drain() {
+            self.key_ix.remove(&a.core.key);
+        }
+        self.install_rules(rs);
+        self.clear_caches();
+        Ok(())
+    }
+
+    /// What reading steps from a segment does about rule columns: which stored fields are
+    /// left out and which rules are worked out. A segment written under today's rules needs
+    /// neither.
+    fn seg_rules(&self, seg: &Segment) -> Arc<SegRules> {
+        if let Some(x) = self.seg_rules.lock().unwrap().get(&seg.num) {
+            return x.clone();
+        }
+        let applied = |name: &[u8]| seg.cat.rules.iter().find(|r| r.0 == name).map(|r| r.1);
+        let current = |name: &[u8]| self.rules.position(name).map(|i| self.rules.rules[i].ver);
+        let drop = seg.cat.fields.iter().map(|f| applied(f) != current(f)).collect();
+        let todo = self.rules.rules.iter().enumerate().filter(|(_, r)| applied(r.name.as_bytes()) != Some(r.ver)).map(|x| x.0).collect();
+        let x = Arc::new(SegRules { drop, todo });
+        self.seg_rules.lock().unwrap().insert(seg.num, x.clone());
+        x
+    }
+
+    /// Whether a segment's stored values of store field `f` are not what queries see (see
+    /// [`SegRules::drop`]), or the field is a rule's column the segment has no values of.
+    fn seg_field_stale(&self, seg: &Segment, f: u32) -> bool {
+        let name = self.sd.fields.get(f);
+        seg.cat.rules.iter().find(|r| r.0 == name).map(|r| r.1) != self.rules.position(name).map(|i| self.rules.rules[i].ver)
+    }
+
+    /// The raw JSON text of a long input value of a step that is being read or written.
+    fn long_input(&self, s: u32, row: &StepRow, off: u32, len: u32, name: &str) -> Result<Option<Vec<u8>>> {
+        if let Some(b) = self.stored_range(s, row.call_node, off, len)? {
+            return Ok(Some(b));
+        }
+        // an opaque value sits inside: the field is read from the whole message
+        let m = self.message(s, row.call_node)?;
+        let (calls, _) = steps::scan_message(&m);
+        Ok(calls.iter().find(|c| c.block == row.call_block).and_then(|c| c.fields.iter().find(|(k, _)| *k == name.as_bytes())).map(|(_, v)| v.to_vec()))
+    }
+
+    /// The values rules `todo` give one step, as (field, JSON text), for the rules that give
+    /// one. `fields` are the step's input fields and the values of the rules not in `todo`.
+    #[allow(clippy::too_many_arguments)]
+    fn rule_values(&self, s: u32, ss: &SessionSteps, row: &StepRow, fields: &[(u32, FieldVal)], todo: &[usize], result_msg: Option<&[u8]>, last: &RefCell<Option<(u32, Arc<Vec<u8>>)>>) -> Result<Vec<(u32, Vec<u8>)>> {
+        let view = RuleView { db: self, s, ss, row, fields, result_msg, last, err: RefCell::new(None) };
+        let mut vals: Vec<Value> = Vec::with_capacity(self.rules.rules.len());
+        let mut out = Vec::new();
+        let mut t = 0;
+        for i in 0..self.rules.rules.len() {
+            let f = self.rule_fields[i];
+            if todo.get(t) == Some(&i) {
+                t += 1;
+                let v = self.rules.eval(i, &view, &vals);
+                if let Some(text) = crate::rules::stored(&v) {
+                    out.push((f, text));
+                }
+                vals.push(v);
+            } else {
+                vals.push(match fields.iter().find(|x| x.0 == f) {
+                    Some((_, FieldVal::Code(c))) => Value::from_json(ss.value(f, *c)),
+                    _ => Value::Null,
+                });
+            }
+        }
+        match view.err.take() {
+            Some(e) => Err(e),
+            None => Ok(out),
+        }
     }
 
     fn check_run_ranges(&self) -> Result<()> {
@@ -1000,7 +1207,13 @@ impl Db {
         let parts = self.parts(s)?;
         let mut ss = SessionSteps::default();
         let mut fs: Vec<(u32, FieldVal)> = Vec::new();
+        let last = RefCell::new(None);
         for (seg, d) in &parts {
+            // rule columns: stored values that are not today's are left out, and the rules
+            // the segment was written without are worked out, so every step read carries
+            // exactly what today's rules give it
+            let sr = self.seg_rules(seg);
+            let dropped = |f: u32| sr.drop.get(f as usize).copied().unwrap_or(false);
             let raw = self.step_block(seg, &d.steps.0)?;
             let (a, b) = (d.steps.1 as usize, (d.steps.1 + d.steps.2) as usize);
             let p = decode_steps(raw.get(a..b).ok_or_else(|| bad("step part past its block"))?)?;
@@ -1011,12 +1224,15 @@ impl Db {
             let gf = |f: u32| fields.get(f as usize).copied().ok_or_else(|| bad("step names a missing field"));
             let mut vmap = Vec::with_capacity(p.values.len());
             for (f, v) in &p.values {
-                vmap.push(ss.intern_value(gf(*f)?, v));
+                vmap.push(if dropped(*f) { u32::MAX } else { ss.intern_value(gf(*f)?, v) });
             }
             for (mut r, rf) in p.rows.into_iter().zip(p.fields) {
                 r.tool = *tools.get(r.tool as usize).ok_or_else(|| bad("step names a missing tool"))?;
                 fs.clear();
                 for (f, v) in rf {
+                    if dropped(f) {
+                        continue;
+                    }
                     let val = if steps::is_long(v) {
                         let (off, len) = p.longs[(v - steps::LONG_BASE) as usize];
                         FieldVal::Long { off, len }
@@ -1024,6 +1240,11 @@ impl Db {
                         FieldVal::Code(vmap[v as usize])
                     };
                     fs.push((gf(f)?, val));
+                }
+                if !sr.todo.is_empty() {
+                    for (f, t) in self.rule_values(s, &ss, &r, &fs, &sr.todo, None, &last)? {
+                        fs.push((f, FieldVal::Code(ss.intern_value(f, &t))));
+                    }
                 }
                 ss.push(r, &fs);
             }
@@ -1391,20 +1612,44 @@ impl Db {
             let extra: u64 = holes.iter().filter(|h| (h.0 as usize) >= span.start && (h.0 as usize) <= span.end).map(|h| self.opaque_text_len(h.1)).sum();
             found.push((call, block, failed, (span.len() as u64 + extra).min(u32::MAX as u64) as u32));
         }
+        {
+            let a = self.active.get_mut(&si).unwrap();
+            let ss = Arc::make_mut(&mut a.steps);
+            for (tid, block, name, fields) in ex.calls {
+                let ci = self.sd.call_info(ss, id, block, &name, &fields);
+                ss.calls.insert(tid.into(), ci);
+            }
+            if ss.tail.len() != id as usize {
+                return corrupt("step tails out of step with nodes");
+            }
+        }
+        // the new steps, each with the values today's rules give it (an input field a rule
+        // hides is left out)
+        let mut rows: Vec<(StepRow, Vec<(u32, FieldVal)>, Vec<(u32, Vec<u8>)>)> = Vec::with_capacity(found.len());
+        {
+            let ss = &self.active[&si].steps;
+            let all: Vec<usize> = (0..self.rules.rules.len()).collect();
+            let last = RefCell::new(None);
+            for (call, block, failed, out_bytes) in found {
+                let prev = ss.tail[call.node as usize];
+                let row = StepRow { call_node: call.node, result_node: id, prev, tool: call.tool, time_ms, out_bytes, call_block: call.block, result_block: block, failed };
+                let mut fields = call.fields;
+                let mut extra = Vec::new();
+                if !all.is_empty() {
+                    fields.retain(|x| !self.rule_fields.contains(&x.0));
+                    extra = self.rule_values(si, ss, &row, &fields, &all, Some(&self.mem.nodes[mi as usize]), &last)?;
+                }
+                rows.push((row, fields, extra));
+            }
+        }
         let a = self.active.get_mut(&si).unwrap();
         let ss = Arc::make_mut(&mut a.steps);
-        for (tid, block, name, fields) in ex.calls {
-            let ci = self.sd.call_info(ss, id, block, &name, &fields);
-            ss.calls.insert(tid.into(), ci);
-        }
-        if ss.tail.len() != id as usize {
-            return corrupt("step tails out of step with nodes");
-        }
         let mut tail = if parent == NONE { NONE } else { ss.tail[parent as usize] };
-        for (call, block, failed, out_bytes) in found {
-            let prev = ss.tail[call.node as usize];
-            let row = StepRow { call_node: call.node, result_node: id, prev, tool: call.tool, time_ms, out_bytes, call_block: call.block, result_block: block, failed };
-            tail = ss.push(row, &call.fields);
+        for (row, mut fields, extra) in rows {
+            for (f, t) in extra {
+                fields.push((f, FieldVal::Code(ss.intern_value(f, &t))));
+            }
+            tail = ss.push(row, &fields);
         }
         ss.tail.push(tail);
         Ok(())
@@ -1587,6 +1832,7 @@ impl Db {
         let num = man.next_file;
         man.next_file += 1;
         let mut w = SegWriter::create(&self.dir, num, self.opts.frame_size, Codec::plain(self.opts.level), 0, self.seq)?;
+        w.set_rules(self.rules.versions());
         let mut written: Vec<(u32, CorePart)> = Vec::new();
         for &s in &self.mem.touched {
             let a = &self.active[&s];
@@ -1805,6 +2051,8 @@ impl Db {
                 man.next_file += 1;
                 outputs.push(num);
                 w = Some(SegWriter::create(&self.dir, num, self.opts.frame_size, codec.clone(), 1, self.manifest.checkpoint)?);
+                // steps come from `load_steps`, which gives every step today's rule values
+                w.as_mut().unwrap().set_rules(self.rules.versions());
             }
             let core = self.load_core(s)?;
             let ss = self.load_steps(s)?;
@@ -2759,10 +3007,17 @@ impl Db {
     /// and as row ranges of sessions the rest: parts in segments without summaries and
     /// steps not yet flushed. Every step of every session is in exactly one source.
     pub fn step_sources(&self) -> Result<Vec<StepSource>> {
+        self.step_sources_for(None)
+    }
+
+    /// [`Db::step_sources`] for a query that reads store field `field`: a segment whose
+    /// summaries do not hold what queries see of that field (a rule's column the segment
+    /// was written without, or with another version of the rule) gives its steps as rows.
+    pub fn step_sources_for(&self, field: Option<u32>) -> Result<Vec<StepSource>> {
         let mut out = Vec::new();
         for (&num, seg) in &self.segs {
             let live = if self.manifest.dead.iter().any(|(n, _)| *n == num) { Some(self.live_mask(seg)?) } else { None };
-            if seg.cat.stats.is_some() {
+            if seg.cat.stats.is_some() && !field.is_some_and(|f| self.seg_field_stale(seg, f)) {
                 out.push(StepSource::Seg { num, live });
                 continue;
             }

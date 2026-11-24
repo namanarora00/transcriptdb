@@ -150,6 +150,32 @@ pub fn scan_message(b: &[u8]) -> (Vec<RawCall<'_>>, Vec<RawResult<'_>>) {
     (calls, results)
 }
 
+/// The text of the tool result in content block `block` of a message: the string itself,
+/// or the text blocks of a list joined by newlines. `None` when the message has no such
+/// result or the result has no text.
+pub fn result_text(b: &[u8], block: u16) -> Option<String> {
+    let (_, results) = scan_message(b);
+    let c = &results.iter().find(|r| r.block == block)?.content;
+    match b.get(c.start)? {
+        b'"' => Some(crate::text::unescape(json::inner(b, c))),
+        b'[' => {
+            let (els, _) = json::elements(b, c).ok()?;
+            let mut texts: Vec<String> = Vec::new();
+            for el in els.iter().filter(|el| b[el.start] == b'{') {
+                let Ok(ms) = json::members(b, el) else { continue };
+                if !json::find_member(b, &ms, "type").is_some_and(|t| json::inner(b, &t.value) == b"text") {
+                    continue;
+                }
+                if let Some(t) = json::find_member(b, &ms, "text").filter(|m| b[m.value.start] == b'"') {
+                    texts.push(crate::text::unescape(json::inner(b, &t.value)));
+                }
+            }
+            (!texts.is_empty()).then(|| texts.join("\n"))
+        }
+        _ => None,
+    }
+}
+
 /// Milliseconds since the Unix epoch for `YYYY-MM-DDTHH:MM:SS[.fff]Z`, or a plain number
 /// of seconds; 0 when it cannot be read.
 pub fn parse_time_ms(s: &str) -> i64 {
@@ -621,5 +647,9 @@ mod tests {
         assert_eq!(r[0].tool_use_id, b"t1");
         assert!(r[0].is_error);
         assert_eq!(&u[r[0].content.clone()], b"\"ok\"");
+        assert_eq!(result_text(u, 0).as_deref(), Some("ok"));
+        assert_eq!(result_text(u, 1), None);
+        let l = br#"{"content":[{"content":[{"text":"3 failed\n","type":"text"},{"source":{"data":""},"type":"image"},{"text":"done","type":"text"}],"tool_use_id":"t1","type":"tool_result"}],"role":"user"}"#;
+        assert_eq!(result_text(l, 0).as_deref(), Some("3 failed\n\ndone"));
     }
 }

@@ -51,6 +51,8 @@ fn engine_keys(db: &Db, s: u32) -> Result<(HashSet<RefStep>, usize, usize)> {
         let mut fields: Vec<(Vec<u8>, Option<Vec<u8>>)> = ss
             .fields_of(pos as u32)
             .iter()
+            // rule columns are not in the call: the reference has none
+            .filter(|&&(f, _)| db.rules().position(sd.fields.get(f)).is_none())
             .map(|&(f, v)| (sd.fields.get(f).to_vec(), if steps::is_long(v) { None } else { Some(ss.value(f, v).to_vec()) }))
             .collect();
         fields.sort();

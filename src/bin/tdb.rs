@@ -10,6 +10,7 @@
 //!   tdb growth        --store DIR [--rounds 5] [--base 300] [--wake 0.1] [--cache-mb 256] [--flush-mb 64] [--seg-mb 256] [--max-parts 4]
 //!   tdb ceiling       --store DIR [--out DIR]
 //!   tdb screen        --store DIR [--repeat 5]
+//!   tdb rules         --store DIR [--add 'NAME [on TEST] = EXPRESSION'] [--file RULES.txt] [--drop NAME]
 //!   tdb check-search  --store DIR [--patterns 200] [--seed 7] [--fields 5] [--work DIR]
 //!   tdb h2h           --store DIR [--pg ADDR] [--split x] [--sizes-only x]
 //!
@@ -678,6 +679,36 @@ fn head_to_head(a: &Args) {
 /// Screen every session with a fixed set of filters, the way a first pass before a costly
 /// review would: how long each filter takes on one thread and what share of sessions it
 /// passes on.
+/// List a store's column rules, after adding (`--add RULE`, or `--file` with one rule per
+/// line) or dropping (`--drop NAME`) any. A rule added again under the same name replaces it.
+fn rules(a: &Args) {
+    let mut db = Db::open(a.store(), a.opts()).expect("open store");
+    let mut defs: Vec<String> = a.get("add").map(|d| vec![d.to_string()]).unwrap_or_default();
+    if let Some(p) = a.get("file") {
+        let text = std::fs::read_to_string(p).expect("read the rules file");
+        defs.extend(text.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with("//")).map(str::to_string));
+    }
+    for d in &defs {
+        if let Err(e) = db.define_rule(d) {
+            eprintln!("{e}\n  {d}");
+            std::process::exit(2);
+        }
+    }
+    if let Some(n) = a.get("drop")
+        && let Err(e) = db.drop_rule(n)
+    {
+        eprintln!("{e}");
+        std::process::exit(2);
+    }
+    let cover = db.rule_coverage();
+    if db.rules().is_empty() {
+        println!("no rules");
+    }
+    for (r, (have, of)) in db.rules().rules.iter().zip(cover) {
+        println!("{:<20} version {:016x}  stored in {have} of {of} segments  {}", r.name, r.ver, r.def);
+    }
+}
+
 fn screen(a: &Args) {
     let db = Db::open(a.store(), a.opts()).expect("open store");
     let reps = a.num("repeat", 5) as usize;
@@ -1159,6 +1190,7 @@ fn main() {
         "check-queries" => check_queries(&a),
         "check-search" => check_search(&a),
         "screen" => screen(&a),
+        "rules" => rules(&a),
         "h2h" => head_to_head(&a),
         "synth" => synth_store(&a),
         "steps" => steps_summary(&a),

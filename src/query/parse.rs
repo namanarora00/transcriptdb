@@ -694,6 +694,25 @@ pub fn parse(src: &str) -> Result<Query, QError> {
     p.query()
 }
 
+/// A column rule, `[.create column] NAME [on TEST] = EXPRESSION`: its name, test and
+/// expression.
+pub fn parse_rule(src: &str) -> Result<(String, Option<Expr>, Expr), QError> {
+    let shape = || QError::new("a rule reads `.create column NAME [on TEST] = EXPRESSION`");
+    let mut body = src.trim();
+    if let Some(rest) = body.strip_prefix(".create") {
+        body = rest.trim_start().strip_prefix("column").ok_or_else(shape)?;
+    }
+    let mut p = P { t: lex(body)?, i: 0 };
+    let name = p.ident().map_err(|_| shape())?;
+    let on = if p.kw("on") { Some(p.expr()?) } else { None };
+    p.expect(Tok::Assign, "'='").map_err(|_| shape())?;
+    let e = p.expr()?;
+    if *p.peek() != Tok::End {
+        return p.err("unexpected text after the rule");
+    }
+    Ok((name, on, e))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

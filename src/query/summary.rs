@@ -1216,7 +1216,9 @@ pub fn try_run(db: &Db, pre: &Sp, aggs: &[(String, AggFn, Option<Expr>)], by: &[
         return Ok(None);
     }
     let Some(pl) = Plan::new(db, pre, aggs, by, now)? else { return Ok(None) };
-    let sources = db.step_sources().map_err(qe)?;
+    // a segment whose summaries do not hold today's values of a rule's column gives its
+    // steps as rows
+    let sources = db.step_sources_for(pl.field.as_ref().map(|x| x.0)).map_err(qe)?;
     // value ids are group ids when one segment holds every value of the field
     let mut single = None;
     let mut single_dir = None;
