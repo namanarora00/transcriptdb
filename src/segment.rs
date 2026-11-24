@@ -35,7 +35,7 @@ use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-const SEG_MAGIC: &[u8; 8] = b"TDBSEG11";
+const SEG_MAGIC: &[u8; 8] = b"TDBSEG12";
 /// Raw bytes per group block of encoded parts, and per directory block.
 const GROUP: usize = 64 * 1024;
 /// Bloom filter bits per key: about 0.2% false positives.
@@ -99,7 +99,11 @@ pub struct DirEnt {
     pub n_rows: u32,
     pub frame_bytes: u64,
     pub core: PartRef,
+    /// The part's step rows (everything but the text of input values) ...
     pub steps: PartRef,
+    /// ... and the text of its input values, in blocks of their own, so queries that test
+    /// no input value never decompress them.
+    pub vals: PartRef,
 }
 
 /// What every open store keeps in memory about a segment.
@@ -501,8 +505,11 @@ pub fn decode_core(b: &[u8]) -> Result<CorePart> {
 const STEP_COLS: usize = 12;
 
 /// Encode a step part; returns where each value's text starts in the encoding.
-fn encode_steps(p: &StepPart, e: &mut Enc) -> Vec<u32> {
-    let base = e.buf.len();
+/// Encode a step part as its rows (`e`, every column but the values' text, which stays
+/// empty) and the text of its values (`vals`). Returns where each value's text starts in
+/// `vals`, counted from where this part starts there.
+fn encode_steps(p: &StepPart, e: &mut Enc, vals: &mut Enc) -> Vec<u32> {
+    let vbase = vals.buf.len();
     let mut at = Vec::with_capacity(p.values.len());
     let mut c: Vec<Enc> = (0..STEP_COLS).map(|_| Enc::new()).collect();
     c[0].var(p.first as u64);
@@ -510,9 +517,9 @@ fn encode_steps(p: &StepPart, e: &mut Enc) -> Vec<u32> {
     c[0].var(p.rows.len() as u64);
     for (f, v) in &p.values {
         c[1].var(*f as u64);
-        c[2].var(v.len() as u64);
-        at.push(c[2].buf.len() as u32);
-        c[2].raw(v);
+        vals.var(v.len() as u64);
+        at.push((vals.buf.len() - vbase) as u32);
+        vals.raw(v);
     }
     let (mut pc, mut pt) = (0i64, 0i64);
     for (i, (r, fs)) in p.rows.iter().zip(&p.fields).enumerate() {
@@ -540,16 +547,23 @@ fn encode_steps(p: &StepPart, e: &mut Enc) -> Vec<u32> {
             }
         }
     }
-    // the values are column 2: move each position from the column to the whole encoding
-    let starts = put_columns(c, e);
-    let col = (starts[2] - base) as u32;
-    for a in &mut at {
-        *a += col;
-    }
+    put_columns(c, e);
     at
 }
 
-pub fn decode_steps(b: &[u8]) -> Result<StepPart> {
+/// A step part without the text of its values: each value's field only, in order.
+pub struct LightPart {
+    pub first: u32,
+    pub rows: Vec<StepRow>,
+    /// Per row: (field, value index into `value_fields`, or `steps::LONG_BASE + i`).
+    pub fields: Vec<Vec<(u32, u32)>>,
+    pub value_fields: Vec<u32>,
+    pub longs: Vec<(u32, u32)>,
+}
+
+/// [`decode_steps`] without reading the values' text (what queries that test no input value
+/// need: the rows and which fields each step has).
+pub fn decode_steps_light(b: &[u8]) -> Result<LightPart> {
     let mut d = Dec::new(b);
     let mut c = get_columns(&mut d, STEP_COLS)?;
     if !d.done() {
@@ -558,9 +572,69 @@ pub fn decode_steps(b: &[u8]) -> Result<StepPart> {
     let first = c[0].var32()?;
     let nv = c[0].var()? as usize;
     let n = c[0].var()? as usize;
+    let mut value_fields = Vec::with_capacity(nv.min(1 << 20));
+    for _ in 0..nv {
+        value_fields.push(c[1].var32()?);
+    }
+    let mut rows = Vec::with_capacity(n.min(1 << 20));
+    let mut fields = Vec::with_capacity(n.min(1 << 20));
+    let mut longs = Vec::new();
+    let (mut pc, mut pt) = (0i64, 0i64);
+    for i in 0..n {
+        let call_node = u32_from(pc, c[3].var()?)?;
+        pc = call_node as i64;
+        let result_node = u32_from(call_node as i64, c[4].var()?)?;
+        let call_block = c[5].var32()? as u16;
+        let result_block = c[5].var32()? as u16;
+        let pv = c[6].var()?;
+        let prev = if pv == 0 { u32::MAX } else { u32_from(first as i64 + i as i64, zz(-unzz(pv - 1)))? };
+        let tool = c[7].var32()?;
+        let failed = c[7].u8()? != 0;
+        let out_bytes = c[8].var32()?;
+        let time_ms = i64_from(pt, c[9].var()?)?;
+        pt = time_ms;
+        let nf = c[10].var()? as usize;
+        let mut fs = Vec::with_capacity(nf.min(1 << 10));
+        for _ in 0..nf {
+            let f = c[10].var32()?;
+            let v = c[11].var()?;
+            if v == 0 {
+                longs.push((c[11].var32()?, c[11].var32()?));
+                fs.push((f, steps::LONG_BASE + longs.len() as u32 - 1));
+            } else {
+                let v = (v - 1) as u32;
+                if v as usize >= nv {
+                    return corrupt("step names a missing value");
+                }
+                fs.push((f, v));
+            }
+        }
+        rows.push(StepRow { call_node, result_node, prev, tool, time_ms, out_bytes, call_block, result_block, failed });
+        fields.push(fs);
+    }
+    if [0, 1, 3, 4, 5, 6, 7, 8, 9, 10, 11].iter().any(|&k| !c[k].done()) {
+        return corrupt("trailing bytes in a step part");
+    }
+    Ok(LightPart { first, rows, fields, value_fields, longs })
+}
+
+/// A step part from its rows (`b`) and the text of its values (`vals`).
+pub fn decode_steps(b: &[u8], vals: &[u8]) -> Result<StepPart> {
+    let mut d = Dec::new(b);
+    let mut c = get_columns(&mut d, STEP_COLS)?;
+    if !d.done() {
+        return corrupt("trailing bytes in a step part");
+    }
+    let mut vd = Dec::new(vals);
+    let first = c[0].var32()?;
+    let nv = c[0].var()? as usize;
+    let n = c[0].var()? as usize;
     let mut values = Vec::with_capacity(nv.min(1 << 20));
     for _ in 0..nv {
-        values.push((c[1].var32()?, c[2].bytes()?.to_vec()));
+        values.push((c[1].var32()?, vd.bytes()?.to_vec()));
+    }
+    if !vd.done() {
+        return corrupt("trailing bytes in a step part's values");
     }
     let mut rows = Vec::with_capacity(n.min(1 << 20));
     let mut fields = Vec::with_capacity(n.min(1 << 20));
@@ -615,7 +689,7 @@ fn encode_dir(dir: &[DirEnt]) -> Vec<u8> {
             e.var(v as u64);
         }
         e.var(x.frame_bytes);
-        for (b, o, l) in [x.core, x.steps] {
+        for (b, o, l) in [x.core, x.steps, x.vals] {
             b.encode(&mut e);
             e.var(o as u64);
             e.var(l as u64);
@@ -638,7 +712,8 @@ pub fn decode_dir(b: &[u8]) -> Result<Vec<DirEnt>> {
         let frame_bytes = d.var()?;
         let core = (BlockRef::decode(&mut d)?, d.var32()?, d.var32()?);
         let steps = (BlockRef::decode(&mut d)?, d.var32()?, d.var32()?);
-        out.push(DirEnt { session, key, first_node: v[0], n_nodes: v[1], first_req: v[2], n_reqs: v[3], first_row: v[4], n_rows: v[5], frame_bytes, core, steps });
+        let vals = (BlockRef::decode(&mut d)?, d.var32()?, d.var32()?);
+        out.push(DirEnt { session, key, first_node: v[0], n_nodes: v[1], first_req: v[2], n_reqs: v[3], first_row: v[4], n_rows: v[5], frame_bytes, core, steps, vals });
     }
     if !d.done() || out.windows(2).any(|w| (w[0].session, w[0].first_req) >= (w[1].session, w[1].first_req)) {
         return corrupt("bad segment directory");
@@ -747,6 +822,8 @@ pub struct SegWriter {
     core_waiting: Vec<usize>,
     steps_buf: Vec<u8>,
     steps_waiting: Vec<usize>,
+    vals_buf: Vec<u8>,
+    vals_waiting: Vec<usize>,
     pending: Vec<Pending>,
     pending_raw: usize,
     stats: StatsBuilder,
@@ -777,6 +854,8 @@ impl SegWriter {
             core_waiting: Vec::new(),
             steps_buf: Vec::new(),
             steps_waiting: Vec::new(),
+            vals_buf: Vec::new(),
+            vals_waiting: Vec::new(),
             pending: Vec::new(),
             pending_raw: 0,
             stats: StatsBuilder::default(),
@@ -877,21 +956,27 @@ impl SegWriter {
         self.pos + (self.pending_raw / 4) as u64
     }
 
-    fn seal(&mut self, steps: bool) -> Result<()> {
-        let (buf, waiting) = if steps { (std::mem::take(&mut self.steps_buf), std::mem::take(&mut self.steps_waiting)) } else { (std::mem::take(&mut self.core_buf), std::mem::take(&mut self.core_waiting)) };
+    /// Write the waiting group of one kind of block: 0 message metadata and requests, 1 step
+    /// rows, 2 the text of step values.
+    fn seal(&mut self, kind: u8) -> Result<()> {
+        let (buf, waiting) = match kind {
+            0 => (std::mem::take(&mut self.core_buf), std::mem::take(&mut self.core_waiting)),
+            1 => (std::mem::take(&mut self.steps_buf), std::mem::take(&mut self.steps_waiting)),
+            _ => (std::mem::take(&mut self.vals_buf), std::mem::take(&mut self.vals_waiting)),
+        };
         if waiting.is_empty() {
             return Ok(());
         }
         // step blocks of a segment with a dictionary use it too (about 12% smaller)
         let r = match &self.cdict {
-            Some(cd) if steps => write_packed(&mut self.f, &mut self.pos, &frame_compressor(self.codec.level, Some(cd))?.compress(&buf)?, buf.len())?,
+            Some(cd) if kind > 0 => write_packed(&mut self.f, &mut self.pos, &frame_compressor(self.codec.level, Some(cd))?.compress(&buf)?, buf.len())?,
             _ => write_block(&mut self.f, &mut self.pos, &buf, self.codec.block_level)?,
         };
         for i in waiting {
-            if steps {
-                self.dir[i].steps.0 = r;
-            } else {
-                self.dir[i].core.0 = r;
+            match kind {
+                0 => self.dir[i].core.0 = r,
+                1 => self.dir[i].steps.0 = r,
+                _ => self.dir[i].vals.0 = r,
             }
         }
         Ok(())
@@ -910,13 +995,16 @@ impl SegWriter {
         let core_ref = (BlockRef::default(), self.core_buf.len() as u32, e.buf.len() as u32);
         self.core_buf.extend_from_slice(&e.buf);
         self.core_waiting.push(i);
-        let mut e = Enc::new();
-        let value_at = encode_steps(steps, &mut e);
+        let (mut e, mut ve) = (Enc::new(), Enc::new());
+        let value_at = encode_steps(steps, &mut e, &mut ve);
         self.stats.add_part(session, &key, steps, &steps.long_text, &value_at)?;
         self.text.add_part(session, units);
         let steps_ref = (BlockRef::default(), self.steps_buf.len() as u32, e.buf.len() as u32);
         self.steps_buf.extend_from_slice(&e.buf);
         self.steps_waiting.push(i);
+        let vals_ref = (BlockRef::default(), self.vals_buf.len() as u32, ve.buf.len() as u32);
+        self.vals_buf.extend_from_slice(&ve.buf);
+        self.vals_waiting.push(i);
         for r in core.requests.iter() {
             let t = steps::parse_time_ms(&r.time);
             if t > 0 {
@@ -945,12 +1033,16 @@ impl SegWriter {
             frame_bytes,
             core: core_ref,
             steps: steps_ref,
+            vals: vals_ref,
         });
         if self.core_buf.len() >= GROUP {
-            self.seal(false)?;
+            self.seal(0)?;
         }
         if self.steps_buf.len() >= GROUP {
-            self.seal(true)?;
+            self.seal(1)?;
+        }
+        if self.vals_buf.len() >= GROUP {
+            self.seal(2)?;
         }
         Ok(())
     }
@@ -961,12 +1053,14 @@ impl SegWriter {
 
     pub fn finish(mut self, mode: SyncMode) -> Result<SegCat> {
         self.flush_pending()?;
-        self.seal(false)?;
-        self.seal(true)?;
+        self.seal(0)?;
+        self.seal(1)?;
+        self.seal(2)?;
         let stats = std::mem::take(&mut self.stats);
         let (f, pos) = (&mut self.f, &mut self.pos);
         let mut stats_bytes = 0u64;
-        let step_refs: Vec<PartRef> = self.dir.iter().map(|d| d.steps).collect();
+        // the summaries point at values' text: in the value blocks
+        let step_refs: Vec<PartRef> = self.dir.iter().map(|d| d.vals).collect();
         let level = self.codec.block_level;
         let head = stats.finish(&step_refs, &mut |raw| {
             let r = write_block(f, pos, raw, level)?;

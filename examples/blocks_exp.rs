@@ -210,7 +210,7 @@ fn main() {
                 cc.push(core_cols(&p, true));
                 cch.push(core_cols(&p, false));
                 let b = seg.step_block(&d.steps.0).unwrap();
-                let p = decode_steps(&b[d.steps.1 as usize..(d.steps.1 + d.steps.2) as usize]).unwrap();
+                let p = decode_steps(&b[d.steps.1 as usize..(d.steps.1 + d.steps.2) as usize], &seg.step_block(&d.vals.0).unwrap()[d.vals.1 as usize..(d.vals.1 + d.vals.2) as usize]).unwrap();
                 sr.push(steps_rows(&p));
                 sc.push(steps_cols(&p));
             }

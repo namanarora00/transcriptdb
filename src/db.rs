@@ -406,6 +406,9 @@ struct KeyIds {
     of: Vec<Option<(u32, u32)>>,
     sids: HashMap<String, u32>,
     agents: HashMap<String, u32>,
+    /// The names, by id.
+    sid_names: Vec<Arc<str>>,
+    agent_names: Vec<Arc<str>>,
 }
 
 /// Where a search finds text units (see [`Db::text_sources`]).
@@ -683,7 +686,7 @@ fn part_dead(d: &DirEnt, core: &SessionCore) -> Dead {
     let share = |r: &(BlockRef, u32, u32)| r.2 as u64 * r.0.clen as u64 / r.0.rawlen.max(1) as u64;
     let nodes = d.first_node as usize..(d.first_node + d.n_nodes) as usize;
     Dead {
-        bytes: d.frame_bytes + share(&d.core) + share(&d.steps),
+        bytes: d.frame_bytes + share(&d.core) + share(&d.steps) + share(&d.vals),
         requests: d.n_reqs as u64,
         nodes: d.n_nodes as u64,
         steps: d.n_rows as u64,
@@ -1281,9 +1284,72 @@ impl Db {
         if let Some(c) = self.lightc.get(&s) {
             return Ok(c);
         }
-        let ss = self.read_steps(s)?.without_values();
+        let ss = match self.read_light_steps(s)? {
+            Some(ss) => ss,
+            None => self.read_steps(s)?.without_values(),
+        };
         let size = ss.bytes();
         Ok(self.lightc.insert(s, Arc::new(ss), size))
+    }
+
+    /// A session's steps without their input values, read without reading the values:
+    /// what [`Db::read_steps`] then [`SessionSteps::without_values`] give, codes and counts
+    /// included. Only for a session in one part whose segment needs no rule worked out
+    /// (value codes are then each field's values numbered in order); `None` otherwise.
+    fn read_light_steps(&self, s: u32) -> Result<Option<SessionSteps>> {
+        let parts = self.parts(s)?;
+        let [(seg, d)] = &parts[..] else { return Ok(None) };
+        let sr = self.seg_rules(seg);
+        if !sr.todo.is_empty() {
+            return Ok(None);
+        }
+        let dropped = |f: u32| sr.drop.get(f as usize).copied().unwrap_or(false);
+        let raw = self.step_block(seg, &d.steps.0)?;
+        let (a, b) = (d.steps.1 as usize, (d.steps.1 + d.steps.2) as usize);
+        let p = crate::segment::decode_steps_light(raw.get(a..b).ok_or_else(|| bad("step part past its block"))?)?;
+        if p.first != 0 {
+            return corrupt(format!("session {s}: its only step part does not start at its first step"));
+        }
+        let (tools, fields) = &self.seg_codes[&seg.num];
+        let gf = |f: u32| fields.get(f as usize).copied().ok_or_else(|| bad("step names a missing field"));
+        // each value's code: its place among the values of its field (as interning gives)
+        let mut next: HashMap<u32, u32> = HashMap::new();
+        let mut code = Vec::with_capacity(p.value_fields.len());
+        for &f in &p.value_fields {
+            if dropped(f) {
+                code.push(u32::MAX);
+                continue;
+            }
+            let n = next.entry(gf(f)?).or_insert(0);
+            code.push(*n);
+            *n += 1;
+        }
+        let mut ss = SessionSteps::default();
+        let mut fs: Vec<(u32, FieldVal)> = Vec::new();
+        for (mut r, rf) in p.rows.into_iter().zip(p.fields) {
+            r.tool = *tools.get(r.tool as usize).ok_or_else(|| bad("step names a missing tool"))?;
+            fs.clear();
+            for (f, v) in rf {
+                if dropped(f) {
+                    continue;
+                }
+                let val = if steps::is_long(v) {
+                    let (off, len) = p.longs[(v - steps::LONG_BASE) as usize];
+                    FieldVal::Long { off, len }
+                } else {
+                    FieldVal::Code(code[v as usize])
+                };
+                fs.push((gf(f)?, val));
+            }
+            ss.push(r, &fs);
+        }
+        ss.flushed = ss.rows.len() as u32;
+        ss.turns();
+        ss.by_shape();
+        let mut ss = ss.without_values();
+        ss.counts = next.into_iter().collect();
+        ss.counts.sort_unstable();
+        Ok(Some(ss))
     }
 
     /// Decode a session's steps from its parts (with its turns and steps by shape code).
@@ -1300,7 +1366,13 @@ impl Db {
             let dropped = |f: u32| sr.drop.get(f as usize).copied().unwrap_or(false);
             let raw = self.step_block(seg, &d.steps.0)?;
             let (a, b) = (d.steps.1 as usize, (d.steps.1 + d.steps.2) as usize);
-            let p = decode_steps(raw.get(a..b).ok_or_else(|| bad("step part past its block"))?)?;
+            // a part without values has nothing to read in a value block
+            let vraw = if d.vals.2 == 0 { None } else { Some(self.step_block(seg, &d.vals.0)?) };
+            let vals: &[u8] = match &vraw {
+                None => &[],
+                Some(v) => v.get(d.vals.1 as usize..(d.vals.1 + d.vals.2) as usize).ok_or_else(|| bad("step values past their block"))?,
+            };
+            let p = decode_steps(raw.get(a..b).ok_or_else(|| bad("step part past its block"))?, vals)?;
             if p.first as usize != ss.rows.len() {
                 return corrupt(format!("session {s}: step parts do not follow each other"));
             }
@@ -2719,7 +2791,13 @@ impl Db {
                     let core = self.load_core(s)?;
                     let (ns, na) = (g.sids.len() as u32, g.agents.len() as u32);
                     let sid = *g.sids.entry(core.key.0.clone()).or_insert(ns);
+                    if sid == ns {
+                        g.sid_names.push(core.key.0.as_str().into());
+                    }
                     let agent = *g.agents.entry(core.key.1.clone()).or_insert(na);
+                    if agent == na {
+                        g.agent_names.push(core.key.1.as_str().into());
+                    }
                     g.of[s as usize] = Some((sid, agent));
                     (sid, agent)
                 }
@@ -2736,7 +2814,22 @@ impl Db {
 
     /// The session's (session id, agent id). Panics if the session cannot be read.
     pub fn session_key(&self, s: u32) -> (String, String) {
-        self.load_core(s).expect("read session").key.clone()
+        let (a, b) = self.session_names(s).expect("read session");
+        (a.to_string(), b.to_string())
+    }
+
+    /// The session's session id and agent id, kept once looked up (a session's key never
+    /// changes), so asking again does not read the session.
+    pub fn session_names(&self, s: u32) -> Result<(Arc<str>, Arc<str>)> {
+        {
+            let g = self.key_ids.lock().unwrap();
+            if let Some(Some((a, b))) = g.of.get(s as usize) {
+                return Ok((g.sid_names[*a as usize].clone(), g.agent_names[*b as usize].clone()));
+            }
+        }
+        let (a, b) = self.key_ids(&[s])?[0];
+        let g = self.key_ids.lock().unwrap();
+        Ok((g.sid_names[a as usize].clone(), g.agent_names[b as usize].clone()))
     }
 
     pub fn session_len(&self, s: u32) -> u32 {
@@ -3412,6 +3505,9 @@ impl Db {
                 for d in sg.dir_block(k)? {
                     core.insert(d.core.0.off, d.core.0);
                     steps.insert(d.steps.0.off, d.steps.0);
+                    if d.vals.2 > 0 {
+                        steps.insert(d.vals.0.off, d.vals.0);
+                    }
                 }
             }
             for r in core.values() {

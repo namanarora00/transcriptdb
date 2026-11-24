@@ -85,7 +85,7 @@ pub struct PartInfo {
     /// The part's steps in its session.
     pub first_row: u32,
     pub n_rows: u32,
-    /// Where the part's encoded step data is: a segment block and the offset in it.
+    /// Where the text of the part's step values is: a segment block and the offset in it.
     pub steps: (BlockRef, u32),
 }
 

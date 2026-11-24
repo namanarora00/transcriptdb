@@ -62,19 +62,29 @@ pub fn long_value(db: &Db, s: u32, ss: &SessionSteps, pos: u32, v: u32, name: &s
 
 /// The value of one step column.
 pub fn step_value(db: &Db, s: u32, pos: u32, col: &StepCol) -> Result<Value, QError> {
+    let qe = |e: crate::codec::Error| QError::new(e.to_string());
+    // what is not a step's own needs no steps; what is not an input value needs none of them
+    match col {
+        StepCol::Session => return Ok(Value::Str(db.session_names(s).map_err(qe)?.0.as_ref().into())),
+        StepCol::Agent => return Ok(Value::Str(db.session_names(s).map_err(qe)?.1.as_ref().into())),
+        StepCol::Field(_) => {}
+        _ => {
+            let ss = db.light_steps(s).map_err(qe)?;
+            let r = ss.rows[pos as usize];
+            return Ok(match col {
+                StepCol::Tool => Value::Str(String::from_utf8_lossy(db.step_dicts().tools.get(r.tool)).into()),
+                StepCol::Failed => Value::Bool(r.failed),
+                StepCol::Ok => Value::Bool(!r.failed),
+                StepCol::Time => Value::Time(r.time_ms),
+                StepCol::OutBytes => Value::Int(r.out_bytes as i64),
+                _ => Value::Int(pos as i64),
+            });
+        }
+    }
     let ss_arc = db.steps(s);
     let ss = &*ss_arc;
-    let r = ss.rows[pos as usize];
     let sd = db.step_dicts();
     Ok(match col {
-        StepCol::Tool => Value::Str(String::from_utf8_lossy(sd.tools.get(r.tool)).into()),
-        StepCol::Failed => Value::Bool(r.failed),
-        StepCol::Ok => Value::Bool(!r.failed),
-        StepCol::Time => Value::Time(r.time_ms),
-        StepCol::OutBytes => Value::Int(r.out_bytes as i64),
-        StepCol::Step => Value::Int(pos as i64),
-        StepCol::Session => Value::Str(db.session_key(s).0.as_str().into()),
-        StepCol::Agent => Value::Str(db.session_key(s).1.as_str().into()),
         StepCol::Field(name) => {
             let Some(f) = sd.fields.code(name.as_bytes()) else { return Ok(Value::Null) };
             match ss.fields_of(pos).iter().find(|x| x.0 == f) {
@@ -86,6 +96,7 @@ pub fn step_value(db: &Db, s: u32, pos: u32, col: &StepCol) -> Result<Value, QEr
                 Some(&(_, v)) => Value::from_json(ss.value(f, v)),
             }
         }
+        _ => unreachable!("handled above"),
     })
 }
 

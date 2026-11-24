@@ -638,3 +638,48 @@ fn merges_run_while_writes_go_on() {
         let _ = std::fs::remove_dir_all(d);
     }
 }
+
+/// Steps read without their values (the fast way, for sessions in one part) are what reading
+/// every value and then dropping them gives: rows, field codes, value counts, shapes.
+#[test]
+fn light_steps_equal_full_steps_without_values() {
+    let dir = tmpdir("light");
+    let reqs = traffic(91, 12, 40);
+    let mut db = Db::open(&dir, Options { background_merges: false, ..opts(48 << 10) }).unwrap();
+    for (i, q) in reqs.iter().enumerate() {
+        put(&mut db, q);
+        if i % 50 == 0 {
+            db.commit().unwrap();
+            db.flush().unwrap();
+        }
+    }
+    db.commit().unwrap();
+    let same = |db: &Db, stage: &str| {
+        let mut n = 0;
+        for s in 0..db.session_count() as u32 {
+            db.clear_caches();
+            let light = db.light_steps(s).unwrap();
+            db.clear_caches();
+            let full = db.steps(s).without_values();
+            // values per field, as queries ask for them (a session taking writes is not light)
+            let nf = db.step_dicts().fields.len() as u32;
+            let lc: Vec<usize> = (0..nf).map(|f| light.value_count(f)).collect();
+            let fc: Vec<usize> = (0..nf).map(|f| full.value_count(f)).collect();
+            assert_eq!((&light.rows, &light.fstart, &light.fields, &light.longs, &light.shape, lc), (&full.rows, &full.fstart, &full.fields, &full.longs, &full.shape, fc), "{stage}: session {s}");
+            n += light.rows.len();
+        }
+        assert!(n > 0);
+    };
+    same(&db, "many parts");
+    db.compact().unwrap();
+    same(&db, "one part each");
+    // a rule the merged segment was written without, then with
+    db.define_rule(r#"program on tool == "Bash" = extract(command, @"^\s*(\S+)")"#).unwrap();
+    same(&db, "a rule to work out");
+    db.compact().unwrap();
+    same(&db, "a rule stored");
+    db.define_rule(r#"program on tool == "Bash" = extract(command, @"(\S+)\s*$")"#).unwrap();
+    same(&db, "a rule's stored values out of date");
+    drop(db);
+    let _ = std::fs::remove_dir_all(&dir);
+}
