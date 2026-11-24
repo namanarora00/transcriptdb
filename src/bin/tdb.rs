@@ -10,7 +10,8 @@
 //!   tdb growth        --store DIR [--rounds 5] [--base 300] [--wake 0.1] [--cache-mb 256] [--flush-mb 64] [--seg-mb 256] [--max-parts 4]
 //!   tdb ceiling       --store DIR [--out DIR]
 //!   tdb screen        --store DIR [--repeat 5]
-//!   tdb rules         --store DIR [--add 'NAME [on TEST] = EXPRESSION'] [--file RULES.txt] [--drop NAME]
+//!   tdb check-rules   --store DIR --work DIR [--rules 100] [--seed 7] [--batch 10] [--write-time x]
+//!   tdb rules         --store DIR [--add 'NAME [on TEST] = EXPRESSION'] [--file RULES.txt] [--drop NAME] [--benchmark x]
 //!   tdb check-search  --store DIR [--patterns 200] [--seed 7] [--fields 5] [--work DIR]
 //!   tdb h2h           --store DIR [--pg ADDR] [--split x] [--sizes-only x]
 //!
@@ -679,11 +680,43 @@ fn head_to_head(a: &Args) {
 /// Screen every session with a fixed set of filters, the way a first pass before a costly
 /// review would: how long each filter takes on one thread and what share of sessions it
 /// passes on.
+/// Generated column rules give the same answers before and after a merge stores their
+/// values (and, with `--write-time x`, on a store that had them from the start). Works on
+/// a copy of the store under `--work`; prints counts only.
+fn check_rules(a: &Args) {
+    let work = a.get("work").map(PathBuf::from).unwrap_or_else(|| std::env::temp_dir().join(format!("transcriptdb-check-rules-{}", std::process::id())));
+    let t = Instant::now();
+    let rep = match transcriptdb::rule_check::run(&a.store(), &work, &a.opts(), a.num("rules", 100) as usize, a.num("seed", 7), a.num("batch", 10) as usize, a.get("write-time").is_some()) {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&work);
+            eprintln!("check-rules failed: {e}");
+            std::process::exit(1);
+        }
+    };
+    println!("{} generated rules: {} gave steps a value, {} read result text, {} read other rules; {} queries, {} rows compared; {:.1}s", rep.rules, rep.with_values, rep.read_output, rep.read_rules, rep.queries, rep.rows, t.elapsed().as_secs_f64());
+    println!("worked out on read against stored by a merge: {} rules differ", rep.differ);
+    if rep.write_time {
+        println!("stored by a merge against written under the rules from the first request: {} rules differ", rep.differ_write_time);
+    }
+    println!("summaries: {} rules answered from them before a segment held their values; {} not answered from them after the merge", rep.summarized_early, rep.not_summarized);
+    for (r, q, stage) in &rep.first {
+        println!("  DIFF rule {r}, query {q}: {stage}");
+    }
+    if rep.differ + rep.differ_write_time + rep.summarized_early > 0 {
+        std::process::exit(1);
+    }
+}
+
 /// List a store's column rules, after adding (`--add RULE`, or `--file` with one rule per
 /// line) or dropping (`--drop NAME`) any. A rule added again under the same name replaces it.
 fn rules(a: &Args) {
     let mut db = Db::open(a.store(), a.opts()).expect("open store");
     let mut defs: Vec<String> = a.get("add").map(|d| vec![d.to_string()]).unwrap_or_default();
+    // the rules the PostgreSQL comparison's rule queries read
+    if a.get("benchmark").is_some() {
+        defs.extend(transcriptdb::h2h::RULES.iter().map(|r| r.to_string()));
+    }
     if let Some(p) = a.get("file") {
         let text = std::fs::read_to_string(p).expect("read the rules file");
         defs.extend(text.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with("//")).map(str::to_string));
@@ -1191,6 +1224,7 @@ fn main() {
         "check-search" => check_search(&a),
         "screen" => screen(&a),
         "rules" => rules(&a),
+        "check-rules" => check_rules(&a),
         "h2h" => head_to_head(&a),
         "synth" => synth_store(&a),
         "steps" => steps_summary(&a),

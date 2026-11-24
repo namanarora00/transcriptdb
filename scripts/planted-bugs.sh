@@ -56,6 +56,15 @@ BUGS=(
   "regex-either-branch-both-required|src/query/summary.rs|            other => regex_spec(&other).into_iter().collect(),|            other => regex_spec(&other).into_iter().flatten().map(\|w\| vec![w]).collect(),|test:regex_errors_and_step_fields"
   "regex-shortest-spelling-dropped|src/query/relit.rs|                if k >= r.min {|                if k > r.min {|test:phrases_across_pieces_and_shared_session_ids"
   "regex-long-words-not-read|src/query/messages.rs|        or(&mut units, &maybe);|        let _ = &maybe;|test:phrases_across_pieces_and_shared_session_ids"
+  "rule-stale-values-kept|src/db.rs|.map(\|f\| applied(f) != current(f)).collect();|.map(\|_\| false).collect();|rules:rule_values"
+  "rule-not-worked-out-on-read|src/db.rs|                if !sr.todo.is_empty() {|                if false {|rules:rule_values"
+  "rule-summaries-read-early|src/db.rs|if seg.cat.stats.is_some() && !field.is_some_and(\|f\| self.seg_field_stale(seg, f)) {|if seg.cat.stats.is_some() {|rules:rule_values"
+  "rule-stale-version-summarized|src/db.rs|        seg.cat.rules.iter().find(\|r\| r.0 == name).map(\|r\| r.1) != self.rules.position(name).map(\|i\| self.rules.rules[i].ver)|        seg.cat.rules.iter().all(\|r\| r.0 != name) && self.rules.position(name).is_some()|rules:rule_values"
+  "rule-version-ignores-what-it-reads|src/rules.rs|                h.extend_from_slice(&set.rules[d].ver.to_le_bytes());|                let _ = d;|rules:rule_values"
+  "rule-hidden-input-kept|src/db.rs|                    fields.retain(\|x\| !self.rule_fields.contains(&x.0));|                    let _ = &mut fields;|rules:rule_values"
+  "rule-on-test-ignored|src/rules.rs|                Ok(v) if v.truthy() => {}|                Ok(_) => {}|rules:rule_values"
+  "rule-long-input-unread|src/db.rs|                Ok(Some(t)) => Value::from_json(&t),|                Ok(Some(_)) => Value::Null,|rules:rule_values"
+  "rule-result-first-block-only|src/steps.rs|            for el in els.iter().filter(\|el\| b[el.start] == b'{') {|            for el in els.iter().take(1).filter(\|el\| b[el.start] == b'{') {|rules:rule_values"
   "word-suffix-as-inside|src/textindex.rs|if if fit == Fit::Suffix { at + run.len() == end } else { at + run.len() <= end } {|if at + run.len() <= end {|lib:round_trip_and_lookups"
 )
 
@@ -74,6 +83,7 @@ run_check() {
       store || return 0
       "$TDB" check-queries --store "$WORK/rich" --n 200 --eq 400 --agg 0 >"$WORK/out" 2>&1 || return 1 ;;
     test:*) (cd "$COPY" && cargo test --release --quiet --test query "${1#test:}" >"$WORK/out" 2>&1) || return 1 ;;
+    rules:*) (cd "$COPY" && cargo test --release --quiet --test rules "${1#rules:}" >"$WORK/out" 2>&1) || return 1 ;;
     lib:*) (cd "$COPY" && cargo test --release --quiet --lib "${1#lib:}" >"$WORK/out" 2>&1) || return 1 ;;
   esac
   return 0

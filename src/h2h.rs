@@ -285,8 +285,9 @@ pub fn load(db: &Db, pg: &mut Pg) -> R<String> {
          CREATE TABLE pieces (id int, kind smallint, body text, holes int[], elements int[]);
          CREATE TABLE blocks (id int, body text);
          CREATE TABLE steps (session int, step int, turn int, depth int, prev int, call_node int, result_node int,
-                             tool text, failed bool, out_bytes int, time_ms bigint, file_path text, command text);
-         CREATE TABLE path_steps (session int, path int, depth int, step int, tool text, failed bool, file_path text);",
+                             tool text, failed bool, out_bytes int, time_ms bigint, file_path text, command text,
+                             program text, tests_failed int);
+         CREATE TABLE path_steps (session int, path int, depth int, step int, tool text, failed bool, file_path text, tests_failed int);",
     )
     .map_err(pe)?;
     let ns = db.session_count() as u32;
@@ -438,17 +439,25 @@ pub fn load(db: &Db, pg: &mut Pg) -> R<String> {
     let sd = db.step_dicts();
     let mut fields_err = None;
     let mut steps_cache: Vec<(Vec<u32>, Vec<u32>, Vec<Vec<u32>>)> = Vec::with_capacity(ns as usize);
-    let mut fp: Vec<Vec<(Option<Vec<u8>>, Option<Vec<u8>>)>> = Vec::with_capacity(ns as usize);
+    // (file_path, command, program, tests_failed); the last two are the columns of the
+    // rules of those names, taken from the store so both sides hold the same values
+    let rules = has_rule_columns(db);
+    let mut fp: Vec<Vec<[Option<Vec<u8>>; 4]>> = Vec::with_capacity(ns as usize);
     for s in 0..ns {
         steps_cache.push(turn_tree(db, s));
         let mut v = Vec::new();
         for pos in 0..db.steps(s).rows.len() as u32 {
-            let f = plan::step_value(db, s, pos, &plan::StepCol::Field("file_path".into()));
-            let c = plan::step_value(db, s, pos, &plan::StepCol::Field("command".into()));
-            match (f, c) {
-                (Ok(f), Ok(c)) => v.push((text_of(f), text_of(c))),
-                (Err(e), _) | (_, Err(e)) => fields_err = Some(e.to_string()),
+            let mut row: [Option<Vec<u8>>; 4] = Default::default();
+            for (k, name) in ["file_path", "command", "program", "tests_failed"].into_iter().enumerate() {
+                if k >= 2 && !rules {
+                    continue;
+                }
+                match plan::step_value(db, s, pos, &plan::StepCol::Field(name.into())) {
+                    Ok(x) => row[k] = text_of(x),
+                    Err(e) => fields_err = Some(e.to_string()),
+                }
             }
+            v.push(row);
         }
         fp.push(v);
     }
@@ -472,9 +481,9 @@ pub fn load(db: &Db, pg: &mut Pg) -> R<String> {
                 c.field(Some(if r.failed { b"t" } else { b"f" }));
                 c.int(r.out_bytes as i64);
                 c.int(r.time_ms);
-                let (f, cm) = &fp[s as usize][pos];
-                c.field(f.as_deref());
-                c.field(cm.as_deref());
+                for x in &fp[s as usize][pos] {
+                    c.field(x.as_deref());
+                }
                 c.end_row()?;
             }
         }
@@ -501,7 +510,8 @@ pub fn load(db: &Db, pg: &mut Pg) -> R<String> {
                         c.int(pos as i64);
                         c.field(Some(sd.tools.get(r.tool)));
                         c.field(Some(if r.failed { b"t" } else { b"f" }));
-                        c.field(fp[s as usize][pos as usize].0.as_deref());
+                        c.field(fp[s as usize][pos as usize][0].as_deref());
+                        c.field(fp[s as usize][pos as usize][3].as_deref());
                         c.end_row()?;
                         path_rows += 1;
                     }
@@ -557,6 +567,9 @@ pub fn load(db: &Db, pg: &mut Pg) -> R<String> {
          COMMIT;",
     )
     .map_err(pe)?;
+    if rules {
+        pg.exec("CREATE INDEX steps_program ON steps (program); CREATE INDEX steps_tests_failed ON steps (tests_failed)").map_err(pe)?;
+    }
     pg.exec("VACUUM ANALYZE").map_err(pe)?;
     Ok(format!(
         "loaded {} sessions, {} distinct messages ({:.1} MB), {} requests, {} steps, {} path rows in {:.1}s",
@@ -610,6 +623,48 @@ fn turn_seq_sql(cols: &[(&str, &str)], cond: &str) -> String {
         plain.join(", "),
         lags.join(", ")
     )
+}
+
+/// Whether the store has the rules the rule-column queries read ([`rule_queries`]).
+pub fn has_rule_columns(db: &Db) -> bool {
+    db.rules().position(b"program").is_some() && db.rules().position(b"tests_failed").is_some()
+}
+
+/// The rules [`rule_queries`] are about: the program a shell command runs (past a leading
+/// `cd DIR &&` and variable assignments) and the number of failed tests a test run reports.
+pub const RULES: &[&str] = &[
+    r#"program on tool == "Bash" = extract(command, @"^\s*(?:cd\s+(?:""[^""]*""|'[^']*'|\S+)\s*(?:&&|;)\s*)?(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*(\S+)")"#,
+    r#"tests_failed on program in ("cargo", "pytest", "npm", "npx", "pnpm", "yarn", "go", "make", "python", "python3") = toint(extract(output, @"(\d+) failed"))"#,
+];
+
+/// Queries over rule columns, for a store that has [`RULES`].
+pub fn rule_queries() -> Vec<QuerySpec> {
+    vec![
+        QuerySpec {
+            name: "Shell steps per program, top 10",
+            engine: "where isnotnull(program) | summarize n = count() by program | sort by n desc, program asc | take 10".into(),
+            sql: "SELECT program, count(*) AS n FROM steps WHERE program IS NOT NULL GROUP BY program ORDER BY n DESC, program ASC LIMIT 10".into(),
+            sessions: false,
+        },
+        QuerySpec {
+            name: "Failure rate per program (50+ steps)",
+            engine: "where isnotnull(program) | summarize n = count(), f = countif(failed) by program | where n >= 50 | extend rate = f * 1.0 / n | project program, n, f, rate | sort by program asc".into(),
+            sql: "SELECT program, count(*), count(*) FILTER (WHERE failed), (count(*) FILTER (WHERE failed))::float8 / count(*) FROM steps WHERE program IS NOT NULL GROUP BY program HAVING count(*) >= 50 ORDER BY program".into(),
+            sessions: false,
+        },
+        QuerySpec {
+            name: "Test runs with failed tests, per week",
+            engine: "where tests_failed > 0 | summarize n = count(), s = dcount(session) by w = bin(time, 7d) | sort by w asc".into(),
+            sql: "SELECT (s.time_ms / 604800000) * 604800000 AS w, count(*), count(DISTINCT se.sid) FROM steps s JOIN sessions se ON se.id = s.session WHERE s.tests_failed > 0 GROUP BY w ORDER BY w".into(),
+            sessions: false,
+        },
+        QuerySpec {
+            name: "Tests fail, then an edit, then a test run",
+            engine: format!("match a: tests_failed > 0 then b: tool in {EDITS} then c: isnotnull(tests_failed)"),
+            sql: three_step_sql("tests_failed > 0", &format!("tool IN {EDITS_SQL}"), "tests_failed IS NOT NULL", "false"),
+            sessions: true,
+        },
+    ]
 }
 
 pub fn queries() -> Vec<QuerySpec> {
@@ -795,7 +850,8 @@ fn best<T>(reps: usize, mut f: impl FnMut() -> R<T>) -> R<(T, f64)> {
 
 pub fn run_queries(db: &Db, pg: &mut Pg, reps: usize) -> R<Vec<Outcome>> {
     let mut out = Vec::new();
-    for q in queries() {
+    let rule_qs = if has_rule_columns(db) { rule_queries() } else { Vec::new() };
+    for q in queries().into_iter().chain(rule_qs) {
         let run = |threads: usize| query::run(db, &q.engine, threads).map_err(|e| format!("{}: {}", q.name, e.show(&q.engine)));
         let (er, e1) = best(reps, || run(1))?;
         let (_, e8) = best(reps, || run(8))?;
