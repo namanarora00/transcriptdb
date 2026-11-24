@@ -681,31 +681,33 @@ fn head_to_head(a: &Args) {
 fn screen(a: &Args) {
     let db = Db::open(a.store(), a.opts()).expect("open store");
     let reps = a.num("repeat", 5) as usize;
-    let mut filters: Vec<(String, String)> = transcriptdb::h2h::queries().into_iter().filter(|q| q.sessions).map(|q| (q.name.to_string(), q.engine)).collect();
-    for (name, q) in [
-        ("User says it still fails or does not work", r#"messages | where role == "user" and (text contains "still failing" or text contains "not working" or text contains "doesn't work")"#),
-        ("User says revert or undo", r#"messages | where role == "user" and (text has "revert" or text has "undo")"#),
-        ("User says wrong", r#"messages | where role == "user" and text has "wrong""#),
-        ("Assistant says you're right or apologizes", r#"messages | where role == "assistant" and (text contains "you're right" or text contains "i apologize")"#),
-        ("Assistant names a root cause", r#"messages | where role == "assistant" and text contains "root cause""#),
-        ("Assistant tries a different approach", r#"messages | where role == "assistant" and text contains "different approach""#),
-        ("Text with TODO", r#"messages | where text contains_cs "TODO""#),
-        ("Command forces a push or removes a tree", r#"where command contains "push --force" or command contains "rm -rf""#),
+    // (name, query, grouped): a grouped filter ends in `summarize ... by session | sort`,
+    // which lets a test on one input field be answered from the step summaries
+    let mut filters: Vec<(String, String, bool)> = transcriptdb::h2h::queries().into_iter().filter(|q| q.sessions).map(|q| (q.name.to_string(), q.engine, false)).collect();
+    for (name, q, grouped) in [
+        ("User says it still fails or does not work", r#"messages | where role == "user" and (text contains "still failing" or text contains "not working" or text contains "doesn't work")"#, false),
+        ("User says revert or undo", r#"messages | where role == "user" and (text has "revert" or text has "undo")"#, false),
+        ("User says wrong", r#"messages | where role == "user" and text has "wrong""#, false),
+        ("Assistant says you're right or apologizes", r#"messages | where role == "assistant" and (text contains "you're right" or text contains "i apologize")"#, false),
+        ("Assistant names a root cause", r#"messages | where role == "assistant" and text contains "root cause""#, false),
+        ("Assistant tries a different approach", r#"messages | where role == "assistant" and text contains "different approach""#, false),
+        ("Text with TODO", r#"messages | where text contains_cs "TODO""#, false),
+        ("Text like N tests failed (regex)", r#"messages | where text matches regex "[0-9]+ tests? failed""#, false),
+        ("Command forces a push", r#"where command contains "push --force" | summarize n = count() by session | sort by session asc"#, true),
+        ("Command removes a tree", r#"where command contains "rm -rf" | summarize n = count() by session | sort by session asc"#, true),
     ] {
-        filters.push((name.to_string(), q.to_string()));
+        filters.push((name.to_string(), q.to_string(), grouped));
     }
     let all: Vec<u32> = (0..db.session_count() as u32).collect();
     let ids = db.key_ids(&all).expect("read sessions");
+    let by_text: std::collections::HashMap<String, u32> = all.iter().map(|&s| (db.session_key(s).0, ids[s as usize].0)).collect();
     let total: std::collections::HashSet<u32> = ids.iter().map(|x| x.0).collect();
-    let mut flagged: std::collections::HashSet<String> = Default::default();
+    let mut flagged: std::collections::HashSet<u32> = Default::default();
     let mut sum_ms = 0.0;
     println!("{:<52} {:>10} {:>9} {:>7}", "filter (one thread)", "ms", "sessions", "share");
-    for (name, q) in &filters {
-        // a filter passes sessions on: grouped by session id, which also lets a filter on
-        // one input field be answered from the step summaries
-        let q = &format!("{q} | summarize n = count() by session");
+    for (name, q, grouped) in &filters {
         let mut best = f64::MAX;
-        let mut hit: std::collections::HashSet<String> = Default::default();
+        let mut hit: std::collections::HashSet<u32> = Default::default();
         for _ in 0..reps.max(1) {
             let t = Instant::now();
             let run = match transcriptdb::query::run(&db, q, 1) {
@@ -716,19 +718,18 @@ fn screen(a: &Args) {
                 }
             };
             best = best.min(t.elapsed().as_secs_f64() * 1e3);
-            hit = run.table.rows.iter().map(|r| r.vals[0].to_string()).collect();
+            hit = if *grouped { run.table.rows.iter().filter_map(|r| by_text.get(&r.vals[0].to_string()).copied()).collect() } else { run.table.rows.iter().map(|r| ids[r.session as usize].0).collect() };
         }
         sum_ms += best;
         println!("{:<52} {:>10.3} {:>9} {:>6.1}%", name, best, hit.len(), 100.0 * hit.len() as f64 / total.len().max(1) as f64);
         flagged.extend(hit);
     }
     println!(
-        "{} filters over {} sessions ({} requests): {:.1} ms in all on one thread, {:.0} session checks a second; {:.1}% of sessions pass at least one filter",
+        "{} filters over {} sessions ({} requests): {:.1} ms in all on one thread; {:.1}% of sessions pass at least one filter",
         filters.len(),
         total.len(),
         db.request_count(),
         sum_ms,
-        filters.len() as f64 * total.len() as f64 / (sum_ms / 1e3),
         100.0 * flagged.len() as f64 / total.len().max(1) as f64
     );
 }
