@@ -65,6 +65,16 @@ BUGS=(
   "rule-on-test-ignored|src/rules.rs|                Ok(v) if v.truthy() => {}|                Ok(_) => {}|rules:rule_values"
   "rule-long-input-unread|src/db.rs|                Ok(Some(t)) => Value::from_json(&t),|                Ok(Some(_)) => Value::Null,|rules:rule_values"
   "rule-result-first-block-only|src/steps.rs|            for el in els.iter().filter(\|el\| b[el.start] == b'{') {|            for el in els.iter().take(1).filter(\|el\| b[el.start] == b'{') {|rules:rule_values"
+  "flush-marks-later-writes-flushed|src/db.rs|            core.flushed_nodes = w.nodes;|            core.flushed_nodes = core.nodes.len() as u32;|store:flushes_run_while_writes_go_on"
+  "frozen-requests-not-found|src/db.rs|        self.mem.req_ix.get(id).or_else(\|\| self.frozen.as_ref().and_then(\|f\| f.req_ix.get(id))).copied()|        self.mem.req_ix.get(id).copied()|store:flushes_run_while_writes_go_on"
+  "merge-forgets-unflushed-sessions|src/db.rs|            self.reread_flushed(s)?;|            let _ = s;|store:flushes_run_while_writes_go_on"
+  "idle-session-dropped-unflushed|src/db.rs|a.last + self.opts.idle_flushes <= self.flushes && a.flushed()|a.last + self.opts.idle_flushes <= self.flushes|store:flushes_run_while_writes_go_on"
+  "light-steps-codes-all-zero|src/db.rs|            code.push(*n);|            code.push(0);|store:light_steps_equal_full_steps_without_values"
+  "pool-evicts-busiest-first|src/cache.rs|        order.sort_by_key(\|x\| x.0);|        order.sort_by_key(\|x\| std::cmp::Reverse(x.0));|lib:a_pool_gives_memory_to_the_cache_in_use"
+  "session-names-swapped|src/db.rs|                return Ok((g.sid_names[*a as usize].clone(), g.agent_names[*b as usize].clone()));|                return Ok((g.agent_names[*b as usize].clone(), g.sid_names[*a as usize].clone()));|test:phrases_across_pieces_and_shared_session_ids"
+  "step-values-read-from-block-start|src/db.rs|                Some(v) => v.get(d.vals.1 as usize..(d.vals.1 + d.vals.2) as usize)|                Some(v) => v.get(0..d.vals.2 as usize)|store:steps_match_the_reference_and_survive_reopen_and_compact"
+  "node-map-kept-after-wake|src/db.rs|        self.nodemaps.remove(&s);|        let _ = &self.nodemaps;|test:text_search_after_a_session_wakes"
+  "merge-files-replaced-while-merging|src/db.rs|                return self.merge_start(inputs, fold, reclaim);|                self.merge(inputs, fold, false)?; continue;|store:merges_run_while_writes_go_on"
   "word-suffix-as-inside|src/textindex.rs|if if fit == Fit::Suffix { at + run.len() == end } else { at + run.len() <= end } {|if at + run.len() <= end {|lib:round_trip_and_lookups"
 )
 
@@ -84,6 +94,7 @@ run_check() {
       "$TDB" check-queries --store "$WORK/rich" --n 200 --eq 400 --agg 0 >"$WORK/out" 2>&1 || return 1 ;;
     test:*) (cd "$COPY" && cargo test --release --quiet --test query "${1#test:}" >"$WORK/out" 2>&1) || return 1 ;;
     rules:*) (cd "$COPY" && cargo test --release --quiet --test rules "${1#rules:}" >"$WORK/out" 2>&1) || return 1 ;;
+    store:*) (cd "$COPY" && cargo test --release --quiet --test store "${1#store:}" >"$WORK/out" 2>&1) || return 1 ;;
     lib:*) (cd "$COPY" && cargo test --release --quiet --lib "${1#lib:}" >"$WORK/out" 2>&1) || return 1 ;;
   esac
   return 0

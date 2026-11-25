@@ -683,3 +683,72 @@ fn light_steps_equal_full_steps_without_values() {
     drop(db);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Flushes run on their own thread while writes go on: the frozen buffer stays readable,
+/// merges put in place while newer writes sit in memory keep them, closing the store in the
+/// middle of a flush loses nothing, and the end state is the one flushes done on the spot
+/// give.
+#[test]
+fn flushes_run_while_writes_go_on() {
+    let reqs = traffic(83, 16, 40);
+    let small = |background: bool| Options { flush_bytes: 24 << 10, sync: SyncMode::Os, merge_at: 2, seg_bytes: 96 << 10, idle_flushes: 1, cache_bytes: 512 << 10, max_parts: 3, background_flush: background, ..Options::default() };
+    let seg_files = |dir: &std::path::Path| std::fs::read_dir(dir).unwrap().filter(|e| e.as_ref().unwrap().file_name().to_string_lossy().starts_with("seg-")).count();
+
+    let da = tmpdir("bgflush");
+    let mut a = Db::open(&da, small(true)).unwrap();
+    let (mut seen_flushing, mut checked_flushing) = (0, 0);
+    for (i, q) in reqs.iter().enumerate() {
+        put(&mut a, q);
+        a.commit().unwrap();
+        if a.flushing() {
+            seen_flushing += 1;
+            // the buffer being flushed is read like any unflushed data
+            if seen_flushing % 7 == 0 {
+                check_all(&a, &reqs[..=i]);
+                checked_flushing += 1;
+            }
+        }
+    }
+    assert!(checked_flushing > 3, "only {checked_flushing} checks while a flush was at work");
+    assert!(a.merge_stats.merges > 0);
+    check_all(&a, &reqs);
+    a.settle().unwrap();
+    assert!(!a.flushing() && !a.merging());
+    assert_eq!(seg_files(&da), a.segment_count(), "a segment file is not in the manifest");
+    check_all(&a, &reqs);
+
+    let dbd = tmpdir("fgflush");
+    let mut b = Db::open(&dbd, small(false)).unwrap();
+    for q in &reqs {
+        put(&mut b, q);
+        b.commit().unwrap();
+        assert!(!b.flushing());
+    }
+    b.settle().unwrap();
+    let by_key = |db: &Db| -> std::collections::BTreeMap<(String, String), Vec<transcriptdb::steps::StepRow>> { (0..db.session_count() as u32).map(|s| (db.session_key(s), db.steps(s).rows.clone())).collect() };
+    assert_eq!(by_key(&a), by_key(&b));
+    drop((a, b));
+
+    // closed while a flush is at work, more than once
+    let dc = tmpdir("dropflush");
+    let mut c = Db::open(&dc, small(true)).unwrap();
+    let mut closed = 0;
+    for (i, q) in reqs.iter().enumerate() {
+        put(&mut c, q);
+        c.commit().unwrap();
+        if c.flushing() && i % 5 == 0 && closed < 6 {
+            closed += 1;
+            drop(c);
+            c = Db::open(&dc, small(true)).unwrap();
+            assert_eq!(seg_files(&dc), c.segment_count(), "a file of the unfinished flush was left behind");
+            check_all(&c, &reqs[..=i]);
+        }
+    }
+    assert!(closed > 0);
+    c.settle().unwrap();
+    check_all(&c, &reqs);
+    drop(c);
+    for d in [da, dbd, dc] {
+        let _ = std::fs::remove_dir_all(d);
+    }
+}

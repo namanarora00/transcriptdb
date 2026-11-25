@@ -525,3 +525,31 @@ fn regex_errors_and_step_fields() {
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_dir_all(tmpdir("rxerr"));
 }
+
+/// A session whose text was searched, then took new messages and left memory again: a
+/// search finds text in the new messages (nothing kept from the first search hides them).
+#[test]
+fn text_search_after_a_session_wakes() {
+    let dir = tmpdir("wake");
+    let o = Options { idle_flushes: 1, ..opts() };
+    let mut db = Db::open(&dir, o).unwrap();
+    let first = r#"{"role":"user","content":"the first message says needle one here"}"#.to_string();
+    let reply = r#"{"role":"assistant","content":"a reply in between"}"#.to_string();
+    let second = r#"{"role":"user","content":"and the second message says needle two there"}"#.to_string();
+    let put = |db: &mut Db, k: usize, msgs: &[String]| {
+        let b = body(msgs);
+        db.put(&Put { session: "w", agent: "", id: &format!("r{k}"), time: &format!("{}", 1_700_000_000 + k), meta: b"", body: b.as_bytes() }).unwrap();
+        db.commit().unwrap();
+    };
+    let count = |db: &Db, q: &str| -> usize { query::run(db, q, 1).unwrap_or_else(|e| panic!("{}", e.show(q))).table.rows.len() };
+    put(&mut db, 0, std::slice::from_ref(&first));
+    db.flush().unwrap();
+    assert_eq!(count(&db, r#"messages | where text contains "needle one""#), 1);
+    put(&mut db, 1, &[first.clone(), reply, second]);
+    db.flush().unwrap();
+    db.flush().unwrap();
+    assert_eq!(count(&db, r#"messages | where text contains "needle two""#), 1);
+    assert_eq!(count(&db, r#"messages | where text contains "needle""#), 2);
+    drop(db);
+    let _ = std::fs::remove_dir_all(&dir);
+}
