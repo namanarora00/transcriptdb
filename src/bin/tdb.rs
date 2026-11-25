@@ -527,6 +527,13 @@ fn bench(a: &Args) {
         })
         .collect();
     let sessions: Vec<u32> = (0..n.min(db.session_count())).map(|_| r.below(db.session_count() as u64) as u32).collect();
+    // --cold x: the store's caches emptied before every read (the OS file cache stays warm)
+    let cold = a.get("cold").is_some();
+    let prep = || {
+        if cold {
+            db.clear_caches();
+        }
+    };
     for pass in 0..2 {
         let (mut t1, mut t2, mut t3) = (Vec::new(), Vec::new(), Vec::new());
         let (mut reads, mut bytes) = (Vec::new(), 0u64);
@@ -534,6 +541,7 @@ fn bench(a: &Args) {
         for &ri in &pick {
             out.clear();
             let mut st = ReadStats::default();
+            prep();
             let t = Instant::now();
             db.rebuild_into(ri, &mut out, &mut st).unwrap();
             t1.push(t.elapsed().as_secs_f64() * 1e3);
@@ -542,17 +550,19 @@ fn bench(a: &Args) {
         }
         for &(ri, s, k) in &ranges {
             let path = db.request_path(ri).unwrap();
+            prep();
             let t = Instant::now();
             db.read_messages(s, &path[k..k + 40], &mut ReadStats::default()).unwrap();
             t2.push(t.elapsed().as_secs_f64() * 1e3);
         }
         for &s in &sessions {
+            prep();
             let t = Instant::now();
             db.replay(s, &mut ReadStats::default()).unwrap();
             t3.push(t.elapsed().as_secs_f64() * 1e3);
         }
         if pass == 1 {
-            println!("reads with a warm OS cache, {} samples each (pass 2 of 2):", n);
+            println!("reads with a warm OS cache{}, {} samples each (pass 2 of 2):", if cold { " and the store's caches emptied before each read" } else { "" }, n);
             println!(
                 "  rebuild one request       median {:.3} ms  p95 {:.3}  p99 {:.3}   (mean request {:.0} KB; disk reads per rebuild median {:.0}, p99 {:.0})",
                 q(&mut t1.clone(), 0.5),
