@@ -572,6 +572,8 @@ impl crate::rules::StepView for RuleView<'_> {
 }
 
 pub struct Db {
+    /// The byte budget all the caches below share.
+    pool: Arc<crate::cache::Pool>,
     dir: PathBuf,
     /// Held with an exclusive lock while the store is open.
     _lock: fs::File,
@@ -595,6 +597,8 @@ pub struct Db {
     /// Index blocks by (run, kind, index).
     ix: Cache<(u32, u8, u32), IxBlock>,
     cores: Cache<u32, SessionCore>,
+    /// Session tables without their requests (see [`Db::load_node_map`]).
+    nodemaps: Cache<u32, SessionCore>,
     stepc: Cache<u32, SessionSteps>,
     /// Sessions' steps without their input values, for queries that read none.
     lightc: Cache<u32, SessionSteps>,
@@ -633,6 +637,11 @@ pub struct Db {
     /// session's parts reads them for every session, and a cache small next to the store
     /// would decode them over and over. About 250 bytes per part.
     dir_res: Mutex<HashMap<(u32, u32), Arc<Vec<DirEnt>>>>,
+    /// Each segment's text index head (its word list and per-unit tables), decoded once and
+    /// kept until the segment goes, for the same reason: every text query reads every head,
+    /// and one bigger than its share of the cache would be decoded for every query. About
+    /// 30 bytes per text unit.
+    head_res: Mutex<HashMap<u32, Arc<crate::textindex::TextHead>>>,
     /// A number for each session id and each agent name seen so far, by stored session.
     key_ids: Mutex<KeyIds>,
     active: HashMap<u32, Active>,
@@ -746,7 +755,10 @@ impl Drop for Db {
 impl Db {
     /// A store's state with nothing loaded yet.
     fn blank(dir: PathBuf, lock: fs::File, opts: Options, manifest: Manifest, wal: Option<WalWriter>, cb: usize) -> Db {
+        // one budget shared by every cache: memory goes to what is being read now
+        let pool = crate::cache::Pool::new(cb);
         Db {
+            pool: pool.clone(),
             dir,
             _lock: lock,
             manifest,
@@ -757,26 +769,28 @@ impl Db {
             seg_rules: Mutex::new(HashMap::new()),
             runs: Vec::new(),
             blob_files: BTreeMap::new(),
-            dirs: Cache::sharded(cb / 32, 16),
-            blocks: Cache::sharded(cb / 8, 16),
-            ix: Cache::sharded(cb / 16, 16),
-            cores: Cache::new(cb * 3 / 16),
-            stepc: Cache::new(cb / 8),
-            lightc: Cache::new(cb / 16),
-            fieldc: Cache::new(cb / 16),
-            msgtextc: Cache::new(cb / 64),
-            texthead: Cache::new(cb / 32),
-            textpost: Cache::sharded(cb / 32, 16),
-            unitc: Cache::sharded(cb / 32, 4),
-            piecec: Cache::sharded(cb / 32, 4),
-            textc: Cache::sharded(cb / 32, 16),
-            pieces: Cache::sharded(cb / 32, 16),
+            dirs: Cache::pooled(&pool, 16),
+            blocks: Cache::pooled(&pool, 16),
+            ix: Cache::pooled(&pool, 16),
+            cores: Cache::pooled(&pool, 1),
+            nodemaps: Cache::pooled(&pool, 4),
+            stepc: Cache::pooled(&pool, 1),
+            lightc: Cache::pooled(&pool, 1),
+            fieldc: Cache::pooled(&pool, 1),
+            msgtextc: Cache::pooled(&pool, 1),
+            texthead: Cache::pooled(&pool, 1),
+            textpost: Cache::pooled(&pool, 16),
+            unitc: Cache::pooled(&pool, 4),
+            piecec: Cache::pooled(&pool, 4),
+            textc: Cache::pooled(&pool, 16),
+            pieces: Cache::pooled(&pool, 16),
             piece_bases: HashMap::new(),
-            skels: Cache::sharded(cb / 32, 16),
-            statc: Cache::new(cb / 12),
-            longc: Cache::sharded(cb / 32, 16),
+            skels: Cache::pooled(&pool, 16),
+            statc: Cache::pooled(&pool, 1),
+            longc: Cache::pooled(&pool, 16),
             live_masks: Mutex::new(HashMap::new()),
             dir_res: Mutex::new(HashMap::new()),
+            head_res: Mutex::new(HashMap::new()),
             key_ids: Mutex::new(KeyIds::default()),
             active: HashMap::new(),
             busy: BTreeSet::new(),
@@ -1075,6 +1089,11 @@ impl Db {
         Ok(d)
     }
 
+    /// (bytes held by all caches, their shared budget)
+    pub fn cache_use(&self) -> (usize, usize) {
+        (self.pool.used(), self.pool.limit())
+    }
+
     /// Bytes the decoded directory blocks take, roughly.
     pub fn directory_bytes(&self) -> usize {
         self.dir_res.lock().unwrap().values().flat_map(|d| d.iter()).map(|x| 160 + x.key.0.len() + x.key.1.len()).sum()
@@ -1241,6 +1260,31 @@ impl Db {
         if let Some(c) = self.cores.get(&s) {
             return Ok(c);
         }
+        let core = self.read_core(s, true)?;
+        let size = core.bytes();
+        Ok(self.cores.insert(s, Arc::new(core), size))
+    }
+
+    /// A session's message table without its requests: where each message is, all reading
+    /// message text needs. A long session's requests are most of its table, so many more of
+    /// these fit the cache than whole tables when a search reads text from many sessions.
+    fn load_node_map(&self, s: u32) -> Result<Arc<SessionCore>> {
+        if let Some(a) = self.active.get(&s) {
+            return Ok(a.core.clone());
+        }
+        if let Some(c) = self.cores.get(&s) {
+            return Ok(c);
+        }
+        if let Some(c) = self.nodemaps.get(&s) {
+            return Ok(c);
+        }
+        let core = self.read_core(s, false)?;
+        let size = core.bytes();
+        Ok(self.nodemaps.insert(s, Arc::new(core), size))
+    }
+
+    /// A session's table decoded from its parts (`requests`: with the request records).
+    fn read_core(&self, s: u32, requests: bool) -> Result<SessionCore> {
         let parts = self.parts(s)?;
         let Some(first) = parts.first() else { return Err(Error::BadRequest(format!("no session {s}"))) };
         let mut core = SessionCore { key: first.1.key.clone(), ..SessionCore::default() };
@@ -1248,7 +1292,7 @@ impl Db {
             let raw = self.block(seg, &d.core.0)?;
             let (a, b) = (d.core.1 as usize, (d.core.1 + d.core.2) as usize);
             let p = decode_core(raw.get(a..b).ok_or_else(|| bad("session part past its block"))?)?;
-            if p.first_node as usize != core.nodes.len() || p.first_req as usize != core.requests.len() {
+            if p.first_node as usize != core.nodes.len() || (requests && p.first_req as usize != core.requests.len()) {
                 return corrupt(format!("session {s}: parts do not follow each other"));
             }
             let chunk = core.chunks.len() as u32;
@@ -1259,15 +1303,23 @@ impl Db {
                 let slot = core.nodes.get_mut(n.id as usize).ok_or_else(|| bad(format!("session {s}: node {} outside its part", n.id)))?;
                 *slot = NodeMeta { parent: n.parent, len: n.len, loc: Loc::Seg { chunk, off: n.off }, holes: if n.holes.is_empty() { None } else { Some(n.holes.into_boxed_slice()) } };
             }
-            core.requests.extend(p.requests);
+            if requests {
+                core.requests.extend(p.requests);
+            } else if p.first_req as usize != core.flushed_reqs as usize {
+                return corrupt(format!("session {s}: parts do not follow each other"));
+            } else {
+                // only the count, so the next part's check holds
+                core.flushed_reqs += p.requests.len() as u32;
+            }
         }
         if core.nodes.iter().any(|n| matches!(n.loc, Loc::Mem(u32::MAX))) {
             return corrupt(format!("session {s} is missing nodes"));
         }
         core.flushed_nodes = core.nodes.len() as u32;
-        core.flushed_reqs = core.requests.len() as u32;
-        let size = core.bytes();
-        Ok(self.cores.insert(s, Arc::new(core), size))
+        if requests {
+            core.flushed_reqs = core.requests.len() as u32;
+        }
+        Ok(core)
     }
 
     fn load_steps(&self, s: u32) -> Result<Arc<SessionSteps>> {
@@ -1430,6 +1482,7 @@ impl Db {
         let core = self.load_core(s)?;
         let steps = self.load_steps(s)?;
         self.cores.remove(&s);
+        self.nodemaps.remove(&s);
         self.stepc.remove(&s);
         self.lightc.remove(&s);
         self.fieldc.remove(&s);
@@ -2377,7 +2430,7 @@ impl Db {
             return corrupt("merge with unflushed sessions");
         }
         self.key_ix.clear();
-        for c in [&self.cores as &dyn Clear, &self.stepc, &self.lightc, &self.fieldc, &self.dirs, &self.blocks, &self.statc, &self.longc, &self.textc, &self.msgtextc] {
+        for c in [&self.cores as &dyn Clear, &self.nodemaps, &self.stepc, &self.lightc, &self.fieldc, &self.dirs, &self.blocks, &self.statc, &self.longc, &self.textc, &self.msgtextc] {
             c.clear_all();
         }
         let mut bytes_out = 0;
@@ -2389,6 +2442,7 @@ impl Db {
         for n in &inputs {
             self.segs.remove(n);
             self.dir_res.lock().unwrap().retain(|k, _| k.0 != *n);
+            self.head_res.lock().unwrap().remove(n);
             self.seg_codes.remove(n);
             let p = seg_path(&self.dir, *n);
             crate::block::forget(&p);
@@ -2856,7 +2910,7 @@ impl Db {
 
     /// Read some messages of a session (node ids), with opaque values put back.
     pub fn read_messages(&self, s: u32, ids: &[u32], st: &mut ReadStats) -> Result<Vec<Vec<u8>>> {
-        let core = self.load_core(s)?;
+        let core = self.load_node_map(s)?;
         let mut buf = Vec::new();
         let mut spans = Vec::new();
         self.read_nodes(&core, ids, &mut buf, &mut spans, st)?;
@@ -3059,15 +3113,20 @@ impl Db {
 
     /// A segment's word index over message text: its units and word list.
     pub fn text_head(&self, num: u32) -> Result<Arc<crate::textindex::TextHead>> {
-        if let Some(h) = self.texthead.get(&num) {
-            return Ok(h);
+        if let Some(h) = self.head_res.lock().unwrap().get(&num) {
+            return Ok(h.clone());
         }
         let seg = self.segs.get(&num).ok_or_else(|| bad(format!("segment {num} is gone")))?;
         let Some(r) = &seg.cat.text else { return Err(bad(format!("segment {num} has no text index"))) };
         let dir = crate::textindex::decode_dir(&seg.block(r)?)?;
-        let h = crate::textindex::TextHead::decode(&dir, &seg.block(&dir.units)?, &seg.block(&dir.words)?)?;
-        let size = h.bytes();
-        Ok(self.texthead.insert(num, Arc::new(h), size))
+        let h = Arc::new(crate::textindex::TextHead::decode(&dir, &seg.block(&dir.units)?, &seg.block(&dir.words)?)?);
+        self.head_res.lock().unwrap().insert(num, h.clone());
+        Ok(h)
+    }
+
+    /// Bytes the decoded text index heads take, roughly.
+    pub fn text_head_bytes(&self) -> usize {
+        self.head_res.lock().unwrap().values().map(|h| h.bytes()).sum()
     }
 
     /// Add the units holding word `word` of a segment's index to `out`.
@@ -3607,10 +3666,11 @@ impl Db {
 
     /// Drop everything read from files from the caches (sessions taking writes stay).
     pub fn clear_caches(&self) {
-        for c in [&self.cores as &dyn Clear, &self.stepc, &self.lightc, &self.dirs, &self.blocks, &self.ix, &self.pieces, &self.skels, &self.statc, &self.longc, &self.fieldc, &self.textc, &self.msgtextc, &self.texthead, &self.textpost, &self.unitc, &self.piecec] {
+        for c in [&self.cores as &dyn Clear, &self.nodemaps, &self.stepc, &self.lightc, &self.dirs, &self.blocks, &self.ix, &self.pieces, &self.skels, &self.statc, &self.longc, &self.fieldc, &self.textc, &self.msgtextc, &self.texthead, &self.textpost, &self.unitc, &self.piecec] {
             c.clear_all();
         }
         self.dir_res.lock().unwrap().clear();
+        self.head_res.lock().unwrap().clear();
     }
 
     pub fn dir(&self) -> &Path {
@@ -3627,7 +3687,7 @@ trait Clear {
     fn clear_all(&self);
 }
 
-impl<K: std::hash::Hash + Eq + Clone, V> Clear for Cache<K, V> {
+impl<K: std::hash::Hash + Eq + Clone + Send + 'static, V: Send + Sync + 'static> Clear for Cache<K, V> {
     fn clear_all(&self) {
         self.clear();
     }

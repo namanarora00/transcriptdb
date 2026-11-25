@@ -17,7 +17,7 @@
 //!   tdb h2h           --store DIR [--pg ADDR] [--split x] [--sizes-only x]
 //!
 //! Writing commands take --merge-level 19 --dict-kb 1024 --dict-content-kb 8192 --zstd-threads N
-//! --cold-days 7 --cold-mb 4 (full-size merges and compact: zstd level, trained dictionary
+//! --cold-days 7 --cold-mb 4 (or --cold-kb N) (full-size merges and compact: zstd level, trained dictionary
 //! size, messages added to the dictionary, compression threads, how much older than the
 //! newest request a session's last one must be for it to be cold, and its runs' size;
 //! --cold-mb 0 keeps every session in 64 KB frames).
@@ -100,7 +100,10 @@ impl Args {
             dict_bytes: (self.num("dict-kb", (Options::default().dict_bytes >> 10) as u64) as usize) << 10,
             dict_content: (self.num("dict-content-kb", (Options::default().dict_content >> 10) as u64) as usize) << 10,
             cold_after_ms: self.num("cold-days", (Options::default().cold_after_ms / 86_400_000) as u64) as i64 * 86_400_000,
-            cold_run: (self.num("cold-mb", (Options::default().cold_run >> 20) as u64) as usize) << 20,
+            cold_run: match self.get("cold-kb") {
+                Some(_) => (self.num("cold-kb", 0) as usize) << 10,
+                None => (self.num("cold-mb", (Options::default().cold_run >> 20) as u64) as usize) << 20,
+            },
             threads: self.num("zstd-threads", Options::default().threads as u64) as usize,
             frame_size: (self.num("frame-kb", 64) as usize) << 10,
             keep: self.keep(),
@@ -492,7 +495,11 @@ fn stats(a: &Args) {
     println!("{mem_line}; opened in {t_open:.3}s");
     let st = db.stats();
     let c: Vec<String> = st.caches.iter().map(|(k, c)| format!("{k} {}", mb(c.bytes as u64))).collect();
-    println!("caches after reading every request (budget {} in all): {}", mb(a.opts().cache_bytes as u64), c.join(", "));
+    let (used, budget) = db.cache_use();
+    println!("caches after reading every request ({} of a shared budget of {}): {}", mb(used as u64), mb(budget as u64), c.join(", "));
+    // what is kept decoded outside the caches: every directory block, and every text head
+    let heads: usize = db.segments().iter().map(|s| db.text_head(s.0).map(|h| h.bytes()).unwrap_or(0)).sum();
+    println!("kept decoded outside the caches: directories {}, text index heads {}", mb(db.directory_bytes() as u64), mb(heads as u64));
 }
 
 
