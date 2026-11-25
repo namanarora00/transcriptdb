@@ -1151,8 +1151,10 @@ fn scale(a: &Args) {
     let (tx, rx) = mpsc::sync_channel::<Item>(64);
     let next = std::sync::atomic::AtomicU64::new(0);
     let t0 = Instant::now();
-    let (mut quiet, mut busy): (Vec<u32>, Vec<u32>) = (Vec::new(), Vec::new());
-    let (mut bytes_in, mut worst_quiet, mut worst_busy) = (0u64, 0u32, 0u32);
+    // write times by what was at work on other threads when the write came: nothing, a merge,
+    // a flush (or both)
+    let mut times: [Vec<u32>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+    let mut bytes_in = 0u64;
     let mut kept: Vec<(String, [u8; 32])> = Vec::new();
     std::thread::scope(|sc| {
         for _ in 0..a.threads().saturating_sub(1).clamp(1, 6) {
@@ -1181,18 +1183,11 @@ fn scale(a: &Args) {
         }
         drop(tx);
         for (k, it) in rx.into_iter().enumerate() {
-            let merging = dst.merging();
+            let kind = if dst.flushing() { 2 } else if dst.merging() { 1 } else { 0 };
             let t = Instant::now();
             dst.put(&Put { session: &it.session, agent: &it.agent, id: &it.id, time: &it.time, meta: &it.meta, body: &it.body }).expect("put");
             dst.commit().expect("commit");
-            let us = t.elapsed().as_micros().min(u32::MAX as u128) as u32;
-            if merging {
-                busy.push(us);
-                worst_busy = worst_busy.max(us);
-            } else {
-                quiet.push(us);
-                worst_quiet = worst_quiet.max(us);
-            }
+            times[kind].push(t.elapsed().as_micros().min(u32::MAX as u128) as u32);
             bytes_in += it.body.len() as u64;
             if (k as u64).is_multiple_of(check_every) {
                 kept.push((it.id, sha256(&it.body)));
@@ -1205,13 +1200,17 @@ fn scale(a: &Args) {
     let settle_s = t.elapsed().as_secs_f64();
     // a sample of the requests, rebuilt once every merge is in place
     let wrong = kept.iter().filter(|(id, want)| dst.request_index(id).map(|ri| sha256(&dst.rebuild(ri).expect("rebuild"))) != Some(*want)).count();
-    quiet.sort_unstable();
-    busy.sort_unstable();
-    let n = quiet.len() + busy.len();
+    for v in times.iter_mut() {
+        v.sort_unstable();
+    }
+    let n: usize = times.iter().map(|v| v.len()).sum();
     println!("scale: {copies} copies of {ns} sessions: {n} requests, {} of request bodies in {secs:.0}s ({:.0} MB/s, {:.0} requests/s); merges done {settle_s:.0}s after the last write", mb(bytes_in), bytes_in as f64 / 1e6 / secs, n as f64 / secs);
-    for (name, v, worst) in [("no merge at work", &quiet, worst_quiet), ("a merge at work", &busy, worst_busy)] {
+    let mut all: Vec<u32> = times.iter().flatten().copied().collect();
+    all.sort_unstable();
+    for (name, v) in [("nothing else at work", &times[0]), ("a merge at work", &times[1]), ("a flush at work (a merge maybe too)", &times[2]), ("all writes", &all)] {
         let slow = v.iter().filter(|&&us| us > 10_000).count();
-        println!("  write and commit, {name}: {} requests; median {:.2} ms, p99 {:.2} ms, p99.9 {:.2} ms, worst {:.0} ms; {slow} took over 10 ms", v.len(), percentile(v, 0.5), percentile(v, 0.99), percentile(v, 0.999), worst as f64 / 1e3);
+        let worst = v.last().copied().unwrap_or(0);
+        println!("  write and commit, {name}: {} requests; median {:.2} ms, p99 {:.2} ms, p99.9 {:.2} ms, worst {:.1} ms; {slow} took over 10 ms", v.len(), percentile(v, 0.5), percentile(v, 0.99), percentile(v, 0.999), worst as f64 / 1e3);
     }
     let ms = &dst.merge_stats;
     println!("  merges put in place: {} (read {}, wrote {}); written by flushes {}", ms.merges, mb(ms.bytes_in), mb(ms.bytes_out), mb(ms.flushed));
