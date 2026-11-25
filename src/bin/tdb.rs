@@ -1221,6 +1221,7 @@ fn scale(a: &Args) {
     let ms = &dst.merge_stats;
     println!("  merges put in place: {} (read {}, wrote {}); written by flushes {}", ms.merges, mb(ms.bytes_in), mb(ms.bytes_out), mb(ms.flushed));
     println!("  flushes on their own thread: {} (longest {} ms from start to in place); writes that waited for one: {} (longest {} ms, {} ms in all)", ms.bg_flushes, ms.flush_ms_max, ms.flush_waits, ms.flush_wait_ms_max, ms.flush_wait_ms_total);
+    println!("  longest on the writing thread: putting a flush in place {} ms (of which merging index runs at most {} ms, putting a merge in place at most {} ms); copying a session for its first write after a flush started {} ms", ms.install_ms_max, ms.run_merge_ms_max, ms.merge_install_ms_max, ms.copy_ms_max);
     println!("  rebuilt and compared after the merges: {} requests, {wrong} different", kept.len());
     println!("  store: {} in {} segments", mb(dst.stats().store_bytes()), dst.segment_count());
     if wrong > 0 {

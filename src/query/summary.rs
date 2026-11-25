@@ -613,6 +613,9 @@ struct Exec<'a> {
     texts: Texts,
     /// When the field's values come from one segment only: its number, and value ids are group ids.
     single: Option<u32>,
+    /// With values from several segments: their groups, built once for those segments
+    /// (local text ids come after its ids).
+    groups: Option<Arc<crate::db::FieldGroups>>,
     single_dir: Option<FieldDir>,
     test: Option<Test>,
     countif_tests: Vec<Test>,
@@ -685,8 +688,24 @@ impl Exec<'_> {
     /// Group id of a value given by its text (`NULL` for `null`).
     fn text_id(&mut self, t: &[u8]) -> u64 {
         let Some(k) = super::value::group_key(t) else { return NULL };
+        if let Some(g) = &self.groups {
+            if let Some(&id) = g.ix.get(&k) {
+                return id as u64;
+            }
+            let base = g.texts.len() as u64;
+            return base + self.texts.id(k, t);
+        }
         let i = self.texts.id(k, t);
         if self.single.is_some() { TEXT_TAG | i } else { i }
+    }
+
+    /// The group of value `v` of segment `num` from the groups built for several segments.
+    fn group_in(&self, num: u32, v: u32) -> Option<u64> {
+        let g = self.groups.as_ref()?;
+        Some(match g.of.get(&num)?.get(v as usize) {
+            Some(&id) if id != u32::MAX => id as u64,
+            _ => NULL,
+        })
     }
 
     fn segment(&mut self, num: u32, live: Option<&Arc<Vec<bool>>>, pre: &Sp) -> Result<(), QError> {
@@ -928,7 +947,13 @@ impl Exec<'_> {
                 let fv = match fval {
                     Some(x) => x,
                     None => {
-                        let x = if this.single == Some(num) { group_of(v) } else { this.text_id(text) };
+                        let x = if this.single == Some(num) {
+                            group_of(v)
+                        } else if let Some(g) = this.group_in(num, v) {
+                            g
+                        } else {
+                            this.text_id(text)
+                        };
                         fval = Some(x);
                         x
                     }
@@ -957,6 +982,14 @@ impl Exec<'_> {
                 let mut bits: Vec<u64> = if pl.fatoms.is_empty() { Vec::new() } else { vec![0; nv as usize] };
                 let mut blocks: Vec<Option<Arc<StatBlock>>> = vec![None; fd.chunks.len()];
                 let single = self.single == Some(num);
+                // with values from several sources, each value's group (by its text) once per
+                // segment, not once per row
+                let mut gid: Vec<Option<u64>> = if single { Vec::new() } else { vec![None; nv as usize] };
+                if let Some(g) = self.groups.as_ref().and_then(|g| g.of.get(&num)) {
+                    for (v, &id) in g.iter().enumerate().take(nv as usize) {
+                        gid[v] = Some(if id == u32::MAX { NULL } else { id as u64 });
+                    }
+                }
                 let present_only = !pl.fatoms.is_empty() && pl.fatoms.iter().all(|a| matches!(a, Sp::Present { .. }));
                 for t in 0..rows.tool_start.len().saturating_sub(1) {
                     let Some(st) = state.get(t) else { continue };
@@ -975,7 +1008,7 @@ impl Exec<'_> {
                         // come from several sources, for its group
                         let mut text: &[u8] = &[];
                         let first = !known[v as usize];
-                        if (first && !pl.fatoms.is_empty() && !present_only) || !single {
+                        if (first && !pl.fatoms.is_empty() && !present_only) || (!single && gid[v as usize].is_none()) {
                             let ci = fd.chunks.partition_point(|c| c.0 <= v) - 1;
                             if blocks[ci].is_none() {
                                 blocks[ci] = Some(db.stats_values(num, fd, v).map_err(qe)?);
@@ -997,7 +1030,18 @@ impl Exec<'_> {
                         if s == 2 && !pl.ev(&resid[t][r.failed as usize], tool, r.failed, sb, fb) {
                             continue;
                         }
-                        let fv = if single { group_of(v) } else { self.text_id(text) };
+                        let fv = if single {
+                            group_of(v)
+                        } else {
+                            match gid[v as usize] {
+                                Some(g) => g,
+                                None => {
+                                    let g = self.text_id(text);
+                                    gid[v as usize] = Some(g);
+                                    g
+                                }
+                            }
+                        };
                         let cif = pl.countif_bits(tool, r.failed, sb, fb);
                         self.add(tool, r.failed, r.day * DAY_MS, sid, agent, fv, cif, W { count: r.count, sum: r.sum_out, min_out: 0, max_out: 0, min_t: 0, max_t: 0 });
                     }
@@ -1168,6 +1212,10 @@ impl Exec<'_> {
     }
 
     fn field_text(&self, id: u64) -> Result<Vec<u8>, QError> {
+        if let Some(g) = &self.groups {
+            let base = g.texts.len() as u64;
+            return Ok(if id < base { g.texts[id as usize].clone() } else { self.texts.texts[(id - base) as usize].clone() });
+        }
         if id & TEXT_TAG != 0 || self.single.is_none() {
             return Ok(self.texts.texts[(id & !TEXT_TAG) as usize].clone());
         }
@@ -1253,6 +1301,8 @@ pub fn try_run(db: &Db, pre: &Sp, aggs: &[(String, AggFn, Option<Expr>)], by: &[
     // value ids are group ids when one segment holds every value of the field
     let mut single = None;
     let mut single_dir = None;
+    let mut field_values = 0usize;
+    let mut groups: Option<Arc<crate::db::FieldGroups>> = None;
     if let Some((f, _)) = &pl.field {
         let mut segs_with = Vec::new();
         let mut other = false;
@@ -1271,23 +1321,32 @@ pub fn try_run(db: &Db, pre: &Sp, aggs: &[(String, AggFn, Option<Expr>)], by: &[
                 StepSource::Rows { .. } => other = true,
             }
         }
+        field_values = segs_with.iter().map(|(_, d)| d.n_values as usize + d.n_longs as usize).sum();
         if segs_with.len() == 1 && !other {
             single = Some(segs_with[0].0);
             single_dir = Some(segs_with[0].1.clone());
+        } else if segs_with.len() > 1 && pl.needs_fval {
+            groups = db.field_groups(*f, &segs_with).map_err(qe)?;
         }
     }
     let na = pl.aggs.len();
     let dense_len = match pl.keys.as_slice() {
         [KeyK::Tool] => db.step_dicts().tools.len(),
         [KeyK::Failed] | [KeyK::Ok] => 2,
-        [KeyK::Field] => single_dir.as_ref().map_or(0, |d| d.n_values as usize),
+        // values from several segments group by their text, numbered as they are met: at most
+        // every segment's values (more, from steps read from sessions, go to the map)
+        [KeyK::Field] => match (&single_dir, &groups) {
+            (Some(d), _) => d.n_values as usize,
+            (None, Some(g)) => g.texts.len(),
+            (None, None) => field_values.min(1 << 22),
+        },
         _ => 0,
     };
     let minmax = pl.aggs.iter().any(|a| matches!(a, AggK::MinOut | AggK::MaxOut | AggK::MinTime | AggK::MaxTime));
     let sets = pl.aggs.iter().any(|a| matches!(a, AggK::DTool | AggK::DSid | AggK::DAgent | AggK::DField | AggK::DNone));
     let sums = pl.aggs.iter().any(|a| matches!(a, AggK::Sum | AggK::Avg));
     let acc = Accs::new(na, sums, minmax, sets, dense_len);
-    let mut ex = Exec { db, pl: &pl, aggs, now, acc, sids: Default::default(), agents: Default::default(), texts: Texts::default(), single, single_dir, test: None, countif_tests: Vec::new(), rows_read: 0 };
+    let mut ex = Exec { db, pl: &pl, aggs, now, acc, sids: Default::default(), agents: Default::default(), texts: Texts::default(), single, groups, single_dir, test: None, countif_tests: Vec::new(), rows_read: 0 };
     let mut segs = 0;
     for s in &sources {
         match s {

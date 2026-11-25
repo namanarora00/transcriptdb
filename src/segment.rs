@@ -758,8 +758,6 @@ fn frame_compressor<'a>(level: i32, dict: Option<&'a zstd::dict::EncoderDictiona
     Ok(c)
 }
 
-/// Compress `chunks` on up to `threads` threads (each takes the next chunk not yet taken),
-/// each with its own compressor sharing one prepared dictionary; results in order.
 thread_local! {
     static LOW_PRIORITY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
@@ -780,6 +778,8 @@ pub fn set_low_priority() {
     }
 }
 
+/// Compress `chunks` on up to `threads` threads (each takes the next chunk not yet taken),
+/// each with its own compressor sharing one prepared dictionary; results in order.
 fn compress_all(level: i32, dict: Option<&zstd::dict::EncoderDictionary<'static>>, threads: usize, chunks: &[&[u8]]) -> Result<Vec<Vec<u8>>> {
     let n = threads.min(chunks.len()).max(1);
     let next = std::sync::atomic::AtomicUsize::new(0);

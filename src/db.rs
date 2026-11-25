@@ -335,6 +335,13 @@ pub struct MergeStats {
     pub flush_waits: u64,
     pub flush_wait_ms_max: u64,
     pub flush_wait_ms_total: u64,
+    /// The longest each of these took on the thread taking writes: putting a flush in place
+    /// (everything below included), merging index runs, putting a merge in place, and
+    /// copying a session's tables for its first write after a flush started.
+    pub install_ms_max: u64,
+    pub run_merge_ms_max: u64,
+    pub merge_install_ms_max: u64,
+    pub copy_ms_max: u64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -494,6 +501,18 @@ impl StatBlock {
             _ => unreachable!("summary block of another kind"),
         }
     }
+}
+
+/// Group ids for one field's values across segments: values equal as query values share
+/// an id (see [`Db::field_groups`]).
+#[derive(Debug, Default)]
+pub struct FieldGroups {
+    /// Group key (see [`crate::query::value::group_key`]) -> id.
+    pub ix: HashMap<Vec<u8>, u32>,
+    /// The first value met of each group (raw JSON text).
+    pub texts: Vec<Vec<u8>>,
+    /// Per segment: each value's group id (`u32::MAX`: null).
+    pub of: HashMap<u32, Vec<u32>>,
 }
 
 /// What a merge read and wrote, before it is put in place (see [`Db::merge_build`]).
@@ -708,6 +727,9 @@ pub struct Db {
     /// session's parts reads them for every session, and a cache small next to the store
     /// would decode them over and over. About 250 bytes per part.
     dir_res: Mutex<HashMap<(u32, u32), Arc<Vec<DirEnt>>>>,
+    /// Per field: its values' groups across segments, for the manifest generation and the
+    /// segments it was built from.
+    field_groups: Mutex<HashMap<u32, (u64, Vec<u32>, Arc<FieldGroups>)>>,
     /// Each segment's text index head (its word list and per-unit tables), decoded once and
     /// kept until the segment goes, for the same reason: every text query reads every head,
     /// and one bigger than its share of the cache would be decoded for every query. About
@@ -873,6 +895,7 @@ impl Db {
             longc: Cache::pooled(&pool, 16),
             live_masks: Mutex::new(HashMap::new()),
             dir_res: Mutex::new(HashMap::new()),
+            field_groups: Mutex::new(HashMap::new()),
             head_res: Mutex::new(HashMap::new()),
             key_ids: Mutex::new(KeyIds::default()),
             active: HashMap::new(),
@@ -1213,6 +1236,58 @@ impl Db {
     /// (bytes held by all caches, their shared budget)
     pub fn cache_use(&self) -> (usize, usize) {
         (self.pool.used(), self.pool.limit())
+    }
+
+    /// Group ids for store field `field`'s values across `segs` (each a segment and the
+    /// field's table there): what grouping by the field needs when several segments hold its
+    /// values. Built once, by reading each segment's values once, and kept until the
+    /// segments change; `None` when there are too many values to keep.
+    pub fn field_groups(&self, field: u32, segs: &[(u32, FieldDir)]) -> Result<Option<Arc<FieldGroups>>> {
+        let nums: Vec<u32> = segs.iter().map(|s| s.0).collect();
+        let generation = self.manifest.generation;
+        if let Some((g, n, fg)) = self.field_groups.lock().unwrap().get(&field)
+            && *g == generation
+            && *n == nums
+        {
+            return Ok(Some(fg.clone()));
+        }
+        let total: usize = segs.iter().map(|s| s.1.n_values as usize).sum();
+        if total > 4 << 20 {
+            return Ok(None);
+        }
+        let mut fg = FieldGroups::default();
+        for (num, fd) in segs {
+            let mut ids = Vec::with_capacity(fd.n_values as usize);
+            for &(first, _) in &fd.chunks {
+                if first >= fd.n_values {
+                    break;
+                }
+                let b = self.stats_values(*num, fd, first)?;
+                let c = b.vals();
+                for v in first..first + c.len() as u32 {
+                    let t = c.get(v);
+                    ids.push(match crate::query::value::group_key(t) {
+                        None => u32::MAX,
+                        Some(k) => match fg.ix.get(&k) {
+                            Some(&id) => id,
+                            None => {
+                                let id = fg.texts.len() as u32;
+                                fg.texts.push(t.to_vec());
+                                fg.ix.insert(k, id);
+                                id
+                            }
+                        },
+                    });
+                }
+            }
+            if ids.len() != fd.n_values as usize {
+                return corrupt(format!("segment {num}: a field's value blocks hold {} values, not {}", ids.len(), fd.n_values));
+            }
+            fg.of.insert(*num, ids);
+        }
+        let fg = Arc::new(fg);
+        self.field_groups.lock().unwrap().insert(field, (generation, nums, fg.clone()));
+        Ok(Some(fg))
     }
 
     /// Bytes the decoded directory blocks take, roughly.
@@ -1851,6 +1926,16 @@ impl Db {
             }
             self.activate(s)?;
         }
+        // a flush at work holds the session's tables as they were frozen: the first write
+        // after that copies them (timed: a long session's tables are large)
+        if let Some(a) = self.active.get_mut(&s)
+            && (Arc::strong_count(&a.core) > 1 || Arc::strong_count(&a.steps) > 1)
+        {
+            let t = std::time::Instant::now();
+            Arc::make_mut(&mut a.core);
+            Arc::make_mut(&mut a.steps);
+            self.merge_stats.copy_ms_max = self.merge_stats.copy_ms_max.max(t.elapsed().as_millis() as u64);
+        }
         for (id, kind, h, b) in m.pieces {
             if id != self.next_piece() {
                 return corrupt("piece out of order");
@@ -2353,6 +2438,13 @@ impl Db {
 
     /// Put a flush's files in place: the manifest first, then this handle's state.
     fn flush_install(&mut self, b: FlushBuild) -> Result<()> {
+        let t = std::time::Instant::now();
+        let r = self.flush_install_timed(b);
+        self.merge_stats.install_ms_max = self.merge_stats.install_ms_max.max(t.elapsed().as_millis() as u64);
+        r
+    }
+
+    fn flush_install_timed(&mut self, b: FlushBuild) -> Result<()> {
         let mut man = self.manifest.clone();
         man.blobs = b.blobs;
         man.runs.push(b.run);
@@ -2429,7 +2521,9 @@ impl Db {
                 self.runs[i..i + w].iter().all(|r| open(r) && tier(r.file_bytes, 16) == t)
             });
             let Some(i) = pick else { break };
+            let t = std::time::Instant::now();
             self.merge_runs(i, w)?;
+            self.merge_stats.run_merge_ms_max = self.merge_stats.run_merge_ms_max.max(t.elapsed().as_millis() as u64);
         }
         loop {
             // the next merge of segments, if one is due: (inputs, fold, a rewrite to drop replaced parts)
@@ -2710,6 +2804,13 @@ impl Db {
     /// own state. Every session must be flushed (the sessions held in memory point at the
     /// old files and are read again from the new ones), so this runs at the end of a flush.
     fn merge_install(&mut self, b: MergeBuild) -> Result<()> {
+        let t = std::time::Instant::now();
+        let r = self.merge_install_timed(b);
+        self.merge_stats.merge_install_ms_max = self.merge_stats.merge_install_ms_max.max(t.elapsed().as_millis() as u64);
+        r
+    }
+
+    fn merge_install_timed(&mut self, b: MergeBuild) -> Result<()> {
         let MergeBuild { inputs, outputs, dead, bytes_in, fold_read, folded, reclaim } = b;
         if let Some(n) = inputs.iter().find(|n| !self.segs.contains_key(n)) {
             return corrupt(format!("a merge read segment {n}, which is gone"));

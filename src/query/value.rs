@@ -128,6 +128,13 @@ impl Value {
 /// `"a\/b"` groups with `"a/b"` and `1.0` with `1`. `None` for `null`, which groups with
 /// steps that lack the field and is not counted by `dcount`.
 pub fn group_key(raw: &[u8]) -> Option<Vec<u8>> {
+    // a plain JSON string (no escapes, valid text): its key is its bytes, as decoding gives
+    if raw.len() >= 2 && raw[0] == b'"' && raw[raw.len() - 1] == b'"' && !raw.contains(&b'\\') && std::str::from_utf8(&raw[1..raw.len() - 1]).is_ok() {
+        let mut k = Vec::with_capacity(raw.len() - 1);
+        k.push(b's');
+        k.extend_from_slice(&raw[1..raw.len() - 1]);
+        return Some(k);
+    }
     match Value::from_json(raw) {
         Value::Null => None,
         Value::Str(s) => {
