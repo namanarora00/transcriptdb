@@ -67,7 +67,9 @@ BUGS=(
   "rule-result-first-block-only|src/steps.rs|            for el in els.iter().filter(\|el\| b[el.start] == b'{') {|            for el in els.iter().take(1).filter(\|el\| b[el.start] == b'{') {|rules:rule_values"
   "flush-marks-later-writes-flushed|src/db.rs|            core.flushed_nodes = w.nodes;|            core.flushed_nodes = core.nodes.len() as u32;|store:flushes_run_while_writes_go_on"
   "frozen-requests-not-found|src/db.rs|        self.mem.req_ix.get(id).or_else(\|\| self.frozen.as_ref().and_then(\|f\| f.req_ix.get(id))).copied()|        self.mem.req_ix.get(id).copied()|store:flushes_run_while_writes_go_on"
-  "merge-forgets-unflushed-sessions|src/db.rs|            self.reread_flushed(s)?;|            let _ = s;|store:flushes_run_while_writes_go_on"
+  "merge-deletes-segments-still-read|src/db.rs|            if used.contains(n)
+                \&\& let Some(seg) = seg|            if false \&\& used.contains(n)
+                \&\& let Some(seg) = seg|store:flushes_run_while_writes_go_on"
   "idle-session-dropped-unflushed|src/db.rs|a.last + self.opts.idle_flushes <= self.flushes && a.flushed()|a.last + self.opts.idle_flushes <= self.flushes|store:flushes_run_while_writes_go_on"
   "light-steps-codes-all-zero|src/db.rs|            code.push(*n);|            code.push(0);|store:light_steps_equal_full_steps_without_values"
   "pool-evicts-busiest-first|src/cache.rs|        order.sort_by_key(\|x\| x.0);|        order.sort_by_key(\|x\| std::cmp::Reverse(x.0));|lib:a_pool_gives_memory_to_the_cache_in_use"

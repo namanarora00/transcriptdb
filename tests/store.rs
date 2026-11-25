@@ -281,8 +281,9 @@ fn thinking_and_images_are_never_kept() {
 #[test]
 fn merges_wakeups_and_small_caches_keep_everything_exact() {
     let dir = tmpdir("merges");
-    // folding off, so woken sessions stay in several parts and reads join them
-    let o = Options { flush_bytes: 48 << 10, sync: SyncMode::Os, merge_at: 3, seg_bytes: 160 << 10, idle_flushes: 1, cache_bytes: 192 << 10, max_parts: 0, ..Options::default() };
+    // folding off, so woken sessions stay in several parts and reads join them; merges and
+    // flushes on the spot, so the counts below do not depend on thread timing
+    let o = Options { flush_bytes: 48 << 10, sync: SyncMode::Os, merge_at: 3, seg_bytes: 160 << 10, idle_flushes: 1, cache_bytes: 192 << 10, max_parts: 0, background_merges: false, background_flush: false, ..Options::default() };
     let early: Vec<Vec<SynthRequest>> = (0..10).map(|s| synth::session(41, s, 36)).collect();
     let mut order: Vec<&SynthRequest> = Vec::new();
     for s in &early {
@@ -353,7 +354,8 @@ fn a_store_opens_in_one_place_at_a_time() {
 #[test]
 fn many_files_with_few_open_at_once() {
     let dir = tmpdir("files");
-    let o = Options { flush_bytes: 24 << 10, sync: SyncMode::Os, merge_at: 50, open_files: 4, cache_bytes: 64 << 10, blob_bytes: 1 << 10, ..Options::default() };
+    // a flush at each 24 KB (on the spot: on their own threads, flushes would take more each)
+    let o = Options { flush_bytes: 24 << 10, sync: SyncMode::Os, merge_at: 50, open_files: 4, cache_bytes: 64 << 10, blob_bytes: 1 << 10, background_flush: false, ..Options::default() };
     let reqs = traffic(51, 10, 30);
     let mut db = Db::open(&dir, o.clone()).unwrap();
     for q in &reqs {

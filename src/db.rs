@@ -670,6 +670,12 @@ pub struct Db {
     opts: Options,
     manifest: Manifest,
     segs: BTreeMap<u32, Arc<Segment>>,
+    /// Segments a merge replaced that sessions taking writes still read their flushed
+    /// messages from (the same bytes are in the merge's output): kept open, out of the
+    /// manifest, until no such session points at them, then deleted.
+    retired: HashMap<u32, Arc<Segment>>,
+    /// Threads deleting replaced files.
+    removing: Vec<std::thread::JoinHandle<()>>,
     /// Per segment: its tool and field codes mapped to the store's.
     seg_codes: HashMap<u32, (Vec<u32>, Vec<u32>)>,
     /// Column rules (`rules.rs`) and the store's field code of each rule's column.
@@ -840,6 +846,13 @@ impl Drop for Db {
         {
             let _ = h.join();
         }
+        // segments kept only for sessions taking writes are not in the manifest: they go too
+        self.removed();
+        for (n, _) in std::mem::take(&mut self.retired) {
+            let p = seg_path(&self.dir, n);
+            crate::block::forget(&p);
+            let _ = fs::remove_file(p);
+        }
         if let Some(mut bg) = self.bg.take() {
             bg.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
             if let Some(h) = bg.handle.take() {
@@ -868,6 +881,8 @@ impl Db {
             _lock: lock,
             manifest,
             segs: BTreeMap::new(),
+            retired: HashMap::new(),
+            removing: Vec::new(),
             seg_codes: HashMap::new(),
             rules: Arc::new(RuleSet::default()),
             rule_fields: Vec::new(),
@@ -1184,6 +1199,60 @@ impl Db {
         self.mem.opaque_base + self.mem.opaques.len() as u64
     }
 
+    /// A segment by number for reading a session's messages through its chunks: a live one,
+    /// or one a merge retired that a session taking writes still points at.
+    fn seg_by_num(&self, n: u32) -> Option<&Arc<Segment>> {
+        self.segs.get(&n).or_else(|| self.retired.get(&n))
+    }
+
+    /// Delete the retired segments no session taking writes points at any more (on a thread
+    /// of its own: removing a large file can take a while).
+    fn drop_retired(&mut self) {
+        if self.retired.is_empty() {
+            return;
+        }
+        // a session all in files that points at a retired segment leaves memory (it is read
+        // again from the live segments when needed)
+        let stale: Vec<u32> = self.active.iter().filter(|(_, a)| a.flushed() && a.core.chunks.iter().any(|c| self.retired.contains_key(&c.seg))).map(|(&s, _)| s).collect();
+        for s in stale {
+            if let Some(a) = self.active.remove(&s) {
+                self.key_ix.remove(&a.core.key);
+            }
+        }
+        let used: BTreeSet<u32> = self.active.values().flat_map(|a| a.core.chunks.iter().map(|c| c.seg)).collect();
+        let gone: Vec<u32> = self.retired.keys().copied().filter(|n| !used.contains(n)).collect();
+        let mut paths = Vec::new();
+        for n in gone {
+            self.retired.remove(&n);
+            let p = seg_path(&self.dir, n);
+            crate::block::forget(&p);
+            paths.push(p);
+        }
+        self.remove_files(paths);
+    }
+
+    /// Delete files on a thread of its own (their handles already forgotten).
+    fn remove_files(&mut self, paths: Vec<PathBuf>) {
+        self.removing.retain(|h| !h.is_finished());
+        if paths.is_empty() {
+            return;
+        }
+        if let Ok(h) = std::thread::Builder::new().name("tdb-remove".into()).spawn(move || {
+            for p in paths {
+                let _ = fs::remove_file(p);
+            }
+        }) {
+            self.removing.push(h);
+        }
+    }
+
+    /// Wait for the files being deleted to be gone.
+    fn removed(&mut self) {
+        for h in self.removing.drain(..) {
+            let _ = h.join();
+        }
+    }
+
     /// The bytes of an unflushed message, `Loc::Mem(i)`: in the buffer taking writes, or in
     /// the one being flushed.
     fn mem_node(&self, i: u32) -> &[u8] {
@@ -1479,29 +1548,6 @@ impl Db {
         let core = self.read_core(s, false)?;
         let size = core.bytes();
         Ok(self.nodemaps.insert(s, Arc::new(core), size))
-    }
-
-    /// For a session taking writes, after a merge rewrote files it had parts in: its flushed
-    /// part read again from the files as they are now, followed by what is not flushed yet.
-    fn reread_flushed(&mut self, s: u32) -> Result<()> {
-        let a = &self.active[&s];
-        let (fn_, fr) = (a.core.flushed_nodes, a.core.flushed_reqs);
-        if fn_ == 0 && fr == 0 {
-            // nothing of it is in files yet
-            return Ok(());
-        }
-        let mut fresh = self.read_core(s, true)?;
-        let a = self.active.get_mut(&s).unwrap();
-        let old = &a.core;
-        if fresh.nodes.len() != fn_ as usize || fresh.requests.len() != fr as usize {
-            return corrupt(format!("session {s}: its parts in files do not match what was flushed"));
-        }
-        fresh.nodes.extend_from_slice(&old.nodes[fn_ as usize..]);
-        fresh.requests.extend_from_slice(&old.requests[fr as usize..]);
-        fresh.flushed_nodes = fn_;
-        fresh.flushed_reqs = fr;
-        a.core = Arc::new(fresh);
-        Ok(())
     }
 
     /// A session's table decoded from its parts (`requests`: with the request records).
@@ -2489,6 +2535,7 @@ impl Db {
             }
         }
         self.remove_old_wal(b.wal_start)?;
+        self.drop_retired();
         self.busy = self.active.keys().copied().collect();
         self.merge_policy()
     }
@@ -2612,6 +2659,8 @@ impl Db {
             self.merge_install(b)?;
             self.merge_policy()?;
         }
+        self.drop_retired();
+        self.removed();
         Ok(())
     }
 
@@ -2842,18 +2891,27 @@ impl Db {
             bytes_out += seg.file_bytes;
             self.add_segment(seg);
         }
+        // sessions still taking writes keep reading their flushed messages from the inputs
+        // (retired, deleted once none of them does); the other inputs go now
+        let used: BTreeSet<u32> = kept.iter().flat_map(|s| self.active[s].core.chunks.iter().map(|c| c.seg)).collect();
+        let mut paths = Vec::new();
         for n in &inputs {
-            self.segs.remove(n);
+            let seg = self.segs.remove(n);
             self.dir_res.lock().unwrap().retain(|k, _| k.0 != *n);
             self.head_res.lock().unwrap().remove(n);
             self.seg_codes.remove(n);
+            if used.contains(n)
+                && let Some(seg) = seg
+            {
+                self.retired.insert(*n, seg);
+                continue;
+            }
             let p = seg_path(&self.dir, *n);
             crate::block::forget(&p);
-            let _ = fs::remove_file(p);
+            paths.push(p);
         }
-        for s in kept {
-            self.reread_flushed(s)?;
-        }
+        self.remove_files(paths);
+        self.drop_retired();
         self.merge_stats.merges += 1;
         self.merge_stats.bytes_in += bytes_in + fold_read;
         self.merge_stats.bytes_out += bytes_out;
@@ -2883,7 +2941,7 @@ impl Db {
         for &s in sessions {
             let core = self.load_core(s)?;
             for ch in core.chunks.iter().filter(|c| inputs.contains(&c.seg)) {
-                let sg = self.segs.get(&ch.seg).ok_or_else(|| bad("segment is gone"))?;
+                let sg = self.seg_by_num(ch.seg).ok_or_else(|| bad("segment is gone"))?;
                 let fs = ch.fs as usize;
                 for f in 0..ch.frames.len() {
                     let len = (ch.raw_len as usize - f * fs).min(fs);
@@ -2940,7 +2998,7 @@ impl Db {
                     return Ok(());
                 }
                 let ch = &core.chunks[chunk as usize];
-                let sg = self.segs.get(&ch.seg).ok_or_else(|| bad(format!("segment {} is gone", ch.seg)))?;
+                let sg = self.seg_by_num(ch.seg).ok_or_else(|| bad(format!("segment {} is gone", ch.seg)))?;
                 let fs = ch.fs as usize;
                 let (a, b) = (off as usize, off as usize + nm.len as usize);
                 let (f0, f1) = (a / fs, (b - 1) / fs);
@@ -3008,7 +3066,7 @@ impl Db {
                 j += 1;
             }
             let ch = &core.chunks[chunk as usize];
-            let sg = self.segs.get(&ch.seg).ok_or_else(|| bad(format!("segment {} is gone", ch.seg)))?;
+            let sg = self.seg_by_num(ch.seg).ok_or_else(|| bad(format!("segment {} is gone", ch.seg)))?;
             let frames = sg.frames(&ch.frames, ch.raw_len, ch.fs as usize, k0, v[j].1)?;
             st.reads += 1;
             st.frames += frames.len() as u32;
@@ -3706,7 +3764,7 @@ impl Db {
                     return Ok(Some(Vec::new()));
                 }
                 let ch = &core.chunks[chunk as usize];
-                let sg = self.segs.get(&ch.seg).ok_or_else(|| bad("segment is gone"))?;
+                let sg = self.seg_by_num(ch.seg).ok_or_else(|| bad("segment is gone"))?;
                 let fs = ch.fs as usize;
                 let (ga, gb) = (base as usize + a, base as usize + b);
                 let (f0, f1) = (ga / fs, (gb - 1) / fs);
