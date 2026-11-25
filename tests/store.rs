@@ -447,7 +447,10 @@ fn index_runs_stay_few_through_many_small_flushes() {
 #[test]
 fn woken_sessions_fold_back_into_one_part() {
     let dir = tmpdir("fold");
-    let o = Options { flush_bytes: 24 << 10, sync: SyncMode::Os, merge_at: 3, seg_bytes: 96 << 10, idle_flushes: 1, cache_bytes: 256 << 10, max_parts: 3, ..Options::default() };
+    // the merge policy itself: merges and flushes done on the spot, so the counts below do
+    // not depend on when threads finish (`merges_run_while_writes_go_on` and
+    // `flushes_run_while_writes_go_on` cover those)
+    let o = Options { flush_bytes: 24 << 10, sync: SyncMode::Os, merge_at: 3, seg_bytes: 96 << 10, idle_flushes: 1, cache_bytes: 256 << 10, max_parts: 3, background_merges: false, background_flush: false, ..Options::default() };
     let wakers: Vec<Vec<SynthRequest>> = (0..10).map(|s| synth::session(61, s, 40)).collect();
     // filler sessions from another seed: their ids repeat ("synth-<n>-<k>"), so keep them apart
     let filler: Vec<SynthRequest> = traffic(67, 60, 24).into_iter().map(|q| SynthRequest { id: format!("fill-{}", q.id), ..q }).collect();
