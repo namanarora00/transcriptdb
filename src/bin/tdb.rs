@@ -1043,7 +1043,9 @@ fn crash_child(a: &Args) {
     // small because requests store little once thinking and images are blanked: full-size
     // merges must happen for folds and rewrites to be killed too. Synthetic sessions span
     // minutes, so any session older than the newest request is cold, in runs of 4 frames.
-    let opts = Options { sync: a.sync(), flush_bytes: 128 << 10, merge_at: 3, seg_bytes: 32 << 10, idle_flushes: 1, cache_bytes: 4 << 20, blob_bytes: 32 << 10, run_bytes: 64 << 10, merge_level: 3, threads: 2, cold_after_ms: 1, cold_run: 256 << 10, ..Options::default() };
+    // runs alternate between merges and flushes on their own threads and on the spot, so kills
+    // land in both (merges at low priority rarely finish before a kill)
+    let opts = Options { sync: a.sync(), flush_bytes: 128 << 10, merge_at: 3, seg_bytes: 32 << 10, idle_flushes: 1, cache_bytes: 4 << 20, blob_bytes: 32 << 10, run_bytes: 64 << 10, merge_level: 3, threads: 2, cold_after_ms: 1, cold_run: 256 << 10, background_merges: run % 2 == 1, background_flush: run % 3 != 2, ..Options::default() };
     let mut db = Db::open(a.store(), opts).expect("open store");
     {
         let mut l = std::io::stdout().lock();

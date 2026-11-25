@@ -8,8 +8,10 @@ Numbers are parsed from the outputs, never typed. Everything above the line
 
 FULL.txt and SAMPLE.txt are `tdb h2h --split x` outputs on every log file and on the
 200-file sample. NOTES.json holds what the outputs do not: "files" (log files read),
-"units" (text blocks), "date", "machine" (one sentence), and "notes" (a list of bullets
-for "Reading these numbers", in Markdown).
+"units" (text blocks), "date", "machine" (one sentence), "notes" (a list of bullets for
+"Reading these numbers", in Markdown), and optionally "scale" (the h2h output on a store
+holding several copies of every log file), "copies" (how many) and "scale_notes" (bullets
+under that section).
 """
 import json
 import re
@@ -27,19 +29,24 @@ SECTIONS = [
 
 
 def parse(path):
-    q, reads, size = [], [], {}
+    q, reads, size = [], {"warm": [], "cold": []}, {}
+    section = "warm"
     with open(path) as f:
         for line in f:
+            if line.startswith("== cold reads"):
+                section = "cold"
+            elif line.startswith("== reads"):
+                section = "warm"
             m = re.match(r"^\s{2}(.+?)\s{2,}yes\s+([\d.]+) ms\s+([\d.]+) ms\s+([\d.]+) ms\s+([\d.]+)x\s+(.*)$", line)
             if m:
                 q.append((m.group(1).strip(), m.group(2), float(m.group(4)), m.group(5)))
             if re.match(r"^\s{2}.+?\s{2,}NO\s", line):
                 sys.exit(f"{path}: an answer differs: {line.strip()}")
-            m = re.match(r"^\s{2}(.+?)\s{2,}same (\d+)/(\d+)\s+TDB ([\d.]+) / ([\d.]+)\s+PostgreSQL ([\d.]+) / ([\d.]+)\s+([\d.]+)x", line)
+            m = re.match(r"^\s{2}(.+?)\s{2,}same (\d+)/(\d+)\s+TDB ([\d.]+) / ([\d.]+) / ([\d.]+)\s+PostgreSQL ([\d.]+) / ([\d.]+) / ([\d.]+)", line)
             if m:
                 if m.group(2) != m.group(3):
                     sys.exit(f"{path}: reads differ: {line.strip()}")
-                reads.append(m.groups())
+                reads[section].append(m.groups())
             m = re.match(r"^\s+TranscriptDB store: ([\d.]+) MB", line)
             if m:
                 size["tdb"] = m.group(1)
@@ -78,8 +85,8 @@ def main():
     fq, fr, fs = parse(full_path)
     sq, _, ss = parse(sample_path)
     want = sum(s[1] for s in SECTIONS)
-    if len(fq) != want or len(sq) != want or len(fr) != 4:
-        sys.exit(f"expected {want} queries and 4 reads, got {len(fq)} / {len(sq)} queries and {len(fr)} reads")
+    if len(fq) != want or len(sq) != want or len(fr["warm"]) != 4 or len(fr["cold"]) != 4:
+        sys.exit(f"expected {want} queries and 4 + 4 reads, got {len(fq)} / {len(sq)} queries and {len(fr['warm'])} + {len(fr['cold'])} reads")
     n = lambda s: f"{int(s):,}"
     sess, _, mb, reqs, steps = fs["load"]
     ssess, _, _, _, ssteps = ss["load"]
@@ -119,9 +126,31 @@ def main():
     span = lambda qs: f"{times(min((q[3] for q in qs), key=float))}x to {times(max((q[3] for q in qs), key=float))}x"
     parts = [f"{t} {span(qs)}" for t, qs in ranges]
     out += ["", f"On the 200-file sample ({n(ssess)} sessions, {n(ssteps)} steps), times faster: " + ", ".join(parts) + "."]
-    out += ["", "### Reads", "", "| Read (median / 95th percentile) | TranscriptDB | PostgreSQL | Faster at the median |", "|---|---|---|---|"]
-    for g in fr:
-        out.append(f"| {g[0][0].upper() + g[0][1:]} | {g[3]} / {g[4]} ms | {g[5]} / {g[6]} ms | {g[7]}x |")
+    def read_table(rows):
+        t = ["| Read | TranscriptDB median / p99 | PostgreSQL median / p99 | Faster at the median / p99 |", "|---|---|---|---|"]
+        for g in rows:
+            e50, e99, p50, p99 = float(g[3]), float(g[5]), float(g[6]), float(g[8])
+            t.append(f"| {g[0][0].upper() + g[0][1:]} | {g[3]} / {g[5]} ms | {g[6]} / {g[8]} ms | {p50 / e50:.1f}x / {p99 / e99:.1f}x |")
+        return t
+    out += ["", "### Reads", "", "Random items, each compared byte for byte.", ""] + read_table(fr["warm"])
+    out += ["", "Cold: each side's own cache emptied before every read (the store's caches, and", "PostgreSQL's shared buffers with `pg_buffercache_evict_all()`). The operating system's file", "cache stays warm for both.", ""] + read_table(fr["cold"])
+    if notes.get("scale"):
+        xq, xr, xs = parse(notes["scale"])
+        if len(xq) != want:
+            sys.exit(f"scale: expected {want} queries, got {len(xq)}")
+        k = notes.get("copies", 3)
+        xsess, _, xmb, xreqs, xsteps = xs["load"]
+        out += ["", f"### At {k} times the data", ""]
+        out.append(f"{k} copies of every log file, each copy as sessions of its own: {n(xsess)} sessions, {n(xreqs)} requests,")
+        out.append(f"{n(xsteps)} steps. TranscriptDB {xs['tdb']} MB, PostgreSQL {float(xs['pg']):,.1f} MB: {xs['x']}x smaller. Every answer and read")
+        out.append("was identical on both sides.")
+        out += ["", "| Query | TranscriptDB 1x → 3x | PostgreSQL 1x → 3x | Faster by at 3x |", "|---|---|---|---|"]
+        for (name, t1, p1, _), (_, t3, p3, x3) in zip(fq, xq):
+            out.append(f"| {name.replace('git commit', '`git commit`')} | {t1} → {t3} ms | {ms(p1)} → {ms(p3)} ms | {x3}x |")
+        out += ["", "Reads at 3x:", ""] + read_table(xr["warm"]) + ["", "Cold reads at 3x:", ""] + read_table(xr["cold"])
+        if notes.get("scale_notes"):
+            out.append("")
+            out += [f"- {b}" for b in notes["scale_notes"]]
     copy = fs["texts"][0] + fs["texts"][1]
     lean = (float(fs["pg"]) - copy) / float(fs["tdb"])
     out += ["", "### Reading these numbers", ""]
