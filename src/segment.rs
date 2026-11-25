@@ -760,10 +760,34 @@ fn frame_compressor<'a>(level: i32, dict: Option<&'a zstd::dict::EncoderDictiona
 
 /// Compress `chunks` on up to `threads` threads (each takes the next chunk not yet taken),
 /// each with its own compressor sharing one prepared dictionary; results in order.
+thread_local! {
+    static LOW_PRIORITY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run this thread (and the compression threads it starts) at a lower priority than the
+/// threads taking writes: merges use every core when they are idle, but a write or a flush
+/// gets the processor first. On macOS the "utility" quality of service; elsewhere a nice
+/// value of 10 for the thread.
+pub fn set_low_priority() {
+    LOW_PRIORITY.with(|c| c.set(true));
+    #[cfg(target_os = "macos")]
+    unsafe {
+        libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_UTILITY, 0);
+    }
+    #[cfg(target_os = "linux")]
+    unsafe {
+        libc::setpriority(libc::PRIO_PROCESS, libc::gettid() as libc::id_t, 10);
+    }
+}
+
 fn compress_all(level: i32, dict: Option<&zstd::dict::EncoderDictionary<'static>>, threads: usize, chunks: &[&[u8]]) -> Result<Vec<Vec<u8>>> {
     let n = threads.min(chunks.len()).max(1);
     let next = std::sync::atomic::AtomicUsize::new(0);
+    let low = LOW_PRIORITY.with(|c| c.get());
     let work = || -> Result<Vec<(usize, Vec<u8>)>> {
+        if low {
+            set_low_priority();
+        }
         let mut c = frame_compressor(level, dict)?;
         let mut out = Vec::new();
         loop {
@@ -1130,6 +1154,11 @@ thread_local! {
     static DDCTX: RefCell<Option<zstd::zstd_safe::DCtx<'static>>> = const { RefCell::new(None) };
     /// Recently decompressed frames, per thread: frames never change, so this is always safe.
     static FRAMES: RefCell<FrameCache> = RefCell::new(FrameCache::default());
+}
+
+/// Drop this thread's decompressed frames (for measuring reads with nothing cached).
+pub fn forget_frames() {
+    FRAMES.with(|c| *c.borrow_mut() = FrameCache::default());
 }
 
 /// Bytes of decompressed frames each thread keeps (128 frames of 64 KB, or two of a cold

@@ -884,8 +884,15 @@ pub struct ReadOutcome {
     pub name: String,
     pub same: usize,
     pub total: usize,
-    pub engine: (f64, f64),
-    pub pg: (f64, f64),
+    /// (median, 95th, 99th percentile) in ms.
+    pub engine: (f64, f64, f64),
+    /// `None` when PostgreSQL's cache could not be emptied for cold reads.
+    pub pg: Option<(f64, f64, f64)>,
+}
+
+fn quantiles(v: &[f64]) -> (f64, f64, f64) {
+    let mut v = v.to_vec();
+    (quantile(&mut v, 0.5), quantile(&mut v, 0.95), quantile(&mut v, 0.99))
 }
 
 fn sql_str(s: &str) -> String {
@@ -893,8 +900,24 @@ fn sql_str(s: &str) -> String {
 }
 
 /// Reads: a request's messages, 20 steps with their messages, a whole session. Median and p95 ms.
-pub fn run_reads(db: &Db, pg: &mut Pg, n: usize, seed: u64) -> R<Vec<ReadOutcome>> {
+/// Reads of `n` random items each, compared byte for byte. With `cold`, both sides' own
+/// caches are emptied before every read: the store's (and its kept directories and text
+/// heads), and PostgreSQL's shared buffers (`pg_buffercache_evict_all`). The operating
+/// system's file cache stays warm for both. When PostgreSQL's buffers cannot be emptied, its
+/// cold times are left out.
+pub fn run_reads(db: &Db, pg: &mut Pg, n: usize, seed: u64, cold: bool) -> R<Vec<ReadOutcome>> {
     let mut r = Rng::new(seed);
+    let pg_cold = cold && pg.exec("CREATE EXTENSION IF NOT EXISTS pg_buffercache").is_ok() && pg.query("SELECT pg_buffercache_evict_all()").is_ok();
+    // what runs before each timed read (not timed)
+    let prep = |pg: &mut Pg| {
+        if cold {
+            db.clear_caches();
+            if pg_cold {
+                let _ = pg.query("SELECT pg_buffercache_evict_all()");
+            }
+        }
+    };
+    let pg_times = |tp: &[f64]| if cold && !pg_cold { None } else { Some(quantiles(tp)) };
     let mut res = Vec::new();
     let e = |x: crate::codec::Error| x.to_string();
     let all = db.all_requests().map_err(e)?;
@@ -904,6 +927,7 @@ pub fn run_reads(db: &Db, pg: &mut Pg, n: usize, seed: u64) -> R<Vec<ReadOutcome
         for _ in 0..n {
             let ri = all[r.below(all.len() as u64) as usize];
             let rec = db.request(ri).map_err(e)?;
+            prep(pg);
             let a = Instant::now();
             let path = db.request_path(ri).map_err(e)?;
             let msgs = db.read_messages(rec.session, &path, &mut ReadStats::default()).map_err(e)?;
@@ -919,7 +943,7 @@ pub fn run_reads(db: &Db, pg: &mut Pg, n: usize, seed: u64) -> R<Vec<ReadOutcome
             let pb = rows.first().and_then(|x| x[0].clone()).unwrap_or_default();
             same += (sha256(&eb) == sha256(pb.as_bytes())) as usize;
         }
-        res.push(ReadOutcome { name: "a request's messages in order".into(), same, total: n, engine: (quantile(&mut te.clone(), 0.5), quantile(&mut te, 0.95)), pg: (quantile(&mut tp.clone(), 0.5), quantile(&mut tp, 0.95)) });
+        res.push(ReadOutcome { name: "a request's messages in order".into(), same, total: n, engine: quantiles(&te), pg: pg_times(&tp) });
     }
     // 2. 20 steps of a session with their call and result messages
     {
@@ -930,6 +954,7 @@ pub fn run_reads(db: &Db, pg: &mut Pg, n: usize, seed: u64) -> R<Vec<ReadOutcome
             let ss_arc = db.steps(s);
             let ss = &*ss_arc;
             let k = r.below(ss.rows.len() as u64 - 19) as usize;
+            prep(pg);
             let a = Instant::now();
             let mut ids = Vec::with_capacity(40);
             for row in &ss.rows[k..k + 20] {
@@ -952,7 +977,7 @@ pub fn run_reads(db: &Db, pg: &mut Pg, n: usize, seed: u64) -> R<Vec<ReadOutcome
             let pb: Vec<String> = rows.into_iter().flat_map(|x| x.into_iter().map(|c| c.unwrap_or_default())).collect();
             same += (sha256(&eb) == sha256(pb.join("|").as_bytes())) as usize;
         }
-        res.push(ReadOutcome { name: "20 steps with their messages".into(), same, total: n, engine: (quantile(&mut te.clone(), 0.5), quantile(&mut te, 0.95)), pg: (quantile(&mut tp.clone(), 0.5), quantile(&mut tp, 0.95)) });
+        res.push(ReadOutcome { name: "20 steps with their messages".into(), same, total: n, engine: quantiles(&te), pg: pg_times(&tp) });
     }
     // 3. every message of a session
     {
@@ -960,6 +985,7 @@ pub fn run_reads(db: &Db, pg: &mut Pg, n: usize, seed: u64) -> R<Vec<ReadOutcome
         let m = n.min(db.session_count());
         for _ in 0..m {
             let s = r.below(db.session_count() as u64) as u32;
+            prep(pg);
             let a = Instant::now();
             let ids: Vec<u32> = (0..db.session_len(s)).collect();
             let msgs = db.read_messages(s, &ids, &mut ReadStats::default()).map_err(e)?;
@@ -972,7 +998,7 @@ pub fn run_reads(db: &Db, pg: &mut Pg, n: usize, seed: u64) -> R<Vec<ReadOutcome
             let pb = rows.first().and_then(|x| x[0].clone()).unwrap_or_default();
             same += (sha256(&eb) == sha256(pb.as_bytes())) as usize;
         }
-        res.push(ReadOutcome { name: "a whole session's messages".into(), same, total: m, engine: (quantile(&mut te.clone(), 0.5), quantile(&mut te, 0.95)), pg: (quantile(&mut tp.clone(), 0.5), quantile(&mut tp, 0.95)) });
+        res.push(ReadOutcome { name: "a whole session's messages".into(), same, total: m, engine: quantiles(&te), pg: pg_times(&tp) });
     }
     // 4. a whole request rebuilt byte for byte, as it was sent (less what is never stored)
     {
@@ -980,6 +1006,7 @@ pub fn run_reads(db: &Db, pg: &mut Pg, n: usize, seed: u64) -> R<Vec<ReadOutcome
         for _ in 0..n {
             let ri = all[r.below(all.len() as u64) as usize];
             let id = db.request(ri).map_err(e)?.id;
+            prep(pg);
             let a = Instant::now();
             let eb = db.rebuild(ri).map_err(e)?;
             te.push(a.elapsed().as_secs_f64() * 1e3);
@@ -988,7 +1015,7 @@ pub fn run_reads(db: &Db, pg: &mut Pg, n: usize, seed: u64) -> R<Vec<ReadOutcome
             tp.push(a.elapsed().as_secs_f64() * 1e3);
             same += (eb == pb) as usize;
         }
-        res.push(ReadOutcome { name: "a whole request rebuilt".into(), same, total: n, engine: (quantile(&mut te.clone(), 0.5), quantile(&mut te, 0.95)), pg: (quantile(&mut tp.clone(), 0.5), quantile(&mut tp, 0.95)) });
+        res.push(ReadOutcome { name: "a whole request rebuilt".into(), same, total: n, engine: quantiles(&te), pg: pg_times(&tp) });
     }
     Ok(res)
 }

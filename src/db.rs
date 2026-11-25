@@ -328,6 +328,13 @@ pub struct MergeStats {
     /// Sessions folded into one part, and segments rewritten to drop the parts folds replaced.
     pub folded: u64,
     pub reclaims: u64,
+    /// Flushes run on their own thread, and the longest from start to being put in place.
+    pub bg_flushes: u64,
+    pub flush_ms_max: u64,
+    /// Writes that waited for a flush at work (memory held two buffers' worth), and how long.
+    pub flush_waits: u64,
+    pub flush_wait_ms_max: u64,
+    pub flush_wait_ms_total: u64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -556,6 +563,7 @@ struct FlushBuild {
 struct BgFlush {
     rx: Mutex<std::sync::mpsc::Receiver<Result<FlushBuild>>>,
     handle: Option<std::thread::JoinHandle<()>>,
+    started: std::time::Instant,
 }
 
 /// File numbers set aside for the outputs of a merge on its own thread.
@@ -2028,9 +2036,14 @@ impl Db {
         if self.mem.bytes >= self.opts.flush_bytes {
             if self.fbg.is_some() && self.mem.bytes >= 2 * self.opts.flush_bytes {
                 // memory holds two buffers' worth: wait for the flush at work
+                let t = std::time::Instant::now();
                 if let Some(b) = self.flush_done(true)? {
                     self.flush_install(b)?;
                 }
+                let ms = t.elapsed().as_millis() as u64;
+                self.merge_stats.flush_waits += 1;
+                self.merge_stats.flush_wait_ms_max = self.merge_stats.flush_wait_ms_max.max(ms);
+                self.merge_stats.flush_wait_ms_total += ms;
             }
             if self.fbg.is_none() {
                 self.flush_start()?;
@@ -2127,7 +2140,7 @@ impl Db {
         let handle = std::thread::Builder::new().name("tdb-flush".into()).spawn(move || {
             let _ = tx.send(view.flush_build(job));
         })?;
-        self.fbg = Some(BgFlush { rx: Mutex::new(rx), handle: Some(handle) });
+        self.fbg = Some(BgFlush { rx: Mutex::new(rx), handle: Some(handle), started: std::time::Instant::now() });
         Ok(())
     }
 
@@ -2144,8 +2157,12 @@ impl Db {
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => Err(bad("the flush thread stopped without an answer")),
             }
         };
-        if let Some(h) = self.fbg.take().and_then(|mut bg| bg.handle.take()) {
-            let _ = h.join();
+        if let Some(mut bg) = self.fbg.take() {
+            self.merge_stats.bg_flushes += 1;
+            self.merge_stats.flush_ms_max = self.merge_stats.flush_ms_max.max(bg.started.elapsed().as_millis() as u64);
+            if let Some(h) = bg.handle.take() {
+                let _ = h.join();
+            }
         }
         r.map(Some)
     }
@@ -2454,6 +2471,7 @@ impl Db {
         let (tx, rx) = std::sync::mpsc::channel();
         let stop = cancel.clone();
         let handle = std::thread::Builder::new().name("tdb-merge".into()).spawn(move || {
+            crate::segment::set_low_priority();
             let r = view.merge_build(inputs, fold, false, first, MERGE_FILES, Some(&stop)).map(|mut b| {
                 b.reclaim = reclaim;
                 b
@@ -3966,6 +3984,7 @@ impl Db {
         }
         self.dir_res.lock().unwrap().clear();
         self.head_res.lock().unwrap().clear();
+        crate::segment::forget_frames();
     }
 
     pub fn dir(&self) -> &Path {

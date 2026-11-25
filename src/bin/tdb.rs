@@ -673,11 +673,17 @@ fn head_to_head(a: &Args) {
         let ms = |x: f64| if x < 1.0 { format!("{x:.3}") } else { format!("{x:.2}") };
         println!("  {:<48} {:>6} {:>9} ms {:>6} ms {:>9} ms {:>9}  {}", o.name, if o.same { "yes" } else { "NO" }, ms(o.engine_ms), ms(o.engine_ms_par), ms(o.pg_ms), sp, o.detail);
     }
-    let reads = h2h::run_reads(&db, &mut pg, a.num("reads", 200) as usize, a.num("seed", 5)).expect("reads");
-    println!("\n== reads (median / p95 ms per item; PostgreSQL over loopback TCP)");
-    for r in &reads {
-        all_same &= r.same == r.total;
-        println!("  {:<36} same {}/{}   TDB {:.3} / {:.3}   PostgreSQL {:.3} / {:.3}   {:.1}x at the median", r.name, r.same, r.total, r.engine.0, r.engine.1, r.pg.0, r.pg.1, r.pg.0 / r.engine.0.max(1e-9));
+    for (cold, title) in [(false, "reads"), (true, "cold reads (both sides' own caches emptied before each read; the OS file cache warm for both)")] {
+        let reads = h2h::run_reads(&db, &mut pg, a.num("reads", 200) as usize, a.num("seed", 5), cold).expect("reads");
+        println!("\n== {title} (median / p95 / p99 ms per item; PostgreSQL over loopback TCP)");
+        for r in &reads {
+            all_same &= r.same == r.total;
+            let e = r.engine;
+            match r.pg {
+                Some(p) => println!("  {:<36} same {}/{}   TDB {:.3} / {:.3} / {:.3}   PostgreSQL {:.3} / {:.3} / {:.3}   {:.1}x at the median, {:.1}x at p99", r.name, r.same, r.total, e.0, e.1, e.2, p.0, p.1, p.2, p.0 / e.0.max(1e-9), p.2 / e.2.max(1e-9)),
+                None => println!("  {:<36} same {}/{}   TDB {:.3} / {:.3} / {:.3}   PostgreSQL not measured (its buffers could not be emptied)", r.name, r.same, r.total, e.0, e.1, e.2),
+            }
+        }
     }
     if !all_same {
         println!("\nFAILED: some answers differ");
@@ -1214,6 +1220,7 @@ fn scale(a: &Args) {
     }
     let ms = &dst.merge_stats;
     println!("  merges put in place: {} (read {}, wrote {}); written by flushes {}", ms.merges, mb(ms.bytes_in), mb(ms.bytes_out), mb(ms.flushed));
+    println!("  flushes on their own thread: {} (longest {} ms from start to in place); writes that waited for one: {} (longest {} ms, {} ms in all)", ms.bg_flushes, ms.flush_ms_max, ms.flush_waits, ms.flush_wait_ms_max, ms.flush_wait_ms_total);
     println!("  rebuilt and compared after the merges: {} requests, {wrong} different", kept.len());
     println!("  store: {} in {} segments", mb(dst.stats().store_bytes()), dst.segment_count());
     if wrong > 0 {
