@@ -3,3 +3,4 @@
 /data
 *.tdb
 *.log
+__pycache__/
