@@ -1,4 +1,4 @@
-//! TranscriptDB: a storage and query engine for agent transcripts.
+//! TranscriptDB: a database for LLM agent transcripts.
 //!
 //! This crate is the storage core: requests are split into messages, each session's
 //! messages are kept once as a tree stored main line first in compressed frames, and

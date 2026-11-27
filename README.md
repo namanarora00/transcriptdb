@@ -1,6 +1,6 @@
 # TranscriptDB
 
-A storage and query engine for LLM agent transcripts, written in Rust.
+A database for LLM agent transcripts. Embed it in Rust or run it as an HTTP server.
 
 Agents resend the whole conversation on every model call. TranscriptDB stores each session as a
 tree of messages, keeps every message once, and indexes tool calls and text for querying.
