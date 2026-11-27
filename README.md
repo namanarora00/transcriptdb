@@ -93,6 +93,34 @@ What you can do with them:
 
 The gaps hold at 3 times the data.
 
+**Against DuckDB 2.0**, in the same process, on all 12 cores, with the same tables and indexes
+PostgreSQL got. TranscriptDB on one thread. Queries and reads run on this Mac's 24 real sessions
+copied 30 times (720 sessions, 101,310 requests, 537 MB of distinct text). Sizes are for the
+24 real sessions alone.
+
+| | TranscriptDB | DuckDB | |
+|:--|--:|--:|:--|
+| Size on disk | 6.6 MB | 29 – 32 MB | **4.4 – 4.8× smaller** |
+| Size, each request body kept whole | 6.6 MB | 112 MB | **17× smaller** |
+| Sequence queries | 0.15 – 2.1 ms | 5.1 – 37 ms | **15 – 35× faster** |
+| Aggregations | 0.03 – 0.07 ms | 1.7 – 6.6 ms | **24 – 165× faster** |
+| Text search | 0.01 – 0.50 ms | 5.9 – 59 ms | **82 – 533× faster** |
+| Rule columns | 0.01 – 1.4 ms | 2.1 – 30 ms | **22 – 769× faster** |
+| Scans its index can't narrow | 4.1 – 17 ms | 33 – 78 ms | **4.5 – 8× faster** |
+| Reads, median | 0.15 – 0.31 ms | 1.8 – 6.7 ms | **7 – 40× faster** |
+
+Every answer and read was identical. What favours whom:
+
+- DuckDB was handed TranscriptDB's deduplication (each distinct message once). Storing each
+  request whole, as calls arrive, it is the 17× row.
+- Every DuckDB query pays about 1.7 ms before it starts. DuckDB is built for big scans and full
+  SQL (joins, anything ad hoc), which TranscriptDB's language doesn't offer.
+- The closest race is text with no word for the index to use (a digits regex, `rm -rf`): both
+  sides scan.
+- DuckDB had no full-text extension (it would be downloaded at run time); warm reads only.
+- The 30 copies are near-duplicates. That helps TranscriptDB's compression (17× smaller at 30x),
+  so sizes are given for the real data.
+
 **Many clients at once**: real requests of about 0.7 MB each, every write fsynced, Apple M6.
 
 | Clients | Requests per write | Requests/s | Body MB/s | Read p99 meanwhile |
@@ -101,7 +129,8 @@ The gaps hold at 3 times the data.
 | 12 (HTTP) | 1 | 739 | 498 | 0.8 ms |
 | 12 (HTTP) | 8 | 2,342 | 1,562 | 1.1 ms |
 
-Reproduce with `scripts/h2h.sh` (needs `postgresql@18`) and `tdb load --store DIR --via http`.
+Reproduce with `scripts/h2h.sh` (needs `postgresql@18`), `scripts/duck.sh` (builds DuckDB from
+source) and `tdb load --store DIR --via http`.
 
 ## Tests
 

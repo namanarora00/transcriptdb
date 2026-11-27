@@ -72,7 +72,7 @@ pub fn turn_tree(db: &Db, s: u32) -> (Vec<u32>, Vec<u32>, Vec<Vec<u32>>) {
     (turn_of, depth, paths)
 }
 
-fn text_of(v: Value) -> Option<Vec<u8>> {
+pub(crate) fn text_of(v: Value) -> Option<Vec<u8>> {
     match v {
         Value::Null => None,
         Value::Str(s) => Some(s.as_bytes().to_vec()),
@@ -81,7 +81,7 @@ fn text_of(v: Value) -> Option<Vec<u8>> {
 }
 
 /// The elements of a JSON array that is exactly `[` + elements joined by `,` + `]`.
-fn array_elements(b: &[u8]) -> Option<Vec<&[u8]>> {
+pub(crate) fn array_elements(b: &[u8]) -> Option<Vec<&[u8]>> {
     let (spans, end) = crate::json::elements(b, &(0..b.len())).ok()?;
     if end + 1 != b.len() {
         return None;
@@ -100,7 +100,7 @@ fn array_elements(b: &[u8]) -> Option<Vec<&[u8]>> {
 
 /// Strings as a JSON array (for the rare request whose messages are not separated by bare
 /// commas).
-fn json_strings<'a>(xs: impl Iterator<Item = &'a [u8]>) -> Vec<u8> {
+pub(crate) fn json_strings<'a>(xs: impl Iterator<Item = &'a [u8]>) -> Vec<u8> {
     let mut out = vec![b'['];
     for (i, x) in xs.enumerate() {
         if i > 0 {
@@ -130,7 +130,7 @@ fn parse_json_strings(s: &str) -> Option<Vec<Vec<u8>>> {
 }
 
 fn ints(s: &str) -> Vec<u32> {
-    s.trim_matches(|c| c == '{' || c == '}').split(',').filter(|x| !x.is_empty()).filter_map(|x| x.parse().ok()).collect()
+    s.trim_matches(|c| c == '{' || c == '}' || c == '[' || c == ']').split(',').map(|x| x.trim()).filter(|x| !x.is_empty()).filter_map(|x| x.parse().ok()).collect()
 }
 
 /// Insert cache-marker texts at their offsets.
@@ -177,7 +177,15 @@ pub fn pg_rebuild(pg: &mut Pg, id: &str) -> R<Vec<u8>> {
             _ => {}
         }
     }
-    let (ids, notes, layout) = head.ok_or("no such request")?;
+    assemble(msgs, &pcs, head.ok_or("no such request")?)
+}
+
+/// A request put together from its parts as a SQL engine returns them: its messages with
+/// their positions, its pieces by id (body, and the skeleton's holes as array text), and
+/// (piece ids "skeleton,system,tools" with -1 for none, cache notes as array text, layout).
+/// The same assembly as the store's.
+pub(crate) fn assemble(mut msgs: Vec<(u64, String)>, pcs: &HashMap<u32, (String, Option<String>)>, head: (String, Option<String>, Option<String>)) -> R<Vec<u8>> {
+    let (ids, notes, layout) = head;
     msgs.sort_by_key(|m| m.0);
     let ids: Vec<i64> = ids.split(',').filter_map(|x| x.parse().ok()).collect();
     let piece = |i: i64| pcs.get(&(i as u32)).ok_or_else(|| format!("missing piece {i}"));
@@ -237,6 +245,21 @@ pub fn pg_rebuild(pg: &mut Pg, id: &str) -> R<Vec<u8>> {
 /// letters and digits, which is what the engine's `has` matches (runs over 255 bytes are
 /// left out).
 fn terms_vector(low: &str) -> String {
+    let mut out = String::new();
+    for w in words(low) {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push('\'');
+        out.push_str(w);
+        out.push('\'');
+    }
+    out
+}
+
+/// The whole words of lower-cased text, each once: maximal runs of letters and digits (runs
+/// over 255 bytes left out), which is what the engine's `has` matches.
+pub(crate) fn words(low: &str) -> BTreeSet<&str> {
     let mut words: BTreeSet<&str> = BTreeSet::new();
     let mut start = None;
     for (i, ch) in low.char_indices() {
@@ -256,16 +279,7 @@ fn terms_vector(low: &str) -> String {
     {
         words.insert(&low[a..]);
     }
-    let mut out = String::new();
-    for w in words {
-        if !out.is_empty() {
-            out.push(' ');
-        }
-        out.push('\'');
-        out.push_str(w);
-        out.push('\'');
-    }
-    out
+    words
 }
 
 /// Load the store into PostgreSQL (tables dropped first).
@@ -807,7 +821,7 @@ pub fn queries() -> Vec<QuerySpec> {
     ]
 }
 
-fn cell_eq(a: &str, b: &str) -> bool {
+pub(crate) fn cell_eq(a: &str, b: &str) -> bool {
     if a == b {
         return true;
     }
@@ -817,7 +831,7 @@ fn cell_eq(a: &str, b: &str) -> bool {
     }
 }
 
-fn engine_cell(v: &Value) -> String {
+pub(crate) fn engine_cell(v: &Value) -> String {
     match v {
         Value::Null => String::new(),
         Value::Float(f) => format!("{f}"),
@@ -836,7 +850,7 @@ pub struct Outcome {
     pub detail: String,
 }
 
-fn best<T>(reps: usize, mut f: impl FnMut() -> R<T>) -> R<(T, f64)> {
+pub(crate) fn best<T>(reps: usize, mut f: impl FnMut() -> R<T>) -> R<(T, f64)> {
     let mut out = None;
     let mut t = f64::MAX;
     for _ in 0..reps.max(1) {
@@ -890,12 +904,12 @@ pub struct ReadOutcome {
     pub pg: Option<(f64, f64, f64)>,
 }
 
-fn quantiles(v: &[f64]) -> (f64, f64, f64) {
+pub(crate) fn quantiles(v: &[f64]) -> (f64, f64, f64) {
     let mut v = v.to_vec();
     (quantile(&mut v, 0.5), quantile(&mut v, 0.95), quantile(&mut v, 0.99))
 }
 
-fn sql_str(s: &str) -> String {
+pub(crate) fn sql_str(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
 }
 

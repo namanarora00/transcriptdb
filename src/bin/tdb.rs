@@ -701,6 +701,60 @@ fn head_to_head(a: &Args) {
     }
 }
 
+/// `tdb duck --store DIR --duck FILE [--reps 7] [--reads 300] [--duck-threads 12,1]
+/// [--raw FILE] [--no-keys x]` (built with `--features duckdb`): the head-to-head of `h2h` against DuckDB
+/// in this process (see `duck.rs`). `--raw` also loads every request body whole into a
+/// DuckDB file of its own and reports its size.
+#[cfg(feature = "duckdb")]
+fn duck(a: &Args) {
+    use transcriptdb::duck;
+    let db = Db::open(a.store(), a.opts()).expect("open store");
+    let path = PathBuf::from(a.get("duck").expect("--duck FILE"));
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(path.with_extension("duckdb.wal"));
+    let conn = duckdb::Connection::open(&path).expect("open duckdb");
+    let ver = duck::rows(&conn, "SELECT version()").ok().and_then(|r| r.first()?.first()?.clone()).unwrap_or_default();
+    let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+    println!("DuckDB {ver} in this process; {cores} cores");
+    let keys = a.get("no-keys").is_none();
+    println!("{} ({})", duck::load(&db, &conn, keys).expect("load"), if keys { "with primary keys" } else { "no primary keys or indexes" });
+    let st = db.stats();
+    let (dsize, dsize_nt) = duck::sizes(&conn, &path).expect("sizes");
+    println!("\n== size on disk");
+    println!("  TranscriptDB store: {}", mb(st.store_bytes()));
+    println!("  DuckDB: {} ({} without its copy of the text for search); DuckDB / TranscriptDB {:.2}x", mb(dsize), mb(dsize_nt), dsize as f64 / st.store_bytes() as f64);
+    if let Some(raw) = a.get("raw") {
+        let (size, secs) = duck::raw_bodies(&db, Path::new(raw)).expect("raw bodies");
+        let bytes: u64 = db.all_requests().unwrap().iter().map(|&ri| db.rebuild(ri).unwrap().len() as u64).sum();
+        println!("  DuckDB holding every request body whole ({} of bodies): {} in {secs:.1}s; / TranscriptDB {:.1}x", mb(bytes), mb(size), size as f64 / st.store_bytes() as f64);
+        let _ = std::fs::remove_file(raw);
+    }
+    let threads: Vec<usize> = a.get("duck-threads").map(|t| t.split(',').map(|x| x.parse().expect("--duck-threads 12,1")).collect()).unwrap_or(vec![cores, 1]);
+    let reps = a.num("reps", 7) as usize;
+    let out = duck::run_queries(&db, &conn, reps, &threads).expect("queries");
+    println!("\n== queries over {} steps in {} sessions (best of {reps})", (0..db.session_count() as u32).map(|s| db.steps(s).rows.len()).sum::<usize>(), db.session_count());
+    let heads: Vec<String> = threads.iter().map(|t| format!("DuckDB {t}t")).collect();
+    println!("  {:<48} {:>5} {:>10} {:>10} {}  answer", "query", "same", "TDB 1t", "TDB 8t", heads.iter().map(|h| format!("{h:>12}")).collect::<String>());
+    let mut all_same = true;
+    let ms = |x: f64| if x < 1.0 { format!("{x:.3}") } else { format!("{x:.2}") };
+    for (o, d) in &out {
+        all_same &= o.same;
+        println!("  {:<48} {:>5} {:>7} ms {:>7} ms {}  {}", o.name, if o.same { "yes" } else { "NO" }, ms(o.engine_ms), ms(o.engine_ms_par), d.iter().map(|x| format!("{:>9} ms", ms(*x))).collect::<String>(), o.detail);
+    }
+    conn.execute_batch(&format!("SET threads = {cores}")).expect("threads");
+    let reads = duck::run_reads(&db, &conn, a.num("reads", 300) as usize, a.num("seed", 5)).expect("reads");
+    println!("\n== reads, warm (median / p95 / p99 ms per item)");
+    for r in &reads {
+        all_same &= r.same == r.total;
+        let (e, p) = (r.engine, r.pg.unwrap());
+        println!("  {:<36} same {}/{}   TDB {:.3} / {:.3} / {:.3}   DuckDB {:.3} / {:.3} / {:.3}", r.name, r.same, r.total, e.0, e.1, e.2, p.0, p.1, p.2);
+    }
+    if !all_same {
+        println!("\nFAILED: some answers differ");
+        std::process::exit(1);
+    }
+}
+
 /// Generated match queries: the engine against the slow reference, session by session.
 /// Screen every session with a fixed set of filters, the way a first pass before a costly
 /// review would: how long each filter takes on one thread and what share of sessions it
@@ -1682,6 +1736,8 @@ fn main() {
         "scale" => scale(&a),
         "check-rules" => check_rules(&a),
         "h2h" => head_to_head(&a),
+        #[cfg(feature = "duckdb")]
+        "duck" => duck(&a),
         "synth" => synth_store(&a),
         "steps" => steps_summary(&a),
         "bench" => bench(&a),

@@ -15,6 +15,11 @@ regex = "1"
 regex-syntax = "0.8"
 base64 = "0.22"
 libc = "0.2"
+duckdb = { version = "1.20001.0", features = ["bundled"], optional = true }
+
+[features]
+# the head-to-head against DuckDB (`tdb duck`); builds DuckDB from source
+duckdb = ["dep:duckdb"]
 
 [profile.release]
 debug = 1
