@@ -221,7 +221,7 @@ pub fn run(store: &Path, work: &Path, opts: &Options, n: usize, seed: u64, batch
             let (sid, agent) = a.session_key(r.session);
             body.clear();
             a.rebuild_into(ri, &mut body, &mut Default::default())?;
-            b.put(&Put { session: &sid, agent: &agent, id: &r.id, time: &r.time, meta: &r.meta, body: &body })?;
+            b.put(&Put { session: &sid, agent: &agent, id: &r.id, time: &r.time, meta: &r.meta, body: &body, response: b"" })?;
             if k % 256 == 255 {
                 b.commit()?;
             }

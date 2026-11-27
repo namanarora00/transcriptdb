@@ -70,6 +70,12 @@ pub struct Pool {
     clock: AtomicU64,
 }
 
+impl std::fmt::Debug for Pool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Pool({} of {} bytes)", self.used(), self.limit)
+    }
+}
+
 impl Pool {
     pub fn new(limit: usize) -> Arc<Pool> {
         Arc::new(Pool { limit, total: AtomicUsize::new(0), members: Mutex::new(Vec::new()), clock: AtomicU64::new(1) })

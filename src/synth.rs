@@ -34,6 +34,7 @@ impl Rng {
     }
 }
 
+#[derive(Debug, Clone)]
 pub struct SynthRequest {
     pub session: String,
     pub agent: String,

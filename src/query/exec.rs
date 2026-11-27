@@ -1260,6 +1260,12 @@ fn sort_rows(db: &Db, mut t: Table, keys: &[(Expr, bool)], now: i64, limit: Opti
 
 /// Headers and cells for printing.
 pub fn render(db: &Db, t: &Table, limit: usize) -> Result<(Vec<String>, Vec<Vec<String>>), QError> {
+    let (heads, rows) = render_values(db, t, limit)?;
+    Ok((heads, rows.into_iter().map(|r| r.into_iter().map(|v| v.to_string()).collect()).collect()))
+}
+
+/// [`render`] with each cell as its value rather than its text.
+pub fn render_values(db: &Db, t: &Table, limit: usize) -> Result<(Vec<String>, Vec<Vec<Value>>), QError> {
     let now = now_ms();
     let mut heads: Vec<String> = Vec::new();
     let mut exprs: Vec<Expr> = Vec::new();
@@ -1298,7 +1304,7 @@ pub fn render(db: &Db, t: &Table, limit: usize) -> Result<(Vec<String>, Vec<Vec<
     for row in t.rows.iter().take(limit) {
         let mut line = Vec::new();
         for e in &exprs {
-            line.push(eval_row(db, t, row, e, now)?.to_string());
+            line.push(eval_row(db, t, row, e, now)?);
         }
         cells.push(line);
     }

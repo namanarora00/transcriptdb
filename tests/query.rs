@@ -44,7 +44,7 @@ fn store(name: &str, sessions: &[Vec<String>]) -> (Db, std::path::PathBuf) {
         for b in bodies {
             let id = format!("r{k}");
             let time = format!("{}", 1_700_000_000 + k);
-            db.put(&Put { session: &format!("s{s}"), agent: "", id: &id, time: &time, meta: b"", body: b.as_bytes() }).unwrap();
+            db.put(&Put { session: &format!("s{s}"), agent: "", id: &id, time: &time, meta: b"", body: b.as_bytes(), response: b"" }).unwrap();
             k += 1;
         }
     }
@@ -142,7 +142,7 @@ fn generated_queries_match_the_reference() {
     let mut db = Db::open(&dir, opts()).unwrap();
     for s in 0..16 {
         for q in synth::session(5, s, 45) {
-            db.put(&Put { session: &q.session, agent: &q.agent, id: &q.id, time: &q.time, meta: b"", body: &q.body }).unwrap();
+            db.put(&Put { session: &q.session, agent: &q.agent, id: &q.id, time: &q.time, meta: b"", body: &q.body, response: b"" }).unwrap();
         }
     }
     db.commit().unwrap();
@@ -164,7 +164,7 @@ fn columnar_summarize_equals_the_general_path() {
     let mut db = Db::open(&dir, opts()).unwrap();
     for s in 0..12 {
         for q in synth::session(8, s, 40) {
-            db.put(&Put { session: &q.session, agent: &q.agent, id: &q.id, time: &q.time, meta: b"", body: &q.body }).unwrap();
+            db.put(&Put { session: &q.session, agent: &q.agent, id: &q.id, time: &q.time, meta: b"", body: &q.body, response: b"" }).unwrap();
         }
     }
     db.commit().unwrap();
@@ -189,7 +189,7 @@ fn columnar_summarize_equals_the_general_path() {
 }
 
 fn put_req(db: &mut Db, q: &synth::SynthRequest) {
-    db.put(&Put { session: &q.session, agent: &q.agent, id: &q.id, time: &q.time, meta: b"", body: &q.body }).unwrap();
+    db.put(&Put { session: &q.session, agent: &q.agent, id: &q.id, time: &q.time, meta: b"", body: &q.body, response: b"" }).unwrap();
 }
 
 /// Requests of `sessions` rich synthetic sessions, interleaved.
@@ -281,7 +281,8 @@ fn aggregations_skip_parts_that_folds_replaced() {
             db.commit().unwrap();
         }
     }
-    db.flush().unwrap();
+    // merges run on their own thread: wait for them, or a busy machine may not have folded yet
+    db.settle().unwrap();
     let st = db.stats();
     assert!(st.merges.folded > 0 && st.dead_bytes > 0, "no parts replaced by folds: {:?}", st.merges);
     let used = check_aggregations(&db, 150, 9);
@@ -377,7 +378,7 @@ fn message_search_matches_a_scan_at_every_stage() {
     };
     let third = traffic.len() / 3;
     for (k, q) in traffic.iter().enumerate() {
-        db.put(&Put { session: &q.session, agent: &q.agent, id: &q.id, time: &q.time, meta: b"", body: &q.body }).unwrap();
+        db.put(&Put { session: &q.session, agent: &q.agent, id: &q.id, time: &q.time, meta: b"", body: &q.body, response: b"" }).unwrap();
         if k + 1 == third {
             db.commit().unwrap();
             check(&db, "in memory");
@@ -439,7 +440,7 @@ fn phrases_across_pieces_and_shared_session_ids() {
     let mut db = Db::open(&dir, opts()).unwrap();
     let put = |db: &mut Db, session: &str, agent: &str, k: usize, text: &str| {
         let b = body(&[format!(r#"{{"role":"user","content":"{text}"}}"#)]);
-        db.put(&Put { session, agent, id: &format!("r{k}"), time: &format!("{}", 1_700_000_000 + k), meta: b"", body: b.as_bytes() }).unwrap();
+        db.put(&Put { session, agent, id: &format!("r{k}"), time: &format!("{}", 1_700_000_000 + k), meta: b"", body: b.as_bytes(), response: b"" }).unwrap();
     };
     for (k, t) in texts.iter().enumerate() {
         put(&mut db, &format!("s{k}"), "", k, t);
@@ -538,7 +539,7 @@ fn text_search_after_a_session_wakes() {
     let second = r#"{"role":"user","content":"and the second message says needle two there"}"#.to_string();
     let put = |db: &mut Db, k: usize, msgs: &[String]| {
         let b = body(msgs);
-        db.put(&Put { session: "w", agent: "", id: &format!("r{k}"), time: &format!("{}", 1_700_000_000 + k), meta: b"", body: b.as_bytes() }).unwrap();
+        db.put(&Put { session: "w", agent: "", id: &format!("r{k}"), time: &format!("{}", 1_700_000_000 + k), meta: b"", body: b.as_bytes(), response: b"" }).unwrap();
         db.commit().unwrap();
     };
     let count = |db: &Db, q: &str| -> usize { query::run(db, q, 1).unwrap_or_else(|e| panic!("{}", e.show(q))).table.rows.len() };

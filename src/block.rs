@@ -171,6 +171,71 @@ pub fn forget(path: &Path) {
     });
 }
 
+/// Files a store replaced, deleted on a thread of their own once nothing reads them.
+///
+/// A segment or index run a merge replaced may still be read by snapshots taken before the
+/// merge was put in place (and files are reopened by path when their handle was closed to
+/// stay under the cap), so the store only marks it doomed; the file goes when the last
+/// handle on it is dropped ([`Doom`]).
+struct Deleter {
+    tx: std::sync::mpsc::Sender<PathBuf>,
+}
+
+static DELETER: Mutex<Option<Deleter>> = Mutex::new(None);
+/// Files handed to the deleter and not yet gone.
+static PENDING: (Mutex<usize>, std::sync::Condvar) = (Mutex::new(0), std::sync::Condvar::new());
+
+/// Close `path` and delete it on the deleter's thread.
+pub fn remove_later(path: PathBuf) {
+    forget(&path);
+    *PENDING.0.lock().unwrap() += 1;
+    let mut g = DELETER.lock().unwrap();
+    let d = g.get_or_insert_with(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<PathBuf>();
+        let _ = std::thread::Builder::new().name("tdb-remove".into()).spawn(move || {
+            for p in rx {
+                let _ = std::fs::remove_file(&p);
+                let mut n = PENDING.0.lock().unwrap();
+                *n -= 1;
+                if *n == 0 {
+                    PENDING.1.notify_all();
+                }
+            }
+        });
+        Deleter { tx }
+    });
+    if let Err(e) = d.tx.send(path) {
+        // the thread is gone: delete here
+        let _ = std::fs::remove_file(e.0);
+        *PENDING.0.lock().unwrap() -= 1;
+    }
+}
+
+/// Wait until every file handed to [`remove_later`] is gone.
+pub fn wait_removed() {
+    let mut n = PENDING.0.lock().unwrap();
+    while *n > 0 {
+        n = PENDING.1.wait(n).unwrap();
+    }
+}
+
+/// A file that is deleted when its owner is dropped, once marked: segments and index runs
+/// hold one, and every handle on them is an `Arc` (the store's, and each snapshot's).
+#[derive(Debug, Default)]
+pub struct Doom(std::sync::atomic::AtomicBool);
+
+impl Doom {
+    pub fn set(&self) {
+        self.0.store(true, std::sync::atomic::Ordering::Release);
+    }
+    /// Called from the owner's `drop`: delete `path` if marked.
+    pub fn drop_file(&self, path: &Path) {
+        if self.0.load(std::sync::atomic::Ordering::Acquire) {
+            remove_later(path.to_path_buf());
+        }
+    }
+}
+
 thread_local! {
     /// Per thread: handles already looked up, held weakly so closing still works.
     static HANDLES: std::cell::RefCell<HashMap<u64, std::sync::Weak<File>>> = std::cell::RefCell::new(HashMap::new());

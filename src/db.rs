@@ -107,6 +107,9 @@ pub struct Options {
     /// new buffer takes the writes that follow (up to twice `flush_bytes` in all before a
     /// write waits). Without it the write that fills memory waits for the flush.
     pub background_flush: bool,
+    /// A cache budget shared with other stores (a server's projects): when set, this
+    /// store's caches use it instead of a budget of `cache_bytes` of their own.
+    pub cache_pool: Option<Arc<crate::cache::Pool>>,
 }
 
 impl Default for Options {
@@ -134,12 +137,13 @@ impl Default for Options {
             threads: std::thread::available_parallelism().map_or(4, |n| n.get()),
             background_merges: true,
             background_flush: true,
+            cache_pool: None,
         }
     }
 }
 
 /// One request as it arrives: the exact body the model API received, plus who sent it.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct Put<'a> {
     pub session: &'a str,
     /// Empty for the main agent; a subagent id otherwise.
@@ -148,6 +152,38 @@ pub struct Put<'a> {
     pub time: &'a str,
     pub meta: &'a [u8],
     pub body: &'a [u8],
+    /// The response the model gave, kept exactly as it came (empty: none). Not split or
+    /// read as messages; [`Db::response`] gives it back.
+    pub response: &'a [u8],
+}
+
+/// A request body split and hashed: the part of a put that needs nothing from the store
+/// (it is most of a put's work, since a body carries the whole conversation so far), so
+/// threads taking requests do it at once before handing them to the one thread that writes.
+pub struct Prepared {
+    sp: split::Split,
+    /// Each message's hash, as it came.
+    hashes: Vec<u128>,
+    skeleton: Vec<u8>,
+    system_hash: u128,
+    tools_hash: u128,
+    skeleton_hash: u128,
+}
+
+impl Prepared {
+    /// Split `body` and hash its parts; with `verify_split`, check the parts join back to it.
+    pub fn new(opts: &Options, body: &[u8]) -> Result<Prepared> {
+        let sp = split::split(body)?;
+        if opts.verify_split && split::join(&sp)? != body {
+            return Err(Error::BadRequest("split pieces do not join back to the body".into()));
+        }
+        let hashes = sp.messages.iter().map(|m| xxh3_128(&m.bytes)).collect();
+        let skeleton = sp.skeleton.encode();
+        let system_hash = sp.system.as_ref().map_or(0, |x| piece_hash(PIECE_SYSTEM, &x.bytes));
+        let tools_hash = sp.tools.as_ref().map_or(0, |x| piece_hash(PIECE_TOOLS, &x.bytes));
+        let skeleton_hash = piece_hash(PIECE_SKELETON, &skeleton);
+        Ok(Prepared { sp, hashes, skeleton, system_hash, tools_hash, skeleton_hash })
+    }
 }
 
 /// A stored request: its session in the high 32 bits, its index in the session below.
@@ -211,6 +247,11 @@ impl SessionCore {
     pub fn key(&self) -> (&str, &str) {
         (&self.key.0, &self.key.1)
     }
+
+    /// The session's requests, in the order they were stored.
+    pub fn requests(&self) -> &[ReqRec] {
+        &self.requests
+    }
 }
 
 impl SessionCore {
@@ -241,7 +282,9 @@ struct Active {
 
 impl Active {
     fn new(core: Arc<SessionCore>, steps: Arc<SessionSteps>, last: u64) -> Active {
-        let mut stored_kids: Vec<u32> = (0..core.nodes.len() as u32).collect();
+        // responses are never walked through
+        let responses: std::collections::HashSet<u32> = core.requests.iter().map(|r| r.response).filter(|&r| r != NONE).collect();
+        let mut stored_kids: Vec<u32> = (0..core.nodes.len() as u32).filter(|i| !responses.contains(i)).collect();
         stored_kids.sort_by_key(|&i| core.nodes[i as usize].parent);
         Active { core, steps, children: HashMap::new(), stored_kids, keyed: Default::default(), last }
     }
@@ -277,22 +320,61 @@ struct OpaqueMeta {
     loc: OLoc,
 }
 
+/// Unflushed data: messages, shared pieces and opaque values, and the requests that came
+/// with them, numbered on from the ids already in files. The buffer taking writes is one;
+/// a snapshot seals it, so the writer goes on in a new one while the snapshot reads the
+/// sealed one (see [`Db::snapshot`]); a flush writes them all out as one.
 #[derive(Default)]
 struct Mem {
     /// `Loc::Mem(node_base + i)` is `nodes[i]`.
     node_base: u32,
-    nodes: Vec<Box<[u8]>>,
+    nodes: Vec<Arc<[u8]>>,
     /// Pieces with ids from `piece_base` on.
     piece_base: u32,
     pieces: Vec<(u8, u128, Arc<[u8]>)>,
     /// Opaque values with ids from `opaque_base` on: (enc, kind, hash, payload).
     opaque_base: u64,
-    opaques: Vec<(u8, u8, u128, Box<[u8]>)>,
+    opaques: Vec<(u8, u8, u128, Arc<[u8]>)>,
     piece_ix: HashMap<u128, u32>,
     opaque_ix: HashMap<u128, u64>,
     req_ix: HashMap<Box<str>, ReqId>,
     bytes: usize,
     touched: BTreeSet<u32>,
+}
+
+impl Mem {
+    fn is_empty(&self) -> bool {
+        self.nodes.is_empty() && self.pieces.is_empty() && self.opaques.is_empty() && self.req_ix.is_empty() && self.touched.is_empty()
+    }
+
+    /// An empty buffer for the ids after this one's.
+    fn next(&self) -> Mem {
+        Mem {
+            node_base: self.node_base + self.nodes.len() as u32,
+            piece_base: self.piece_base + self.pieces.len() as u32,
+            opaque_base: self.opaque_base + self.opaques.len() as u64,
+            ..Mem::default()
+        }
+    }
+
+    /// Buffers that follow each other (oldest first) as one; their contents are shared.
+    fn join(ms: &[&Mem]) -> Result<Mem> {
+        let mut out = Mem { node_base: ms[0].node_base, piece_base: ms[0].piece_base, opaque_base: ms[0].opaque_base, ..Mem::default() };
+        for m in ms {
+            if m.node_base != out.node_base + out.nodes.len() as u32 || m.piece_base != out.piece_base + out.pieces.len() as u32 || m.opaque_base != out.opaque_base + out.opaques.len() as u64 {
+                return corrupt("unflushed buffers do not follow each other");
+            }
+            out.nodes.extend(m.nodes.iter().cloned());
+            out.pieces.extend(m.pieces.iter().cloned());
+            out.opaques.extend(m.opaques.iter().cloned());
+            out.piece_ix.extend(m.piece_ix.iter().map(|(k, v)| (*k, *v)));
+            out.opaque_ix.extend(m.opaque_ix.iter().map(|(k, v)| (*k, *v)));
+            out.req_ix.extend(m.req_ix.iter().map(|(k, v)| (k.clone(), *v)));
+            out.bytes += m.bytes;
+            out.touched.extend(m.touched.iter().copied());
+        }
+        Ok(out)
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -399,6 +481,29 @@ struct BlobFile {
     uid: u64,
     path: PathBuf,
     len: u64,
+    /// Shared with views and snapshots: the file is deleted, once doomed, when the last of
+    /// them lets it go (see [`crate::block::Doom`]).
+    keep: Arc<BlobKeep>,
+}
+
+impl BlobFile {
+    fn new(path: PathBuf, len: u64) -> BlobFile {
+        BlobFile { uid: crate::block::uid(), keep: Arc::new(BlobKeep { path: path.clone(), doom: Default::default() }), path, len }
+    }
+    fn share(&self) -> BlobFile {
+        BlobFile { uid: self.uid, path: self.path.clone(), len: self.len, keep: self.keep.clone() }
+    }
+}
+
+struct BlobKeep {
+    path: PathBuf,
+    doom: crate::block::Doom,
+}
+
+impl Drop for BlobKeep {
+    fn drop(&mut self) {
+        self.doom.drop_file(&self.path);
+    }
 }
 
 /// Where a query that reads summaries finds steps (see [`Db::step_sources`]).
@@ -661,47 +766,31 @@ impl crate::rules::StepView for RuleView<'_> {
     }
 }
 
-pub struct Db {
+/// Every cache of a store, behind one byte budget. The handle taking writes and every
+/// snapshot taken from it share one `Caches`, the way a database server's buffer pool is
+/// shared by all its connections. What a key names never changes: blocks of a file that is
+/// never rewritten, a message, a piece; and a session's tables and steps read from files are
+/// keyed by the manifest generation they were read at, so a snapshot reading an older
+/// generation never hands its tables to a newer one.
+pub(crate) struct Caches {
     /// The byte budget all the caches below share.
     pool: Arc<crate::cache::Pool>,
-    dir: PathBuf,
-    /// Held with an exclusive lock while the store is open.
-    _lock: fs::File,
-    opts: Options,
-    manifest: Manifest,
-    segs: BTreeMap<u32, Arc<Segment>>,
-    /// Segments a merge replaced that sessions taking writes still read their flushed
-    /// messages from (the same bytes are in the merge's output): kept open, out of the
-    /// manifest, until no such session points at them, then deleted.
-    retired: HashMap<u32, Arc<Segment>>,
-    /// Threads deleting replaced files.
-    removing: Vec<std::thread::JoinHandle<()>>,
-    /// Per segment: its tool and field codes mapped to the store's.
-    seg_codes: HashMap<u32, (Vec<u32>, Vec<u32>)>,
-    /// Column rules (`rules.rs`) and the store's field code of each rule's column.
-    rules: Arc<RuleSet>,
-    rule_fields: Vec<u32>,
-    /// Per segment: what reading its steps does about rule columns.
-    seg_rules: Mutex<HashMap<u32, Arc<SegRules>>>,
-    /// Index runs in id order (oldest first), so piece and opaque id ranges ascend.
-    runs: Vec<Arc<Run>>,
-    blob_files: BTreeMap<u32, BlobFile>,
     /// Directory blocks by (segment, block).
     dirs: Cache<(u32, u32), Vec<DirEnt>>,
     /// Segment blocks by (segment, offset).
     blocks: Cache<(u32, u64), Vec<u8>>,
     /// Index blocks by (run, kind, index).
     ix: Cache<(u32, u8, u32), IxBlock>,
-    cores: Cache<u32, SessionCore>,
+    cores: Cache<(u32, u64), SessionCore>,
     /// Session tables without their requests (see [`Db::load_node_map`]).
-    nodemaps: Cache<u32, SessionCore>,
-    stepc: Cache<u32, SessionSteps>,
+    nodemaps: Cache<(u32, u64), SessionCore>,
+    stepc: Cache<(u32, u64), SessionSteps>,
     /// Sessions' steps without their input values, for queries that read none.
-    lightc: Cache<u32, SessionSteps>,
+    lightc: Cache<(u32, u64), SessionSteps>,
     /// Sessions' steps with the values of only the fields queries tested.
-    fieldc: Cache<u32, SessionSteps>,
+    fieldc: Cache<(u32, u64), SessionSteps>,
     /// Sessions' text units (what the user wrote and the assistant said), read whole.
-    msgtextc: Cache<u32, crate::text::SessionTexts>,
+    msgtextc: Cache<(u32, u64), crate::text::SessionTexts>,
     /// Segments' word indexes over message text: units and word lists.
     texthead: Cache<u32, crate::textindex::TextHead>,
     /// Their postings, by (segment, block).
@@ -716,9 +805,6 @@ pub struct Db {
     /// candidates are spread over far more step blocks than fit a cache.
     textc: Cache<(u32, u32, u32), Vec<u8>>,
     pieces: Cache<u32, Vec<u8>>,
-    /// Per piece kind, the last few pieces stored, with how many pieces reading each one
-    /// needs first: new pieces of that kind are compressed against one of them when that pays.
-    piece_bases: HashMap<u8, Vec<(u32, u8)>>,
     skels: Cache<u32, Skeleton>,
     /// Decoded summary blocks by (segment, offset).
     statc: Cache<(u32, u64), StatBlock>,
@@ -743,6 +829,70 @@ pub struct Db {
     head_res: Mutex<HashMap<u32, Arc<crate::textindex::TextHead>>>,
     /// A number for each session id and each agent name seen so far, by stored session.
     key_ids: Mutex<KeyIds>,
+}
+
+impl Caches {
+    /// Empty caches on one budget (`pool`): memory goes to what is being read now.
+    fn new(pool: Arc<crate::cache::Pool>) -> Caches {
+        Caches {
+            pool: pool.clone(),
+            dirs: Cache::pooled(&pool, 16),
+            blocks: Cache::pooled(&pool, 16),
+            ix: Cache::pooled(&pool, 16),
+            cores: Cache::pooled(&pool, 1),
+            nodemaps: Cache::pooled(&pool, 4),
+            stepc: Cache::pooled(&pool, 1),
+            lightc: Cache::pooled(&pool, 1),
+            fieldc: Cache::pooled(&pool, 1),
+            msgtextc: Cache::pooled(&pool, 1),
+            texthead: Cache::pooled(&pool, 1),
+            textpost: Cache::pooled(&pool, 16),
+            unitc: Cache::pooled(&pool, 4),
+            piecec: Cache::pooled(&pool, 4),
+            textc: Cache::pooled(&pool, 16),
+            pieces: Cache::pooled(&pool, 16),
+            skels: Cache::pooled(&pool, 16),
+            statc: Cache::pooled(&pool, 1),
+            longc: Cache::pooled(&pool, 16),
+            live_masks: Mutex::new(HashMap::new()),
+            dir_res: Mutex::new(HashMap::new()),
+            field_groups: Mutex::new(HashMap::new()),
+            head_res: Mutex::new(HashMap::new()),
+            key_ids: Mutex::new(KeyIds::default()),
+        }
+    }
+}
+
+pub struct Db {
+    /// Caches, shared by the writing handle and the snapshots taken from it (see
+    /// [`Caches`]).
+    c: Arc<Caches>,
+    dir: PathBuf,
+    /// Held with an exclusive lock while the store is open (by the handle `open` returned;
+    /// views and snapshots hold none).
+    _lock: Option<fs::File>,
+    opts: Options,
+    manifest: Manifest,
+    segs: BTreeMap<u32, Arc<Segment>>,
+    /// Segments a merge replaced that sessions taking writes still read their flushed
+    /// messages from (the same bytes are in the merge's output): kept open, out of the
+    /// manifest, until no such session points at them, then deleted.
+    retired: HashMap<u32, Arc<Segment>>,
+    /// The handle `open` returned, which owns the store's files; views and snapshots do not.
+    owner: bool,
+    /// Per segment: its tool and field codes mapped to the store's.
+    seg_codes: HashMap<u32, (Vec<u32>, Vec<u32>)>,
+    /// Column rules (`rules.rs`) and the store's field code of each rule's column.
+    rules: Arc<RuleSet>,
+    rule_fields: Vec<u32>,
+    /// Per segment: what reading its steps does about rule columns.
+    seg_rules: Mutex<HashMap<u32, Arc<SegRules>>>,
+    /// Index runs in id order (oldest first), so piece and opaque id ranges ascend.
+    runs: Vec<Arc<Run>>,
+    blob_files: BTreeMap<u32, BlobFile>,
+    /// Per piece kind, the last few pieces stored, with how many pieces reading each one
+    /// needs first: new pieces of that kind are compressed against one of them when that pays.
+    piece_bases: HashMap<u8, Vec<(u32, u8)>>,
     active: HashMap<u32, Active>,
     /// Sessions that took writes in the last `idle_flushes` flushes, as of the last flush
     /// (merges after it drop them from `active`).
@@ -750,6 +900,10 @@ pub struct Db {
     key_ix: HashMap<(String, String), u32>,
     next_session: u32,
     mem: Mem,
+    /// Buffers sealed by snapshots since the last flush started, oldest first: they follow
+    /// each other and `mem` follows them. Neighbours are joined as they pile up, so there
+    /// are only about log2 of the snapshots taken of them.
+    sealed: Vec<Arc<Mem>>,
     /// The write buffer being flushed, while a flush writes it out (on its own thread, or
     /// in [`Db::flush`]); reads see it as unflushed data until the flush is put in place.
     frozen: Option<Arc<Mem>>,
@@ -766,6 +920,32 @@ pub struct Db {
     orphan_results: usize,
     pub recovery: RecoveryReport,
     pub merge_stats: MergeStats,
+}
+
+/// Blob file number of a piece or opaque value [`Db::vacuum`] removed: no live request uses
+/// it, and its table entry says where nothing is.
+const GONE: u32 = u32::MAX;
+
+/// What [`Db::drop_sessions`] and [`Db::vacuum`] did.
+#[derive(Debug, Clone, Default)]
+pub struct DropReport {
+    pub sessions: u64,
+    pub requests: u64,
+    /// Segment bytes that hold deleted sessions, until merges or a vacuum rewrite them.
+    pub dead_bytes: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct VacuumReport {
+    pub segments_before: usize,
+    pub segments_after: usize,
+    pub segment_bytes_before: u64,
+    pub segment_bytes_after: u64,
+    pub blob_bytes_before: u64,
+    pub blob_bytes_after: u64,
+    pub pieces_removed: u64,
+    pub opaques_removed: u64,
+    pub ms: u64,
 }
 
 /// Messages a merge needs (bytes) to train a dictionary and write at `merge_level`.
@@ -839,6 +1019,10 @@ impl Drop for Db {
     /// must not appear after the store is closed (they would be orphans, and their numbers
     /// could be handed out again by the next open).
     fn drop(&mut self) {
+        // views and snapshots own no files
+        if !self.owner {
+            return;
+        }
         // a flush at work finishes writing its files; they are not put in place (its data is
         // in the log, and the files are removed as orphans at the next open)
         if let Some(mut f) = self.fbg.take()
@@ -847,11 +1031,9 @@ impl Drop for Db {
             let _ = h.join();
         }
         // segments kept only for sessions taking writes are not in the manifest: they go too
-        self.removed();
-        for (n, _) in std::mem::take(&mut self.retired) {
-            let p = seg_path(&self.dir, n);
-            crate::block::forget(&p);
-            let _ = fs::remove_file(p);
+        // (once snapshots still reading them are dropped)
+        for (_, seg) in std::mem::take(&mut self.retired) {
+            seg.doom();
         }
         if let Some(mut bg) = self.bg.take() {
             bg.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -872,52 +1054,33 @@ impl Drop for Db {
 
 impl Db {
     /// A store's state with nothing loaded yet.
-    fn blank(dir: PathBuf, lock: fs::File, opts: Options, manifest: Manifest, wal: Option<WalWriter>, cb: usize) -> Db {
-        // one budget shared by every cache: memory goes to what is being read now
-        let pool = crate::cache::Pool::new(cb);
+    fn blank(dir: PathBuf, lock: Option<fs::File>, opts: Options, manifest: Manifest, wal: Option<WalWriter>, cb: usize) -> Db {
+        Db::with_caches(dir, lock, opts, manifest, wal, Arc::new(Caches::new(crate::cache::Pool::new(cb))))
+    }
+
+    /// [`Db::blank`] with caches it shares.
+    fn with_caches(dir: PathBuf, lock: Option<fs::File>, opts: Options, manifest: Manifest, wal: Option<WalWriter>, c: Arc<Caches>) -> Db {
         Db {
-            pool: pool.clone(),
+            c,
             dir,
             _lock: lock,
             manifest,
             segs: BTreeMap::new(),
             retired: HashMap::new(),
-            removing: Vec::new(),
+            owner: false,
             seg_codes: HashMap::new(),
             rules: Arc::new(RuleSet::default()),
             rule_fields: Vec::new(),
             seg_rules: Mutex::new(HashMap::new()),
             runs: Vec::new(),
             blob_files: BTreeMap::new(),
-            dirs: Cache::pooled(&pool, 16),
-            blocks: Cache::pooled(&pool, 16),
-            ix: Cache::pooled(&pool, 16),
-            cores: Cache::pooled(&pool, 1),
-            nodemaps: Cache::pooled(&pool, 4),
-            stepc: Cache::pooled(&pool, 1),
-            lightc: Cache::pooled(&pool, 1),
-            fieldc: Cache::pooled(&pool, 1),
-            msgtextc: Cache::pooled(&pool, 1),
-            texthead: Cache::pooled(&pool, 1),
-            textpost: Cache::pooled(&pool, 16),
-            unitc: Cache::pooled(&pool, 4),
-            piecec: Cache::pooled(&pool, 4),
-            textc: Cache::pooled(&pool, 16),
-            pieces: Cache::pooled(&pool, 16),
             piece_bases: HashMap::new(),
-            skels: Cache::pooled(&pool, 16),
-            statc: Cache::pooled(&pool, 1),
-            longc: Cache::pooled(&pool, 16),
-            live_masks: Mutex::new(HashMap::new()),
-            dir_res: Mutex::new(HashMap::new()),
-            field_groups: Mutex::new(HashMap::new()),
-            head_res: Mutex::new(HashMap::new()),
-            key_ids: Mutex::new(KeyIds::default()),
             active: HashMap::new(),
             busy: BTreeSet::new(),
             key_ix: HashMap::new(),
             next_session: 0,
             mem: Mem::default(),
+            sealed: Vec::new(),
             wal,
             bg: None,
             frozen: None,
@@ -938,19 +1101,59 @@ impl Db {
     /// quarter of the size), and never writes the manifest or a log.
     fn view(&self) -> Result<Db> {
         // not locked: this handle's owner holds the lock
-        let lock = fs::File::open(self.dir.join("LOCK"))?;
-        let mut v = Db::blank(self.dir.clone(), lock, self.opts.clone(), self.manifest.clone(), None, (self.opts.cache_bytes / 4).max(16 << 20));
+        let mut v = Db::blank(self.dir.clone(), None, self.opts.clone(), self.manifest.clone(), None, (self.opts.cache_bytes / 4).max(16 << 20));
         v.segs = self.segs.clone();
         v.seg_codes = self.seg_codes.clone();
         v.rules = self.rules.clone();
         v.rule_fields = self.rule_fields.clone();
         v.runs = self.runs.clone();
-        v.blob_files = self.blob_files.iter().map(|(n, b)| (*n, BlobFile { uid: b.uid, path: b.path.clone(), len: b.len })).collect();
+        v.blob_files = self.blob_files.iter().map(|(n, b)| (*n, b.share())).collect();
         v.busy = self.busy.clone();
         v.next_session = self.next_session;
         v.seq = self.seq;
         v.sd = self.sd.clone();
         Ok(v)
+    }
+
+    /// A read-only handle on the store as it is now, for reading on other threads while
+    /// this handle goes on taking writes: every read API works on it and sees exactly the
+    /// requests put before it was taken, however long it is kept.
+    ///
+    /// It costs about one pointer per session taking writes. It shares this handle's caches,
+    /// its open files and its unflushed data: the buffer taking writes is sealed and shared
+    /// ([`Db::seal`]), and a session table this handle changes later is copied first
+    /// (`Arc::make_mut`), as a flush at work already needs. Files a merge replaces stay on
+    /// disk until the last snapshot reading them is dropped.
+    pub fn snapshot(&mut self) -> Result<Db> {
+        self.seal()?;
+        let mut v = Db::with_caches(self.dir.clone(), None, self.opts.clone(), self.manifest.clone(), None, self.c.clone());
+        v.segs = self.segs.clone();
+        v.retired = self.retired.clone();
+        v.seg_codes = self.seg_codes.clone();
+        v.rules = self.rules.clone();
+        v.rule_fields = self.rule_fields.clone();
+        v.seg_rules = Mutex::new(self.seg_rules.lock().unwrap().clone());
+        v.runs = self.runs.clone();
+        v.blob_files = self.blob_files.iter().map(|(n, b)| (*n, b.share())).collect();
+        v.busy = self.busy.clone();
+        v.key_ix = self.key_ix.clone();
+        v.next_session = self.next_session;
+        v.seq = self.seq;
+        v.sd = self.sd.clone();
+        v.flushes = self.flushes;
+        v.frozen = self.frozen.clone();
+        v.sealed = self.sealed.clone();
+        v.mem = self.mem.next();
+        v.active = self.active.iter().map(|(&s, a)| (s, Active { core: a.core.clone(), steps: a.steps.clone(), children: HashMap::new(), stored_kids: Vec::new(), keyed: Default::default(), last: a.last })).collect();
+        v.orphan_results = self.orphan_results;
+        v.recovery = self.recovery.clone();
+        v.merge_stats = self.merge_stats.clone();
+        Ok(v)
+    }
+
+    /// The log sequence number of the last request put (each put is one).
+    pub fn seq(&self) -> u64 {
+        self.seq
     }
 
     pub fn open(dir: impl AsRef<Path>, opts: Options) -> Result<Db> {
@@ -975,14 +1178,19 @@ impl Db {
         for e in fs::read_dir(&dir)? {
             let name = e?.file_name().to_string_lossy().into_owned();
             let file = parse_num(&name, "seg-", ".tdb").or_else(|| parse_num(&name, "idx-", ".tdb")).or_else(|| parse_num(&name, "blob-", ".dat"));
+            // (a file this process doomed may be deleted by its deleter thread meanwhile)
+            let remove = |p: PathBuf| match fs::remove_file(p) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+                _ => Ok(()),
+            };
             if let Some(n) = file {
                 if !live.contains(&(n as u32)) {
-                    fs::remove_file(dir.join(&name))?;
+                    remove(dir.join(&name))?;
                     rec.orphans_removed += 1;
                 }
             } else if let Some(n) = parse_num(&name, "wal-", ".log") {
                 if n < manifest.wal_start {
-                    fs::remove_file(dir.join(&name))?;
+                    remove(dir.join(&name))?;
                     rec.orphans_removed += 1;
                 } else {
                     wal_nums.push(n);
@@ -994,7 +1202,11 @@ impl Db {
         let wal = WalWriter::create(&dir, new_wal, opts.sync)?;
         crate::block::set_open_files(opts.open_files);
         let cb = opts.cache_bytes;
-        let mut db = Db::blank(dir, lock, opts, manifest, Some(wal), cb);
+        let mut db = match opts.cache_pool.clone() {
+            Some(pool) => Db::with_caches(dir, Some(lock), opts, manifest, Some(wal), Arc::new(Caches::new(pool))),
+            None => Db::blank(dir, Some(lock), opts, manifest, Some(wal), cb),
+        };
+        db.owner = true;
         let _ = fs::remove_file(db.dir.join("RULES.tmp"));
         match fs::read(db.dir.join("RULES")) {
             Ok(b) => db.install_rules(RuleSet::decode(&b)?),
@@ -1009,7 +1221,7 @@ impl Db {
         }
         for &(n, len) in &db.manifest.blobs {
             rec.blob_tail_bytes += blob::trim(&db.dir, n, len, db.opts.sync)?;
-            db.blob_files.insert(n, BlobFile { uid: crate::block::uid(), path: blob_path(&db.dir, n), len });
+            db.blob_files.insert(n, BlobFile::new(blob_path(&db.dir, n), len));
         }
         for &n in &db.manifest.runs {
             db.runs.push(Arc::new(Run::open(&db.dir, n)?));
@@ -1221,53 +1433,77 @@ impl Db {
         }
         let used: BTreeSet<u32> = self.active.values().flat_map(|a| a.core.chunks.iter().map(|c| c.seg)).collect();
         let gone: Vec<u32> = self.retired.keys().copied().filter(|n| !used.contains(n)).collect();
-        let mut paths = Vec::new();
         for n in gone {
-            self.retired.remove(&n);
-            let p = seg_path(&self.dir, n);
-            crate::block::forget(&p);
-            paths.push(p);
-        }
-        self.remove_files(paths);
-    }
-
-    /// Delete files on a thread of its own (their handles already forgotten).
-    fn remove_files(&mut self, paths: Vec<PathBuf>) {
-        self.removing.retain(|h| !h.is_finished());
-        if paths.is_empty() {
-            return;
-        }
-        if let Ok(h) = std::thread::Builder::new().name("tdb-remove".into()).spawn(move || {
-            for p in paths {
-                let _ = fs::remove_file(p);
+            if let Some(seg) = self.retired.remove(&n) {
+                seg.doom();
             }
-        }) {
-            self.removing.push(h);
         }
     }
 
-    /// Wait for the files being deleted to be gone.
+    /// Wait for the files being deleted to be gone (those no snapshot still reads).
     fn removed(&mut self) {
-        for h in self.removing.drain(..) {
-            let _ = h.join();
-        }
+        crate::block::wait_removed();
+    }
+
+    /// Drop decoded directory blocks and text heads of segments that are gone. A snapshot
+    /// still reading a gone segment may decode them again; the next merge drops those too.
+    fn prune_segment_tables(&self) {
+        let live = |n: &u32| self.segs.contains_key(n) || self.retired.contains_key(n);
+        self.c.dir_res.lock().unwrap().retain(|k, _| live(&k.0));
+        self.c.head_res.lock().unwrap().retain(|k, _| live(k));
     }
 
     /// The bytes of an unflushed message, `Loc::Mem(i)`: in the buffer taking writes, or in
     /// the one being flushed.
     fn mem_node(&self, i: u32) -> &[u8] {
-        if let Some(f) = &self.frozen
-            && i >= f.node_base
-            && i < f.node_base + f.nodes.len() as u32
-        {
-            return &f.nodes[(i - f.node_base) as usize];
+        for m in self.mems() {
+            if i >= m.node_base && i < m.node_base + m.nodes.len() as u32 {
+                return &m.nodes[(i - m.node_base) as usize];
+            }
         }
-        &self.mem.nodes[(i - self.mem.node_base) as usize]
+        panic!("unflushed message {i} is in no buffer")
+    }
+
+    /// Every unflushed buffer, newest first: the one taking writes, the sealed ones, the one
+    /// being flushed.
+    fn mems(&self) -> impl Iterator<Item = &Mem> {
+        std::iter::once(&self.mem).chain(self.sealed.iter().rev().map(|m| &**m)).chain(self.frozen.as_deref())
+    }
+
+    /// [`Db::mems`], oldest first.
+    fn mems_oldest_first(&self) -> impl Iterator<Item = &Mem> {
+        self.frozen.as_deref().into_iter().chain(self.sealed.iter().map(|m| &**m)).chain(std::iter::once(&self.mem))
+    }
+
+    /// Bytes not yet written and not being written by a flush.
+    fn pending_bytes(&self) -> usize {
+        self.mem.bytes + self.sealed.iter().map(|m| m.bytes).sum::<usize>()
+    }
+
+    /// Seal the buffer taking writes (if it holds anything) so a snapshot can share it, and
+    /// join the newest sealed buffers while the newer is at least half the older: each byte
+    /// is joined about log2(snapshots) times, and lookups go through few buffers.
+    fn seal(&mut self) -> Result<()> {
+        if self.mem.is_empty() {
+            return Ok(());
+        }
+        let next = self.mem.next();
+        self.sealed.push(Arc::new(std::mem::replace(&mut self.mem, next)));
+        while self.sealed.len() >= 2 {
+            let n = self.sealed.len();
+            if self.sealed[n - 1].bytes * 2 < self.sealed[n - 2].bytes {
+                break;
+            }
+            let j = Mem::join(&[&self.sealed[n - 2], &self.sealed[n - 1]])?;
+            self.sealed.truncate(n - 2);
+            self.sealed.push(Arc::new(j));
+        }
+        Ok(())
     }
 
     /// An unflushed piece by id (`None`: it is in the files).
     fn mem_piece(&self, id: u32) -> Option<&(u8, u128, Arc<[u8]>)> {
-        for m in [Some(&self.mem), self.frozen.as_deref()].into_iter().flatten() {
+        for m in self.mems() {
             if id >= m.piece_base && id < m.piece_base + m.pieces.len() as u32 {
                 return Some(&m.pieces[(id - m.piece_base) as usize]);
             }
@@ -1276,8 +1512,8 @@ impl Db {
     }
 
     /// An unflushed opaque value by id (`None`: it is in the files).
-    fn mem_opaque(&self, id: u64) -> Option<&(u8, u8, u128, Box<[u8]>)> {
-        for m in [Some(&self.mem), self.frozen.as_deref()].into_iter().flatten() {
+    fn mem_opaque(&self, id: u64) -> Option<&(u8, u8, u128, Arc<[u8]>)> {
+        for m in self.mems() {
             if id >= m.opaque_base && id < m.opaque_base + m.opaques.len() as u64 {
                 return Some(&m.opaques[(id - m.opaque_base) as usize]);
             }
@@ -1287,24 +1523,24 @@ impl Db {
 
     /// The request with this id among unflushed ones.
     fn mem_request(&self, id: &str) -> Option<ReqId> {
-        self.mem.req_ix.get(id).or_else(|| self.frozen.as_ref().and_then(|f| f.req_ix.get(id))).copied()
+        self.mems().find_map(|m| m.req_ix.get(id)).copied().filter(|&r| !self.manifest.is_dropped(req_parts(r).0))
     }
 
     // ------------------------------------------------------------------ finding things in files
 
     fn dir_block(&self, seg: &Segment, k: usize) -> Result<Arc<Vec<DirEnt>>> {
         let key = (seg.num, k as u32);
-        if let Some(d) = self.dir_res.lock().unwrap().get(&key) {
+        if let Some(d) = self.c.dir_res.lock().unwrap().get(&key) {
             return Ok(d.clone());
         }
         let d = Arc::new(seg.dir_block(k)?);
-        self.dir_res.lock().unwrap().insert(key, d.clone());
+        self.c.dir_res.lock().unwrap().insert(key, d.clone());
         Ok(d)
     }
 
     /// (bytes held by all caches, their shared budget)
     pub fn cache_use(&self) -> (usize, usize) {
-        (self.pool.used(), self.pool.limit())
+        (self.c.pool.used(), self.c.pool.limit())
     }
 
     /// Group ids for store field `field`'s values across `segs` (each a segment and the
@@ -1314,7 +1550,7 @@ impl Db {
     pub fn field_groups(&self, field: u32, segs: &[(u32, FieldDir)]) -> Result<Option<Arc<FieldGroups>>> {
         let nums: Vec<u32> = segs.iter().map(|s| s.0).collect();
         let generation = self.manifest.generation;
-        if let Some((g, n, fg)) = self.field_groups.lock().unwrap().get(&field)
+        if let Some((g, n, fg)) = self.c.field_groups.lock().unwrap().get(&field)
             && *g == generation
             && *n == nums
         {
@@ -1355,41 +1591,41 @@ impl Db {
             fg.of.insert(*num, ids);
         }
         let fg = Arc::new(fg);
-        self.field_groups.lock().unwrap().insert(field, (generation, nums, fg.clone()));
+        self.c.field_groups.lock().unwrap().insert(field, (generation, nums, fg.clone()));
         Ok(Some(fg))
     }
 
     /// Bytes the decoded directory blocks take, roughly.
     pub fn directory_bytes(&self) -> usize {
-        self.dir_res.lock().unwrap().values().flat_map(|d| d.iter()).map(|x| 160 + x.key.0.len() + x.key.1.len()).sum()
+        self.c.dir_res.lock().unwrap().values().flat_map(|d| d.iter()).map(|x| 160 + x.key.0.len() + x.key.1.len()).sum()
     }
 
     fn block(&self, seg: &Segment, r: &BlockRef) -> Result<Arc<Vec<u8>>> {
-        if let Some(x) = self.blocks.get(&(seg.num, r.off)) {
+        if let Some(x) = self.c.blocks.get(&(seg.num, r.off)) {
             return Ok(x);
         }
         let raw = seg.block(r)?;
         let n = raw.len();
-        Ok(self.blocks.insert((seg.num, r.off), Arc::new(raw), n))
+        Ok(self.c.blocks.insert((seg.num, r.off), Arc::new(raw), n))
     }
 
     fn step_block(&self, seg: &Segment, r: &BlockRef) -> Result<Arc<Vec<u8>>> {
-        if let Some(x) = self.blocks.get(&(seg.num, r.off)) {
+        if let Some(x) = self.c.blocks.get(&(seg.num, r.off)) {
             return Ok(x);
         }
         let raw = seg.step_block(r)?;
         let n = raw.len();
-        Ok(self.blocks.insert((seg.num, r.off), Arc::new(raw), n))
+        Ok(self.c.blocks.insert((seg.num, r.off), Arc::new(raw), n))
     }
 
     fn ixb(&self, run: &Run, kind: u8, i: usize) -> Result<Arc<IxBlock>> {
         let k = (run.num, kind, i as u32);
-        if let Some(t) = self.ix.get(&k) {
+        if let Some(t) = self.c.ix.get(&k) {
             return Ok(t);
         }
         let t = run.block(kind, i)?;
         let n = t.bytes();
-        Ok(self.ix.insert(k, Arc::new(t), n))
+        Ok(self.c.ix.insert(k, Arc::new(t), n))
     }
 
     /// Every live part of session `s`, in order.
@@ -1401,6 +1637,10 @@ impl Db {
     /// longest first, puts each covering part before the parts it replaced.
     fn parts(&self, s: u32) -> Result<Vec<(Arc<Segment>, DirEnt)>> {
         let mut out = Vec::new();
+        if self.manifest.is_dropped(s) {
+            // deleted: what is left of it in files is never read
+            return Ok(out);
+        }
         for seg in self.segs.values() {
             if !seg.cat.may_hold(s) {
                 continue;
@@ -1448,6 +1688,9 @@ impl Db {
     fn find_session_in_files(&self, key: &(String, String)) -> Result<Option<u32>> {
         let Some(s) = self.index_get(NS_SESSION, session_hash(key))? else { return Ok(None) };
         let s = u32::try_from(s).map_err(|_| bad("index gives a bad session id"))?;
+        if self.manifest.is_dropped(s) {
+            return Ok(None);
+        }
         if s >= self.next_session || self.load_core(s)?.key != *key {
             return corrupt("index points a session key at another session");
         }
@@ -1456,6 +1699,9 @@ impl Db {
 
     fn find_request_in_files(&self, id: &str) -> Result<Option<ReqId>> {
         let Some(r) = self.index_get(NS_REQUEST, request_hash(id))? else { return Ok(None) };
+        if self.manifest.is_dropped(req_parts(r).0) {
+            return Ok(None);
+        }
         let (core, k) = self.core_req(r)?;
         if *core.requests[k as usize].id != *id {
             return corrupt("index points a request id at another request");
@@ -1465,7 +1711,7 @@ impl Db {
 
     /// An existing piece or opaque value with this hash (tag 0 = piece, 1 = opaque).
     fn find_by_hash(&self, tag: u8, hash: u128) -> Result<Option<u64>> {
-        for m in [Some(&self.mem), self.frozen.as_deref()].into_iter().flatten() {
+        for m in self.mems() {
             let found = if tag == 0 { m.piece_ix.get(&hash).map(|&x| x as u64) } else { m.opaque_ix.get(&hash).copied() };
             if found.is_some() {
                 return Ok(found);
@@ -1520,16 +1766,22 @@ impl Db {
 
     // ------------------------------------------------------------------ sessions
 
+    /// A session's key in the caches of tables read from files: with the manifest
+    /// generation they were read at, since snapshots of other generations share the caches.
+    fn skey(&self, s: u32) -> (u32, u64) {
+        (s, self.manifest.generation)
+    }
+
     fn load_core(&self, s: u32) -> Result<Arc<SessionCore>> {
         if let Some(a) = self.active.get(&s) {
             return Ok(a.core.clone());
         }
-        if let Some(c) = self.cores.get(&s) {
+        if let Some(c) = self.c.cores.get(&self.skey(s)) {
             return Ok(c);
         }
         let core = self.read_core(s, true)?;
         let size = core.bytes();
-        Ok(self.cores.insert(s, Arc::new(core), size))
+        Ok(self.c.cores.insert(self.skey(s), Arc::new(core), size))
     }
 
     /// A session's message table without its requests: where each message is, all reading
@@ -1539,19 +1791,22 @@ impl Db {
         if let Some(a) = self.active.get(&s) {
             return Ok(a.core.clone());
         }
-        if let Some(c) = self.cores.get(&s) {
+        if let Some(c) = self.c.cores.get(&self.skey(s)) {
             return Ok(c);
         }
-        if let Some(c) = self.nodemaps.get(&s) {
+        if let Some(c) = self.c.nodemaps.get(&self.skey(s)) {
             return Ok(c);
         }
         let core = self.read_core(s, false)?;
         let size = core.bytes();
-        Ok(self.nodemaps.insert(s, Arc::new(core), size))
+        Ok(self.c.nodemaps.insert(self.skey(s), Arc::new(core), size))
     }
 
     /// A session's table decoded from its parts (`requests`: with the request records).
     fn read_core(&self, s: u32, requests: bool) -> Result<SessionCore> {
+        if self.manifest.is_dropped(s) {
+            return Ok(SessionCore::default());
+        }
         let parts = self.parts(s)?;
         let Some(first) = parts.first() else { return Err(Error::BadRequest(format!("no session {s}"))) };
         let mut core = SessionCore { key: first.1.key.clone(), ..SessionCore::default() };
@@ -1593,12 +1848,12 @@ impl Db {
         if let Some(a) = self.active.get(&s) {
             return Ok(a.steps.clone());
         }
-        if let Some(c) = self.stepc.get(&s) {
+        if let Some(c) = self.c.stepc.get(&self.skey(s)) {
             return Ok(c);
         }
         let ss = self.read_steps(s)?;
         let size = ss.bytes();
-        Ok(self.stepc.insert(s, Arc::new(ss), size))
+        Ok(self.c.stepc.insert(self.skey(s), Arc::new(ss), size))
     }
 
     /// A session's steps without their input values (or with them, when they are at hand),
@@ -1607,10 +1862,10 @@ impl Db {
         if let Some(a) = self.active.get(&s) {
             return Ok(a.steps.clone());
         }
-        if let Some(c) = self.stepc.get(&s) {
+        if let Some(c) = self.c.stepc.get(&self.skey(s)) {
             return Ok(c);
         }
-        if let Some(c) = self.lightc.get(&s) {
+        if let Some(c) = self.c.lightc.get(&self.skey(s)) {
             return Ok(c);
         }
         let ss = match self.read_light_steps(s)? {
@@ -1618,7 +1873,7 @@ impl Db {
             None => self.read_steps(s)?.without_values(),
         };
         let size = ss.bytes();
-        Ok(self.lightc.insert(s, Arc::new(ss), size))
+        Ok(self.c.lightc.insert(self.skey(s), Arc::new(ss), size))
     }
 
     /// A session's steps without their input values, read without reading the values:
@@ -1748,12 +2003,12 @@ impl Db {
         }
         let core = self.load_core(s)?;
         let steps = self.load_steps(s)?;
-        self.cores.remove(&s);
-        self.nodemaps.remove(&s);
-        self.stepc.remove(&s);
-        self.lightc.remove(&s);
-        self.fieldc.remove(&s);
-        self.msgtextc.remove(&s);
+        self.c.cores.remove(&self.skey(s));
+        self.c.nodemaps.remove(&self.skey(s));
+        self.c.stepc.remove(&self.skey(s));
+        self.c.lightc.remove(&self.skey(s));
+        self.c.fieldc.remove(&self.skey(s));
+        self.c.msgtextc.remove(&self.skey(s));
         let mut ss = Arc::unwrap_or_clone(steps);
         // per node: last step at or above it on its path
         let mut last_at = vec![NONE; core.nodes.len()];
@@ -1784,7 +2039,11 @@ impl Db {
     // ------------------------------------------------------------------ writes
 
     fn piece_id(&self, kind: u8, b: &[u8], m: &mut Mutation, pending: &mut HashMap<u128, u32>) -> Result<u32> {
-        let h = piece_hash(kind, b);
+        self.piece_id_hashed(kind, b, piece_hash(kind, b), m, pending)
+    }
+
+    /// [`Db::piece_id`] with the piece's hash worked out already.
+    fn piece_id_hashed(&self, kind: u8, b: &[u8], h: u128, m: &mut Mutation, pending: &mut HashMap<u128, u32>) -> Result<u32> {
         if let Some(&i) = pending.get(&h) {
             return Ok(i);
         }
@@ -1812,18 +2071,59 @@ impl Db {
         Ok(id)
     }
 
+    /// The stored session with this key, if any.
+    pub fn session_index(&self, session: &str, agent: &str) -> Result<Option<u32>> {
+        let key = (session.to_string(), agent.to_string());
+        match self.key_ix.get(&key) {
+            Some(&s) => Ok(Some(s)),
+            None => self.find_session_in_files(&key),
+        }
+    }
+
+    /// Read into the shared caches what putting `p` will read from files: the index blocks
+    /// that find its id and session, and the session's tables. Done on a snapshot by the
+    /// thread preparing a request, so the writing thread finds them in memory.
+    pub fn warm(&self, p: &Put) -> Result<()> {
+        if self.find_request(p.id)?.is_some() {
+            return Ok(());
+        }
+        if let Some(s) = self.session_index(p.session, p.agent)?
+            && !self.active.contains_key(&s)
+        {
+            self.load_core(s)?;
+            self.load_steps(s)?;
+        }
+        Ok(())
+    }
+
+    /// The stored request with this id, if any (unflushed ones included).
+    pub fn find_request(&self, id: &str) -> Result<Option<ReqId>> {
+        if let Some(r) = self.mem_request(id) {
+            return Ok(Some(r));
+        }
+        self.find_request_in_files(id)
+    }
+
     /// Add one request. It is visible to reads at once and durable after [`Db::commit`].
     pub fn put(&mut self, p: &Put) -> Result<PutOutcome> {
-        if let Some(r) = self.mem_request(p.id) {
+        if let Some(r) = self.find_request(p.id)? {
             return Ok(PutOutcome::Duplicate(r));
         }
-        if let Some(r) = self.find_request_in_files(p.id)? {
+        let pr = Prepared::new(&self.opts, p.body)?;
+        self.put_new(p, pr)
+    }
+
+    /// [`Db::put`] for a body already split and hashed by [`Prepared::new`], maybe on
+    /// another thread: what is left is quick and reads nothing from the body again.
+    pub fn put_prepared(&mut self, p: &Put, pr: Prepared) -> Result<PutOutcome> {
+        if let Some(r) = self.find_request(p.id)? {
             return Ok(PutOutcome::Duplicate(r));
         }
-        let sp = split::split(p.body)?;
-        if self.opts.verify_split && split::join(&sp)? != p.body {
-            return Err(Error::BadRequest("split pieces do not join back to the body".into()));
-        }
+        self.put_new(p, pr)
+    }
+
+    fn put_new(&mut self, p: &Put, pr: Prepared) -> Result<PutOutcome> {
+        let Prepared { sp, hashes, skeleton, system_hash, tools_hash, skeleton_hash } = pr;
         let key = (p.session.to_string(), p.agent.to_string());
         let existing = match self.key_ix.get(&key) {
             Some(&s) => Some(s),
@@ -1852,6 +2152,7 @@ impl Db {
                 tools: NONE,
                 notes: Box::new([]),
                 layout: sp.layout.as_ref().map(|g| g.iter().map(|x| x.clone().into_boxed_slice()).collect()),
+                response: NONE,
             },
         };
         let mut pp = HashMap::new();
@@ -1869,7 +2170,7 @@ impl Db {
         // values not kept are blanked; cache markers after them move back by what was removed
         let mut blanked: Vec<Vec<crate::json::Span>> = vec![Vec::new(); sp.messages.len()];
         for (i, msg) in sp.messages.iter().enumerate() {
-            let h = xxh3_128(&msg.bytes);
+            let h = hashes[i];
             if !creating {
                 let a = act.unwrap();
                 let find = |k: &(u32, u128), learned: &HashMap<(u32, u128), u32>| a.children.get(k).or_else(|| learned.get(k)).copied();
@@ -1918,17 +2219,22 @@ impl Db {
             next += 1;
         }
         m.req.tip = parent;
+        if !p.response.is_empty() {
+            // a leaf under the request's last message, out of the tree's walks
+            m.nodes.push(NewNode { id: next, parent, hash: 0, bytes: p.response.to_vec(), holes: Vec::new() });
+            m.req.response = next;
+        }
 
         let mut notes = Vec::new();
         if let Some(sys) = &sp.system {
-            m.req.system = self.piece_id(PIECE_SYSTEM, &sys.bytes, &mut m, &mut pp)?;
+            m.req.system = self.piece_id_hashed(PIECE_SYSTEM, &sys.bytes, system_hash, &mut m, &mut pp)?;
             for n in &sys.notes {
                 let t = self.piece_id(PIECE_MARKER, &n.text, &mut m, &mut pp)?;
                 notes.push(ReqNote { target: TARGET_SYSTEM, offset: n.offset, text: t });
             }
         }
         if let Some(tools) = &sp.tools {
-            m.req.tools = self.piece_id(PIECE_TOOLS, &tools.bytes, &mut m, &mut pp)?;
+            m.req.tools = self.piece_id_hashed(PIECE_TOOLS, &tools.bytes, tools_hash, &mut m, &mut pp)?;
             for n in &tools.notes {
                 let t = self.piece_id(PIECE_MARKER, &n.text, &mut m, &mut pp)?;
                 notes.push(ReqNote { target: TARGET_TOOLS, offset: n.offset, text: t });
@@ -1941,11 +2247,12 @@ impl Db {
             }
         }
         m.req.notes = notes.into_boxed_slice();
-        m.req.skeleton = self.piece_id(PIECE_SKELETON, &sp.skeleton.encode(), &mut m, &mut pp)?;
+        m.req.skeleton = self.piece_id_hashed(PIECE_SKELETON, &skeleton, skeleton_hash, &mut m, &mut pp)?;
 
         let k = act.map(|a| a.core.requests.len() as u32).unwrap_or(0);
         self.wal.as_mut().ok_or_else(|| bad("a view takes no writes"))?.append(&m.encode());
-        self.apply(m)?;
+        // logged: state that fails to take it no longer matches the log
+        self.apply(m).map_err(|e| Error::Corrupt(format!("a logged request could not be applied: {e}")))?;
         let a = self.active.get_mut(&sidx).unwrap();
         a.children.extend(learned);
         a.keyed.extend(keyed);
@@ -1958,19 +2265,26 @@ impl Db {
             return corrupt(format!("log record {} after {}", m.seq, self.seq));
         }
         let s = m.session;
+        // a record for a session deleted since (only replayed after a crash): its shared
+        // pieces and values are kept, since ids follow each other, and nothing else
+        let gone = self.manifest.is_dropped(s);
         if let Some((i, sk, ak)) = m.new_session {
             if i != self.next_session || i != s {
                 return corrupt("new session out of order");
             }
-            let core = SessionCore { key: (sk, ak), ..SessionCore::default() };
-            self.key_ix.insert(core.key.clone(), i);
-            self.active.insert(i, Active::new(Arc::new(core), Arc::new(SessionSteps::default()), self.flushes));
+            if !gone {
+                let core = SessionCore { key: (sk, ak), ..SessionCore::default() };
+                self.key_ix.insert(core.key.clone(), i);
+                self.active.insert(i, Active::new(Arc::new(core), Arc::new(SessionSteps::default()), self.flushes));
+            }
             self.next_session += 1;
         } else {
             if s >= self.next_session {
                 return corrupt("record names a missing session");
             }
-            self.activate(s)?;
+            if !gone {
+                self.activate(s)?;
+            }
         }
         // a flush at work holds the session's tables as they were frozen: the first write
         // after that copies them (timed: a long session's tables are large)
@@ -1995,10 +2309,15 @@ impl Db {
                 return corrupt("opaque value out of order");
             }
             self.mem.bytes += o.payload.len();
-            self.mem.opaques.push((o.enc, o.kind, o.hash, o.payload.into_boxed_slice()));
+            self.mem.opaques.push((o.enc, o.kind, o.hash, o.payload.into()));
             self.mem.opaque_ix.insert(o.hash, o.id);
         }
+        if gone {
+            self.seq = m.seq;
+            return Ok(());
+        }
         let time_ms = steps::parse_time_ms(&m.req.time);
+        let response = m.req.response;
         for n in m.nodes {
             let id = n.id;
             let a = self.active.get_mut(&s).unwrap();
@@ -2009,7 +2328,9 @@ impl Db {
             if n.parent != NONE && n.parent >= n.id {
                 return corrupt("node parent after the node");
             }
-            a.children.insert((n.parent, n.hash), n.id);
+            if id != response {
+                a.children.insert((n.parent, n.hash), n.id);
+            }
             core.nodes.push(NodeMeta {
                 parent: n.parent,
                 len: n.bytes.len() as u32,
@@ -2017,8 +2338,18 @@ impl Db {
                 holes: if n.holes.is_empty() { None } else { Some(n.holes.into_boxed_slice()) },
             });
             self.mem.bytes += n.bytes.len() + 64;
-            self.mem.nodes.push(n.bytes.into_boxed_slice());
-            self.add_node_steps(s, id, time_ms)?;
+            self.mem.nodes.push(n.bytes.into());
+            if id == response {
+                // no steps: it holds no results, and its calls are the next request's
+                let ss = Arc::make_mut(&mut self.active.get_mut(&s).unwrap().steps);
+                if ss.tail.len() != id as usize {
+                    return corrupt("step tails out of step with nodes");
+                }
+                let t = if n.parent == NONE { NONE } else { ss.tail[n.parent as usize] };
+                ss.tail.push(t);
+            } else {
+                self.add_node_steps(s, id, time_ms)?;
+            }
         }
         let a = self.active.get_mut(&s).unwrap();
         let core = Arc::make_mut(&mut a.core);
@@ -2155,7 +2486,7 @@ impl Db {
     pub fn commit(&mut self) -> Result<()> {
         self.wal.as_mut().ok_or_else(|| bad("a view takes no writes"))?.commit()?;
         if !self.opts.background_flush {
-            if self.mem.bytes >= self.opts.flush_bytes {
+            if self.pending_bytes() >= self.opts.flush_bytes {
                 self.flush()?;
             }
             return Ok(());
@@ -2164,8 +2495,8 @@ impl Db {
         if let Some(b) = self.flush_done(false)? {
             self.flush_install(b)?;
         }
-        if self.mem.bytes >= self.opts.flush_bytes {
-            if self.fbg.is_some() && self.mem.bytes >= 2 * self.opts.flush_bytes {
+        if self.pending_bytes() >= self.opts.flush_bytes {
+            if self.fbg.is_some() && self.pending_bytes() >= 2 * self.opts.flush_bytes {
                 // memory holds two buffers' worth: wait for the flush at work
                 let t = std::time::Instant::now();
                 if let Some(b) = self.flush_done(true)? {
@@ -2252,7 +2583,7 @@ impl Db {
         if let Some(b) = self.flush_done(true)? {
             self.flush_install(b)?;
         }
-        if self.mem.touched.is_empty() && self.mem.pieces.is_empty() && self.mem.opaques.is_empty() {
+        if self.mem.is_empty() && self.sealed.is_empty() {
             // nothing to write; a merge that finished on its own thread is still put in place
             return if self.bg.is_some() { self.merge_policy() } else { Ok(()) };
         }
@@ -2308,14 +2639,19 @@ impl Db {
         w.commit()?;
         let wal_start = w.num + 1;
         self.wal = Some(WalWriter::create(&self.dir, wal_start, self.opts.sync)?);
-        let next = Mem {
-            node_base: self.mem.node_base + self.mem.nodes.len() as u32,
-            piece_base: self.next_piece(),
-            opaque_base: self.next_opaque(),
-            ..Mem::default()
-        };
-        let frozen = Arc::new(std::mem::replace(&mut self.mem, next));
-        let sessions: Vec<(u32, Arc<SessionCore>, Arc<SessionSteps>)> = frozen.touched.iter().map(|&s| (s, self.active[&s].core.clone(), self.active[&s].steps.clone())).collect();
+        let next = self.mem.next();
+        let cur = std::mem::replace(&mut self.mem, next);
+        let frozen = Arc::new(if self.sealed.is_empty() {
+            cur
+        } else {
+            let mut all: Vec<&Mem> = self.sealed.iter().map(|m| &**m).collect();
+            all.push(&cur);
+            let j = Mem::join(&all)?;
+            self.sealed.clear();
+            j
+        });
+        // (a session deleted since it took writes is not written)
+        let sessions: Vec<(u32, Arc<SessionCore>, Arc<SessionSteps>)> = frozen.touched.iter().filter_map(|&s| self.active.get(&s).map(|a| (s, a.core.clone(), a.steps.clone()))).collect();
         // file numbers for its segment, index run and maybe a new blob file
         let first_file = self.manifest.next_file;
         self.manifest.next_file += 3;
@@ -2326,14 +2662,13 @@ impl Db {
     /// A read-only handle for a flush to read from: the files as they are, the frozen
     /// buffer, and the sessions it holds as they were when it was frozen.
     fn flush_view(&self, job: &FlushJob) -> Result<Db> {
-        let lock = fs::File::open(self.dir.join("LOCK"))?;
-        let mut v = Db::blank(self.dir.clone(), lock, self.opts.clone(), self.manifest.clone(), None, (self.opts.cache_bytes / 8).max(8 << 20));
+        let mut v = Db::blank(self.dir.clone(), None, self.opts.clone(), self.manifest.clone(), None, (self.opts.cache_bytes / 8).max(8 << 20));
         v.segs = self.segs.clone();
         v.seg_codes = self.seg_codes.clone();
         v.rules = self.rules.clone();
         v.rule_fields = self.rule_fields.clone();
         v.runs = self.runs.clone();
-        v.blob_files = self.blob_files.iter().map(|(n, b)| (*n, BlobFile { uid: b.uid, path: b.path.clone(), len: b.len })).collect();
+        v.blob_files = self.blob_files.iter().map(|(n, b)| (*n, b.share())).collect();
         v.next_session = job.sessions_hi;
         v.seq = job.checkpoint;
         v.sd = self.sd.clone();
@@ -2405,7 +2740,8 @@ impl Db {
             let mut order = Vec::with_capacity(n);
             let mut placed = vec![false; n];
             for &s in &src.touched {
-                let core = &self.active[&s].core;
+                let Some(a) = self.active.get(&s) else { continue };
+                let core = &a.core;
                 for nm in &core.nodes[core.flushed_nodes as usize..] {
                     for &(_, oid) in nm.holes.iter().flat_map(|h| h.iter()) {
                         if oid >= lo && !std::mem::replace(&mut placed[(oid - lo) as usize], true) {
@@ -2432,8 +2768,12 @@ impl Db {
         keys.extend(oents.iter().enumerate().map(|(i, o)| (NS_OPAQUE, o.hash, lo + i as u64)));
         keys.extend(src.req_ix.iter().map(|(id, &r)| (NS_REQUEST, request_hash(id), r)));
         for s in self.manifest.sessions..job.sessions_hi {
-            let a = self.active.get(&s).ok_or_else(|| bad(format!("new session {s} is not in memory at a flush")))?;
-            keys.push((NS_SESSION, session_hash(&a.core.key), s as u64));
+            match self.active.get(&s) {
+                Some(a) => keys.push((NS_SESSION, session_hash(&a.core.key), s as u64)),
+                // deleted before its first flush
+                None if self.manifest.is_dropped(s) => {}
+                None => return corrupt(format!("new session {s} is not in memory at a flush")),
+            }
         }
         keys.sort_unstable();
         keys.dedup();
@@ -2455,7 +2795,7 @@ impl Db {
         w.set_rules(self.rules.versions());
         let mut written: Vec<FlushedPart> = Vec::new();
         for &s in &src.touched {
-            let a = &self.active[&s];
+            let Some(a) = self.active.get(&s) else { continue };
             let (core, ss) = (&a.core, &a.steps);
             let (mut cp, stream) = self.core_part(core, core.flushed_nodes..core.nodes.len() as u32, core.flushed_reqs..core.requests.len() as u32)?;
             cp.frames = w.frames(&stream)?;
@@ -2501,19 +2841,31 @@ impl Db {
         man.sessions = b.sessions_hi;
         man.pieces += b.pieces;
         man.opaques += b.opaques;
+        // a flush that was at work when sessions were deleted wrote their parts
+        let seg = Segment::open(&self.dir, b.seg)?;
+        if let Some(x) = self.dropped_dead(&seg)? {
+            let mut dead: BTreeMap<u32, Dead> = man.dead.iter().copied().collect();
+            dead.entry(b.seg).or_default().add(&x);
+            man.dead = dead.into_iter().collect();
+        }
         man.store(&self.dir, self.opts.sync)?;
         self.manifest = man;
         let _ = b.new_blob;
 
-        let seg = Segment::open(&self.dir, b.seg)?;
         self.merge_stats.flushed += b.flushed + seg.file_bytes;
         self.add_segment(seg);
         self.runs.push(Arc::new(Run::open(&self.dir, b.run)?));
         if let Some((bn, len)) = b.blob {
-            self.blob_files.entry(bn).or_insert_with(|| BlobFile { uid: crate::block::uid(), path: blob_path(&self.dir, bn), len: 0 }).len = len;
+            self.blob_files.entry(bn).or_insert_with(|| BlobFile::new(blob_path(&self.dir, bn), 0)).len = len;
         }
         for w in b.written {
-            let a = self.active.get_mut(&w.session).ok_or_else(|| bad(format!("session {} left memory before its flush was put in place", w.session)))?;
+            let Some(a) = self.active.get_mut(&w.session) else {
+                // deleted while the flush was at work
+                if self.manifest.is_dropped(w.session) {
+                    continue;
+                }
+                return corrupt(format!("session {} left memory before its flush was put in place", w.session));
+            };
             let core = Arc::make_mut(&mut a.core);
             let chunk = core.chunks.len() as u32;
             core.chunks.push(Chunk { seg: b.seg, frames: w.part.frames.into(), raw_len: w.part.raw_len, fs: w.part.frame });
@@ -2642,6 +2994,328 @@ impl Db {
         r.map(Some)
     }
 
+    /// Put in place a flush or merge that finished on its own thread, without waiting (and
+    /// start the next merge if one is due): what a write would do, for a store taking none.
+    /// Whether the store's files changed.
+    pub fn maintain(&mut self) -> Result<bool> {
+        let before = self.manifest.generation;
+        if let Some(b) = self.flush_done(false)? {
+            self.flush_install(b)?;
+        } else if self.bg.is_some() {
+            self.merge_policy()?;
+        }
+        Ok(self.manifest.generation != before)
+    }
+
+    // ------------------------------------------------------------------ deletes
+
+    /// Every session with bytes in a segment, live, replaced or deleted (a deleted session
+    /// is in this until merges or a vacuum rewrite its segments).
+    pub fn sessions_in_files(&self) -> Result<BTreeSet<u32>> {
+        let mut out = BTreeSet::new();
+        for seg in self.segs.values() {
+            for k in 0..seg.cat.dirs.len() {
+                out.extend(self.dir_block(seg, k)?.iter().map(|d| d.session));
+            }
+        }
+        Ok(out)
+    }
+
+    /// What a segment holds of deleted sessions (written by a flush or merge that was at
+    /// work when they were deleted), to count as dead: queries then read its live mask.
+    fn dropped_dead(&self, seg: &Segment) -> Result<Option<Dead>> {
+        if self.manifest.dropped.is_empty() || !self.manifest.dropped.iter().any(|r| r.0 <= seg.cat.hi && seg.cat.lo < r.1) {
+            return Ok(None);
+        }
+        let mut t = Dead::default();
+        let mut any = false;
+        for k in 0..seg.cat.dirs.len() {
+            for d in seg.dir_block(k)?.iter().filter(|d| self.manifest.is_dropped(d.session)) {
+                t.add(&part_dead(d, &SessionCore::default()));
+                any = true;
+            }
+        }
+        Ok(any.then_some(t))
+    }
+
+    /// Whether session `s` was deleted.
+    pub fn is_dropped(&self, s: u32) -> bool {
+        self.manifest.is_dropped(s)
+    }
+
+    /// How many sessions were deleted.
+    pub fn dropped_count(&self) -> u64 {
+        self.manifest.dropped_count()
+    }
+
+    /// Delete sessions. From when this returns nothing of them is read: their requests are
+    /// not found, queries skip their steps and text, and a new request with a deleted
+    /// session's key starts a new session. Durable at once (the manifest records it).
+    ///
+    /// Their bytes stay in their segments, counted as dead there, until merges rewrite those
+    /// segments (once half of one is dead) or [`Db::vacuum`] removes every trace.
+    pub fn drop_sessions(&mut self, sessions: &[u32]) -> Result<DropReport> {
+        if self.wal.is_none() {
+            return Err(bad("a view takes no writes"));
+        }
+        let mut man = self.manifest.clone();
+        let mut dead: BTreeMap<u32, Dead> = man.dead.iter().copied().collect();
+        let mut rep = DropReport::default();
+        for &s in sessions {
+            if s >= self.next_session || man.is_dropped(s) {
+                continue;
+            }
+            let core = self.load_core(s)?;
+            for (seg, d) in self.parts(s)? {
+                let x = part_dead(&d, &core);
+                rep.dead_bytes += x.bytes;
+                dead.entry(seg.num).or_default().add(&x);
+            }
+            rep.sessions += 1;
+            rep.requests += core.requests.len() as u64;
+            man.drop_session(s);
+        }
+        if rep.sessions == 0 {
+            return Ok(rep);
+        }
+        man.dead = dead.into_iter().filter(|(n, _)| self.segs.contains_key(n)).collect();
+        man.generation += 1;
+        man.store(&self.dir, self.opts.sync)?;
+        self.manifest = man;
+        // out of memory; what they had unflushed stays in the buffer and is never written
+        for &s in sessions {
+            if self.manifest.is_dropped(s)
+                && let Some(a) = self.active.remove(&s)
+            {
+                self.key_ix.remove(&a.core.key);
+            }
+        }
+        let man = &self.manifest;
+        self.busy.retain(|s| !man.is_dropped(*s));
+        Ok(rep)
+    }
+
+    /// Delete the session with this key, if there is one.
+    pub fn drop_session_key(&mut self, session: &str, agent: &str) -> Result<DropReport> {
+        match self.session_index(session, agent)? {
+            Some(s) => self.drop_sessions(&[s]),
+            None => Ok(DropReport::default()),
+        }
+    }
+
+    /// Delete every session whose newest request is older than `cutoff_ms` (ms since the
+    /// epoch, by the requests' own times; a request whose time cannot be read counts as
+    /// new). A session with any newer request keeps all of its requests until they are all
+    /// older: a session's requests share their messages, so it goes as a whole.
+    pub fn drop_before(&mut self, cutoff_ms: i64) -> Result<DropReport> {
+        // the newest a session's requests can be, by the segments holding its parts; and
+        // the sessions with a part where something is older than the cutoff
+        let mut newest: HashMap<u32, i64> = HashMap::new();
+        let mut cand: BTreeSet<u32> = BTreeSet::new();
+        for seg in self.segs.values() {
+            let old = seg.cat.time_lo < cutoff_ms;
+            for k in 0..seg.cat.dirs.len() {
+                for d in self.dir_block(seg, k)?.iter() {
+                    let e = newest.entry(d.session).or_insert(i64::MIN);
+                    *e = (*e).max(seg.cat.time_hi);
+                    if old {
+                        cand.insert(d.session);
+                    }
+                }
+            }
+        }
+        cand.extend(self.active.keys().copied());
+        let mut gone = Vec::new();
+        for s in cand {
+            if self.manifest.is_dropped(s) {
+                continue;
+            }
+            // all of it in segments with nothing as new as the cutoff: no need to read it
+            if !self.active.contains_key(&s) && newest.get(&s).is_some_and(|&t| t > 0 && t < cutoff_ms) {
+                gone.push(s);
+                continue;
+            }
+            let core = self.load_core(s)?;
+            let times: Vec<i64> = core.requests.iter().map(|r| steps::parse_time_ms(&r.time)).collect();
+            if !times.is_empty() && times.iter().all(|&t| t > 0 && t < cutoff_ms) {
+                gone.push(s);
+            }
+        }
+        self.drop_sessions(&gone)
+    }
+
+    /// Remove every trace of deleted sessions from the files. Segments are rewritten with
+    /// live sessions only (as [`Db::compact`] does), blob files with only the shared pieces
+    /// and opaque values live requests use, and the index from the live data alone; the old
+    /// files are deleted once no snapshot reads them. Until a vacuum, deleted sessions are
+    /// never read, but their bytes (and pieces nothing live uses any more, such as their
+    /// system prompts) stay on disk.
+    ///
+    /// Reads and rewrites the whole store, on this thread.
+    pub fn vacuum(&mut self) -> Result<VacuumReport> {
+        let t0 = std::time::Instant::now();
+        if self.wal.is_none() {
+            return Err(bad("a view takes no writes"));
+        }
+        let mut rep = VacuumReport::default();
+        self.settle()?;
+        rep.segments_before = self.segs.len();
+        rep.segment_bytes_before = self.segs.values().map(|s| s.file_bytes).sum();
+        rep.blob_bytes_before = self.blob_files.values().map(|b| b.len).sum();
+        let all: BTreeSet<u32> = self.segs.keys().copied().collect();
+        if !all.is_empty() {
+            self.merge(all, false, true)?;
+        }
+        self.drop_retired();
+
+        // what live requests use, and every live key
+        let (np, no) = (self.manifest.pieces as usize, self.manifest.opaques as usize);
+        let mut live_p = vec![false; np];
+        let mut live_o = vec![false; no];
+        let mut keys: Vec<(u8, u128, u64)> = Vec::new();
+        for s in 0..self.next_session {
+            if self.manifest.is_dropped(s) {
+                continue;
+            }
+            let core = self.load_core(s)?;
+            keys.push((NS_SESSION, session_hash(&core.key), s as u64));
+            for (k, r) in core.requests.iter().enumerate() {
+                keys.push((NS_REQUEST, request_hash(&r.id), req_id(s, k as u32)));
+                for id in [r.skeleton, r.system, r.tools].into_iter().chain(r.notes.iter().map(|n| n.text)) {
+                    if id != NONE {
+                        *live_p.get_mut(id as usize).ok_or_else(|| bad(format!("session {s} uses missing piece {id}")))? = true;
+                    }
+                }
+            }
+            for n in &core.nodes {
+                for &(_, o) in n.holes.iter().flat_map(|h| h.iter()) {
+                    *live_o.get_mut(o as usize).ok_or_else(|| bad(format!("session {s} uses missing opaque value {o}")))? = true;
+                }
+            }
+        }
+
+        // blob files with the live pieces and values, in id order; ids stay what they were
+        let mut man = self.manifest.clone();
+        let mut next_file = man.next_file;
+        let mut blobs: Vec<(u32, u64)> = Vec::new();
+        let mut cur: Option<(u32, BlobAppend)> = None;
+        let (mut pents, mut oents) = (Vec::with_capacity(np), Vec::with_capacity(no));
+        let mut bases: HashMap<u8, Vec<(u32, u8)>> = HashMap::new();
+        let roll = |cur: &mut Option<(u32, BlobAppend)>, blobs: &mut Vec<(u32, u64)>, next_file: &mut u32| -> Result<()> {
+            if cur.as_ref().is_some_and(|(_, w)| w.pos() < self.opts.blob_bytes) {
+                return Ok(());
+            }
+            if let Some((bn, w)) = cur.take() {
+                blobs.push((bn, w.finish(self.opts.sync)?));
+            }
+            let bn = *next_file;
+            *next_file += 1;
+            *cur = Some((bn, BlobAppend::open(&self.dir, bn, 0)?));
+            Ok(())
+        };
+        for r in self.runs.clone() {
+            for i in 0..(r.cat.np as usize).div_ceil(IDS) {
+                let IxBlock::Pieces(v) = &*self.ixb(&r, K_PIECES, i)? else { return corrupt("index block of the wrong kind") };
+                for (j, e) in v.iter().enumerate() {
+                    let id = r.cat.plo + (i * IDS + j) as u32;
+                    if e.file == GONE || !live_p[id as usize] {
+                        rep.pieces_removed += (e.file != GONE) as u64;
+                        pents.push(PieceEnt { kind: 0, hash: 0, file: GONE, off: 0, clen: 0, rawlen: 0, base: 0 });
+                        continue;
+                    }
+                    let raw = self.piece(id)?;
+                    // compressed against a recent live piece of its kind when that pays, as flushes do
+                    let ids = bases.entry(e.kind).or_default();
+                    let cand: Vec<(u32, Arc<Vec<u8>>)> = ids.iter().filter(|x| x.1 < PIECE_CHAIN).map(|&(b, _)| self.piece(b).map(|p| (b, p))).collect::<Result<_>>()?;
+                    let refs: Vec<(u32, &[u8])> = cand.iter().map(|(b, p)| (*b, &p[..])).collect();
+                    let (base, c) = blob::pack_piece(&raw, &refs, self.opts.merge_level)?;
+                    roll(&mut cur, &mut blobs, &mut next_file)?;
+                    let (bn, w) = cur.as_mut().unwrap();
+                    let (off, clen) = w.packed(&c)?;
+                    pents.push(PieceEnt { kind: e.kind, hash: e.hash, file: *bn, off, clen, rawlen: raw.len() as u32, base });
+                    let depth = if base == 0 { 0 } else { ids.iter().find(|x| x.0 == base - 1).map_or(PIECE_CHAIN, |x| x.1 + 1) };
+                    ids.push((id, depth));
+                    if ids.len() > PIECE_BASES {
+                        ids.remove(0);
+                    }
+                }
+            }
+        }
+        for r in self.runs.clone() {
+            for i in 0..(r.cat.no as usize).div_ceil(IDS) {
+                let IxBlock::Opaques(v) = &*self.ixb(&r, K_OPAQUES, i)? else { return corrupt("index block of the wrong kind") };
+                for (j, o) in v.iter().enumerate() {
+                    let id = r.cat.olo + (i * IDS + j) as u64;
+                    if o.file == GONE || !live_o[id as usize] {
+                        rep.opaques_removed += (o.file != GONE) as u64;
+                        oents.push(OpaqueEnt { enc: 0, kind: 0, hash: 0, file: GONE, off: 0, len: 0 });
+                        continue;
+                    }
+                    let p = self.blob_read(o.file, o.off, o.len)?;
+                    roll(&mut cur, &mut blobs, &mut next_file)?;
+                    let (bn, w) = cur.as_mut().unwrap();
+                    let off = w.opaque(&p)?;
+                    oents.push(OpaqueEnt { file: *bn, off, ..*o });
+                }
+            }
+        }
+        if let Some((bn, w)) = cur.take() {
+            blobs.push((bn, w.finish(self.opts.sync)?));
+        }
+        if pents.len() != np || oents.len() != no {
+            return corrupt("index runs do not cover every piece and value");
+        }
+
+        // one index run of live keys, with the new tables
+        for (i, e) in pents.iter().enumerate().filter(|x| x.1.file != GONE) {
+            keys.push((NS_PIECE, e.hash, i as u64));
+        }
+        for (i, e) in oents.iter().enumerate().filter(|x| x.1.file != GONE) {
+            keys.push((NS_OPAQUE, e.hash, i as u64));
+        }
+        keys.sort_unstable();
+        keys.dedup();
+        let rn = next_file;
+        next_file += 1;
+        let mut rw = RunWriter::create(&self.dir, rn, 0, 0)?;
+        for (ns, h, v) in keys {
+            rw.key(ns, h, v)?;
+        }
+        for e in &pents {
+            rw.piece(e)?;
+        }
+        for e in &oents {
+            rw.opaque(e)?;
+        }
+        rw.finish(self.opts.sync)?;
+
+        man.next_file = next_file;
+        man.runs = vec![rn];
+        man.blobs = blobs;
+        man.dead = Vec::new();
+        man.generation += 1;
+        man.store(&self.dir, self.opts.sync)?;
+        let run = Arc::new(Run::open(&self.dir, rn)?);
+        for r in std::mem::replace(&mut self.runs, vec![run]) {
+            r.doom();
+        }
+        for (_, b) in std::mem::take(&mut self.blob_files) {
+            b.keep.doom.set();
+        }
+        for &(bn, len) in &man.blobs {
+            self.blob_files.insert(bn, BlobFile::new(blob_path(&self.dir, bn), len));
+        }
+        self.manifest = man;
+        // new pieces are compressed against these from now on (ids that are gone are not)
+        self.piece_bases = bases;
+        self.check_run_ranges()?;
+        rep.segments_after = self.segs.len();
+        rep.segment_bytes_after = self.segs.values().map(|s| s.file_bytes).sum();
+        rep.blob_bytes_after = self.blob_files.values().map(|b| b.len).sum();
+        rep.ms = t0.elapsed().as_millis() as u64;
+        Ok(rep)
+    }
+
     /// Whether a flush is at work on its own thread.
     pub fn flushing(&self) -> bool {
         self.fbg.is_some()
@@ -2682,8 +3356,7 @@ impl Db {
         self.manifest = man;
         self.runs.splice(i..i + n, [Arc::new(Run::open(&self.dir, num)?)]);
         for r in &inputs {
-            crate::block::forget(r.path());
-            let _ = fs::remove_file(r.path());
+            r.doom();
         }
         self.merge_stats.merges += 1;
         self.merge_stats.bytes_in += inputs.iter().map(|r| r.file_bytes).sum::<u64>();
@@ -2872,6 +3545,15 @@ impl Db {
         for (n, x) in dead {
             all_dead.entry(n).or_default().add(&x);
         }
+        // a merge that was at work when sessions were deleted wrote them out again
+        let mut opened = Vec::with_capacity(outputs.len());
+        for &n in &outputs {
+            let seg = Segment::open(&self.dir, n)?;
+            if let Some(x) = self.dropped_dead(&seg)? {
+                all_dead.entry(n).or_default().add(&x);
+            }
+            opened.push(seg);
+        }
         man.dead = all_dead.into_iter().collect();
         man.store(&self.dir, self.opts.sync)?;
         self.manifest = man;
@@ -2882,36 +3564,31 @@ impl Db {
         let kept: Vec<u32> = self.active.keys().copied().collect();
         let active = &self.active;
         self.key_ix.retain(|_, s| active.contains_key(s));
-        for c in [&self.cores as &dyn Clear, &self.nodemaps, &self.stepc, &self.lightc, &self.fieldc, &self.dirs, &self.blocks, &self.statc, &self.longc, &self.textc, &self.msgtextc] {
+        for c in [&self.c.cores as &dyn Clear, &self.c.nodemaps, &self.c.stepc, &self.c.lightc, &self.c.fieldc, &self.c.dirs, &self.c.blocks, &self.c.statc, &self.c.longc, &self.c.textc, &self.c.msgtextc] {
             c.clear_all();
         }
         let mut bytes_out = 0;
-        for &n in &outputs {
-            let seg = Segment::open(&self.dir, n)?;
+        for seg in opened {
             bytes_out += seg.file_bytes;
             self.add_segment(seg);
         }
         // sessions still taking writes keep reading their flushed messages from the inputs
         // (retired, deleted once none of them does); the other inputs go now
         let used: BTreeSet<u32> = kept.iter().flat_map(|s| self.active[s].core.chunks.iter().map(|c| c.seg)).collect();
-        let mut paths = Vec::new();
         for n in &inputs {
             let seg = self.segs.remove(n);
-            self.dir_res.lock().unwrap().retain(|k, _| k.0 != *n);
-            self.head_res.lock().unwrap().remove(n);
             self.seg_codes.remove(n);
-            if used.contains(n)
-                && let Some(seg) = seg
-            {
-                self.retired.insert(*n, seg);
-                continue;
+            if let Some(seg) = seg {
+                if used.contains(n) {
+                    self.retired.insert(*n, seg);
+                } else {
+                    // deleted once no snapshot reads it
+                    seg.doom();
+                }
             }
-            let p = seg_path(&self.dir, *n);
-            crate::block::forget(&p);
-            paths.push(p);
         }
-        self.remove_files(paths);
         self.drop_retired();
+        self.prune_segment_tables();
         self.merge_stats.merges += 1;
         self.merge_stats.bytes_in += bytes_in + fold_read;
         self.merge_stats.bytes_out += bytes_out;
@@ -3153,7 +3830,7 @@ impl Db {
             let (_, _, b) = self.mem_piece(id).ok_or_else(|| bad(format!("missing piece {id}")))?;
             return Ok(Arc::new(b.to_vec()));
         }
-        if let Some(p) = self.pieces.get(&id) {
+        if let Some(p) = self.c.pieces.get(&id) {
             return Ok(p);
         }
         let r = self.run_for_piece(id)?;
@@ -3174,16 +3851,16 @@ impl Db {
             return corrupt("piece has the wrong size");
         }
         let n = d.len();
-        Ok(self.pieces.insert(id, Arc::new(d), n))
+        Ok(self.c.pieces.insert(id, Arc::new(d), n))
     }
 
     fn skeleton(&self, id: u32) -> Result<Arc<Skeleton>> {
-        if let Some(s) = self.skels.get(&id) {
+        if let Some(s) = self.c.skels.get(&id) {
             return Ok(s);
         }
         let p = self.piece(id)?;
         let n = p.len() + 64;
-        Ok(self.skels.insert(id, Arc::new(Skeleton::decode(&p)?), n))
+        Ok(self.c.skels.insert(id, Arc::new(Skeleton::decode(&p)?), n))
     }
 
     fn path(core: &SessionCore, tip: u32, n: u32) -> Result<Vec<u32>> {
@@ -3288,7 +3965,7 @@ impl Db {
     }
 
     pub fn request_count(&self) -> usize {
-        (self.segs.values().map(|s| s.cat.requests).sum::<u64>() - self.dead_total().requests) as usize + self.mem.req_ix.len() + self.frozen.as_ref().map_or(0, |f| f.req_ix.len())
+        (self.segs.values().map(|s| s.cat.requests).sum::<u64>() - self.dead_total().requests) as usize + self.mems().map(|m| m.req_ix.len()).sum::<usize>()
     }
 
     /// Every stored request, session by session (reads every session's metadata).
@@ -3308,7 +3985,7 @@ impl Db {
     /// For each stored session, a number for its session id and one for its agent name:
     /// equal numbers mean equal text. Worked out once per stored session.
     pub fn key_ids(&self, sessions: &[u32]) -> Result<Vec<(u32, u32)>> {
-        let mut g = self.key_ids.lock().unwrap();
+        let mut g = self.c.key_ids.lock().unwrap();
         let mut out = Vec::with_capacity(sessions.len());
         for &s in sessions {
             if g.of.len() <= s as usize {
@@ -3351,13 +4028,13 @@ impl Db {
     /// changes), so asking again does not read the session.
     pub fn session_names(&self, s: u32) -> Result<(Arc<str>, Arc<str>)> {
         {
-            let g = self.key_ids.lock().unwrap();
+            let g = self.c.key_ids.lock().unwrap();
             if let Some(Some((a, b))) = g.of.get(s as usize) {
                 return Ok((g.sid_names[*a as usize].clone(), g.agent_names[*b as usize].clone()));
             }
         }
         let (a, b) = self.key_ids(&[s])?[0];
-        let g = self.key_ids.lock().unwrap();
+        let g = self.c.key_ids.lock().unwrap();
         Ok((g.sid_names[a as usize].clone(), g.agent_names[b as usize].clone()))
     }
 
@@ -3384,7 +4061,8 @@ impl Db {
     /// Every message of a session in storage order: the whole timeline in one pass.
     pub fn replay(&self, s: u32, st: &mut ReadStats) -> Result<Vec<u8>> {
         let core = self.load_core(s)?;
-        let mut ids: Vec<u32> = (0..core.nodes.len() as u32).collect();
+        let responses: std::collections::HashSet<u32> = core.requests.iter().map(|r| r.response).filter(|&r| r != NONE).collect();
+        let mut ids: Vec<u32> = (0..core.nodes.len() as u32).filter(|i| !responses.contains(i)).collect();
         ids.sort_by_key(|&i| match core.nodes[i as usize].loc {
             Loc::Seg { chunk, off } => (0u8, chunk, off),
             Loc::Mem(m) => (1u8, 0, m),
@@ -3393,6 +4071,18 @@ impl Db {
         let mut spans = Vec::new();
         self.read_nodes(&core, &ids, &mut buf, &mut spans, st)?;
         Ok(buf)
+    }
+
+    /// The response stored with a request, exactly as it came; `None` if it has none.
+    pub fn response(&self, ri: ReqId) -> Result<Option<Vec<u8>>> {
+        let (core, k) = self.core_req(ri)?;
+        let r = core.requests[k as usize].response;
+        if r == NONE {
+            return Ok(None);
+        }
+        let (mut buf, mut spans) = (Vec::new(), Vec::new());
+        self.read_nodes(&core, &[r], &mut buf, &mut spans, &mut ReadStats::default())?;
+        Ok(Some(buf))
     }
 
     /// How many separate runs of storage a request's messages occupy.
@@ -3432,7 +4122,7 @@ impl Db {
             runs: self.runs.len(),
             blobs: self.blob_files.len(),
             wal_bytes: self.wal.as_ref().map_or(0, |w| w.bytes),
-            mem_bytes: self.mem.bytes,
+            mem_bytes: self.pending_bytes(),
             tools: self.sd.tools.len(),
             step_fields: self.sd.fields.len(),
             orphan_results: self.orphan_results,
@@ -3470,7 +4160,7 @@ impl Db {
             st.blob_file_bytes += b.len;
             st.catalog_bytes += 96 + b.path.as_os_str().len();
         }
-        for m in [Some(&self.mem), self.frozen.as_deref()].into_iter().flatten() {
+        for m in self.mems() {
             st.nodes += m.nodes.len();
             st.node_bytes += m.nodes.iter().map(|n| n.len() as u64).sum::<u64>();
             st.piece_raw_bytes += m.pieces.iter().map(|p| p.2.len() as u64).sum::<u64>();
@@ -3481,22 +4171,22 @@ impl Db {
             st.active_bytes += a.core.bytes() + a.steps.bytes() + a.children.len() * 40 + a.stored_kids.len() * 4 + a.keyed.len() * 8;
         }
         st.caches = vec![
-            ("sessions", self.cores.stats()),
-            ("steps", self.stepc.stats()),
-            ("steps without values", self.lightc.stats()),
-            ("steps with some fields' values", self.fieldc.stats()),
-            ("sessions' text", self.msgtextc.stats()),
-            ("text index heads", self.texthead.stats()),
-            ("text index postings", self.textpost.stats()),
-            ("unit texts", self.unitc.stats()),
-            ("unit text windows", self.piecec.stats()),
-            ("step values read by summaries", self.textc.stats()),
-            ("step summaries", self.statc.stats()),
-            ("long input values", self.longc.stats()),
-            ("blocks", self.blocks.stats()),
-            ("directories", self.dirs.stats()),
-            ("index blocks", self.ix.stats()),
-            ("pieces", self.pieces.stats()),
+            ("sessions", self.c.cores.stats()),
+            ("steps", self.c.stepc.stats()),
+            ("steps without values", self.c.lightc.stats()),
+            ("steps with some fields' values", self.c.fieldc.stats()),
+            ("sessions' text", self.c.msgtextc.stats()),
+            ("text index heads", self.c.texthead.stats()),
+            ("text index postings", self.c.textpost.stats()),
+            ("unit texts", self.c.unitc.stats()),
+            ("unit text windows", self.c.piecec.stats()),
+            ("step values read by summaries", self.c.textc.stats()),
+            ("step summaries", self.c.statc.stats()),
+            ("long input values", self.c.longc.stats()),
+            ("blocks", self.c.blocks.stats()),
+            ("directories", self.c.dirs.stats()),
+            ("index blocks", self.c.ix.stats()),
+            ("pieces", self.c.pieces.stats()),
         ];
         st
     }
@@ -3516,7 +4206,7 @@ impl Db {
         if let Some(a) = self.active.get(&s) {
             return Some(a.steps.clone());
         }
-        self.stepc.get(&s)
+        self.c.stepc.get(&self.skey(s))
     }
 
     /// A session's steps, possibly without their input values (`light`): for reading rows,
@@ -3535,11 +4225,11 @@ impl Db {
         if let Some(a) = self.active.get(&s) {
             return Ok(a.steps.clone());
         }
-        if let Some(c) = self.stepc.get(&s) {
+        if let Some(c) = self.c.stepc.get(&self.skey(s)) {
             return Ok(c);
         }
         let mut keep = fields.to_vec();
-        if let Some(c) = self.fieldc.get(&s) {
+        if let Some(c) = self.c.fieldc.get(&self.skey(s)) {
             if fields.iter().all(|f| c.kept.contains(f)) {
                 return Ok(c);
             }
@@ -3549,7 +4239,7 @@ impl Db {
         }
         let ss = self.read_steps(s)?.with_fields(&keep);
         let size = ss.bytes();
-        Ok(self.fieldc.insert(s, Arc::new(ss), size))
+        Ok(self.c.fieldc.insert(self.skey(s), Arc::new(ss), size))
     }
 
     /// Where every text unit is: each segment with a word index as a whole (with which of
@@ -3579,32 +4269,32 @@ impl Db {
 
     /// A segment's word index over message text: its units and word list.
     pub fn text_head(&self, num: u32) -> Result<Arc<crate::textindex::TextHead>> {
-        if let Some(h) = self.head_res.lock().unwrap().get(&num) {
+        if let Some(h) = self.c.head_res.lock().unwrap().get(&num) {
             return Ok(h.clone());
         }
         let seg = self.segs.get(&num).ok_or_else(|| bad(format!("segment {num} is gone")))?;
         let Some(r) = &seg.cat.text else { return Err(bad(format!("segment {num} has no text index"))) };
         let dir = crate::textindex::decode_dir(&seg.block(r)?)?;
         let h = Arc::new(crate::textindex::TextHead::decode(&dir, &seg.block(&dir.units)?, &seg.block(&dir.words)?)?);
-        self.head_res.lock().unwrap().insert(num, h.clone());
+        self.c.head_res.lock().unwrap().insert(num, h.clone());
         Ok(h)
     }
 
     /// Bytes the decoded text index heads take, roughly.
     pub fn text_head_bytes(&self) -> usize {
-        self.head_res.lock().unwrap().values().map(|h| h.bytes()).sum()
+        self.c.head_res.lock().unwrap().values().map(|h| h.bytes()).sum()
     }
 
     /// Add the units holding word `word` of a segment's index to `out`.
     pub fn text_postings(&self, num: u32, head: &crate::textindex::TextHead, word: usize, out: &mut crate::textindex::Bits) -> Result<()> {
         let (c, a, b) = head.postings_at(word);
-        let block = match self.textpost.get(&(num, c as u32)) {
+        let block = match self.c.textpost.get(&(num, c as u32)) {
             Some(x) => x,
             None => {
                 let seg = self.segs.get(&num).ok_or_else(|| bad(format!("segment {num} is gone")))?;
                 let raw = seg.block(&head.chunks[c].1)?;
                 let size = raw.len() + 64;
-                self.textpost.insert((num, c as u32), Arc::new(raw), size)
+                self.c.textpost.insert((num, c as u32), Arc::new(raw), size)
             }
         };
         if b > block.len() {
@@ -3616,7 +4306,7 @@ impl Db {
     /// The text of units of a session, each (node, block): from the cache, the rest read
     /// from their messages (one read for all of them).
     pub fn unit_texts(&self, s: u32, wants: &[(u32, u16)]) -> Result<Vec<Arc<UnitText>>> {
-        let mut out: Vec<Option<Arc<UnitText>>> = wants.iter().map(|&(n, b)| self.unitc.get(&(s, n, b as u32))).collect();
+        let mut out: Vec<Option<Arc<UnitText>>> = wants.iter().map(|&(n, b)| self.c.unitc.get(&(s, n, b as u32))).collect();
         let mut missing: Vec<u32> = wants.iter().zip(&out).filter(|x| x.1.is_none()).map(|x| x.0.0).collect();
         if !missing.is_empty() {
             missing.sort_unstable();
@@ -3630,7 +4320,7 @@ impl Db {
                     let text = crate::text::unescape(&m[t.span.clone()]);
                     let plain_case = crate::query::value::ascii_case_only(&text);
                     let size = text.len() + 96;
-                    read.insert((node, t.block), self.unitc.insert((s, node, t.block as u32), Arc::new(UnitText { text, plain_case }), size));
+                    read.insert((node, t.block), self.c.unitc.insert((s, node, t.block as u32), Arc::new(UnitText { text, plain_case }), size));
                 }
             }
             for (o, w) in out.iter_mut().zip(wants) {
@@ -3648,7 +4338,7 @@ impl Db {
     /// read from their messages (one read for all of them).
     pub fn piece_texts(&self, s: u32, wants: &[(u32, u16, u32)]) -> Result<Vec<Arc<PieceText>>> {
         use crate::textindex::{PIECE, WINDOW};
-        let mut out: Vec<Option<Arc<PieceText>>> = wants.iter().map(|&(n, b, p)| self.piecec.get(&(s, n, b as u32, p))).collect();
+        let mut out: Vec<Option<Arc<PieceText>>> = wants.iter().map(|&(n, b, p)| self.c.piecec.get(&(s, n, b as u32, p))).collect();
         let mut missing: Vec<u32> = wants.iter().zip(&out).filter(|x| x.1.is_none()).map(|x| x.0.0).collect();
         if !missing.is_empty() {
             missing.sort_unstable();
@@ -3673,7 +4363,7 @@ impl Db {
                         }
                         let w = PieceText { text: low[a..e].to_string(), cut_left: a > 0, cut_right: e < low.len() };
                         let size = w.text.len() + 96;
-                        *o = Some(self.piecec.insert((s, n, b as u32, p), Arc::new(w), size));
+                        *o = Some(self.c.piecec.insert((s, n, b as u32, p), Arc::new(w), size));
                     }
                 }
             }
@@ -3685,11 +4375,12 @@ impl Db {
     /// from the session's messages. The slow way to search: it reads the whole session.
     pub fn session_texts(&self, s: u32) -> Result<Arc<crate::text::SessionTexts>> {
         let active = self.active.contains_key(&s);
-        if !active && let Some(c) = self.msgtextc.get(&s) {
+        if !active && let Some(c) = self.c.msgtextc.get(&self.skey(s)) {
             return Ok(c);
         }
         let core = self.load_core(s)?;
-        let ids: Vec<u32> = (0..core.nodes.len() as u32).collect();
+        let responses: std::collections::HashSet<u32> = core.requests.iter().map(|r| r.response).filter(|&r| r != NONE).collect();
+        let ids: Vec<u32> = (0..core.nodes.len() as u32).filter(|i| !responses.contains(i)).collect();
         let msgs = self.read_messages(s, &ids, &mut ReadStats::default())?;
         let mut st = crate::text::SessionTexts::default();
         for (id, m) in ids.iter().zip(&msgs) {
@@ -3712,7 +4403,7 @@ impl Db {
             return Ok(st);
         }
         let size = st.bytes();
-        Ok(self.msgtextc.insert(s, st, size))
+        Ok(self.c.msgtextc.insert(self.skey(s), st, size))
     }
 
     /// The text of a step value a summary points at: `vlen` bytes at `voff` in part
@@ -3720,14 +4411,14 @@ impl Db {
     /// the first read.
     pub fn summary_text(&self, num: u32, part: u32, r: &BlockRef, off: u32, voff: u32, vlen: u32) -> Result<Arc<Vec<u8>>> {
         let key = (num, part, voff);
-        if let Some(t) = self.textc.get(&key) {
+        if let Some(t) = self.c.textc.get(&key) {
             return Ok(t);
         }
         let b = self.stat_step_block(num, r)?;
         let a = off as usize + voff as usize;
         let t = b.post().get(a..a + vlen as usize).ok_or_else(|| bad("summary value past its block"))?.to_vec();
         let size = 64 + t.len();
-        Ok(self.textc.insert(key, Arc::new(t), size))
+        Ok(self.c.textc.insert(key, Arc::new(t), size))
     }
 
     /// Tool and field names.
@@ -3787,12 +4478,12 @@ impl Db {
     /// Kept in a cache after the first read: a message of a session never changes.
     pub fn long_value(&self, s: u32, ss: &SessionSteps, pos: u32, v: u32, name: &str) -> Result<Option<Vec<u8>>> {
         let key = (s, ss.rows[pos as usize].call_node, ss.long_at(v).0);
-        if let Some(x) = self.longc.get(&key) {
+        if let Some(x) = self.c.longc.get(&key) {
             return Ok((*x).clone());
         }
         let x = self.read_long_value(s, ss, pos, v, name)?;
         let size = 64 + x.as_ref().map_or(0, |b| b.len());
-        Ok((*self.longc.insert(key, Arc::new(x), size)).clone())
+        Ok((*self.c.longc.insert(key, Arc::new(x), size)).clone())
     }
 
     /// [`Db::long_value`] straight from the message (what writing a segment uses: it reads
@@ -3810,20 +4501,36 @@ impl Db {
     /// full message only if an opaque value sits inside that field).
     pub fn read_input(&self, s: u32, ss: &SessionSteps, pos: u32, name: &str) -> Result<Option<Vec<u8>>> {
         let r = ss.rows[pos as usize];
-        let find = |m: &[u8]| -> Option<(usize, usize)> {
+        enum Found {
+            /// A range of the message.
+            At(usize, usize),
+            /// Decoded from a JSON string (see [`steps::RawCall::fields`]).
+            Decoded(Vec<u8>),
+        }
+        let find = |m: &[u8]| -> Option<Found> {
             let (calls, _) = steps::scan_message(m);
             let c = calls.iter().find(|c| c.block == r.call_block)?;
-            let (_, v) = c.fields.iter().find(|(k, _)| *k == name.as_bytes())?;
-            let start = v.as_ptr() as usize - m.as_ptr() as usize;
-            Some((start, start + v.len()))
+            let (_, v) = c.fields.iter().find(|(k, _)| **k == *name.as_bytes())?;
+            Some(match v {
+                std::borrow::Cow::Borrowed(x) => {
+                    let start = x.as_ptr() as usize - m.as_ptr() as usize;
+                    Found::At(start, start + x.len())
+                }
+                std::borrow::Cow::Owned(x) => Found::Decoded(x.clone()),
+            })
         };
         let (stored, holes) = self.stored_message(s, r.call_node)?;
         match find(&stored) {
             None => Ok(None),
-            Some((a, b)) if !holes.iter().any(|&h| (h as usize) >= a && (h as usize) <= b) => Ok(Some(stored[a..b].to_vec())),
+            Some(Found::At(a, b)) if !holes.iter().any(|&h| (h as usize) >= a && (h as usize) <= b) => Ok(Some(stored[a..b].to_vec())),
+            Some(Found::Decoded(v)) if holes.is_empty() => Ok(Some(v)),
             Some(_) => {
+                // an opaque value sits inside: read the field from the whole message
                 let m = self.message(s, r.call_node)?;
-                Ok(find(&m).map(|(a, b)| m[a..b].to_vec()))
+                Ok(find(&m).map(|f| match f {
+                    Found::At(a, b) => m[a..b].to_vec(),
+                    Found::Decoded(v) => v,
+                }))
             }
         }
     }
@@ -3873,7 +4580,7 @@ impl Db {
     /// covered by a part of the same session in another segment.
     fn live_mask(&self, seg: &Arc<Segment>) -> Result<Arc<Vec<bool>>> {
         let generation = self.manifest.generation;
-        if let Some((g, m)) = self.live_masks.lock().unwrap().get(&seg.num)
+        if let Some((g, m)) = self.c.live_masks.lock().unwrap().get(&seg.num)
             && *g == generation
         {
             return Ok(m.clone());
@@ -3889,19 +4596,19 @@ impl Db {
             }
         }
         let m = Arc::new(mask);
-        self.live_masks.lock().unwrap().insert(seg.num, (generation, m.clone()));
+        self.c.live_masks.lock().unwrap().insert(seg.num, (generation, m.clone()));
         Ok(m)
     }
 
     fn stat_block(&self, num: u32, r: &BlockRef, decode: impl FnOnce(&[u8]) -> Result<StatBlock>) -> Result<Arc<StatBlock>> {
         let key = (num, r.off);
-        if let Some(b) = self.statc.get(&key) {
+        if let Some(b) = self.c.statc.get(&key) {
             return Ok(b);
         }
         let seg = self.segs.get(&num).ok_or_else(|| bad(format!("segment {num} is gone")))?;
         let b = decode(&seg.block(r)?)?;
         let size = b.bytes();
-        Ok(self.statc.insert(key, Arc::new(b), size))
+        Ok(self.c.statc.insert(key, Arc::new(b), size))
     }
 
     /// The head of a segment's summaries (`None` for a segment written without them).
@@ -3939,14 +4646,14 @@ impl Db {
     /// cache is not split into shards, so a block of one large session still fits).
     pub fn stat_step_block(&self, num: u32, r: &BlockRef) -> Result<Arc<StatBlock>> {
         let key = (num, r.off);
-        if let Some(b) = self.statc.get(&key) {
+        if let Some(b) = self.c.statc.get(&key) {
             return Ok(b);
         }
         let seg = self.segs.get(&num).ok_or_else(|| bad(format!("segment {num} is gone")))?;
         // step blocks may be compressed with the segment's dictionary
         let b = StatBlock::Raw(seg.step_block(r)?);
         let size = b.bytes();
-        Ok(self.statc.insert(key, Arc::new(b), size))
+        Ok(self.c.statc.insert(key, Arc::new(b), size))
     }
 
     /// A segment's tool and field codes mapped to the store's.
@@ -3995,13 +4702,13 @@ impl Db {
         for r in &self.runs {
             for i in 0..(r.cat.no as usize).div_ceil(IDS) {
                 if let IxBlock::Opaques(v) = r.block(K_OPAQUES, i)? {
-                    for o in v {
+                    for o in v.iter().filter(|o| o.file != GONE) {
                         add(o.kind, o.len as u64);
                     }
                 }
             }
         }
-        for m in [self.frozen.as_deref(), Some(&self.mem)].into_iter().flatten() {
+        for m in self.mems_oldest_first() {
             for (_, kind, _, p) in &m.opaques {
                 add(*kind, p.len() as u64);
             }
@@ -4017,13 +4724,16 @@ impl Db {
             for i in 0..(r.cat.no as usize).div_ceil(IDS) {
                 if let IxBlock::Opaques(v) = r.block(K_OPAQUES, i)? {
                     for (j, o) in v.iter().enumerate() {
+                        if o.file == GONE {
+                            continue;
+                        }
                         let p = self.blob_read(o.file, o.off, o.len)?;
                         f(r.cat.olo + (i * IDS + j) as u64, o.kind, o.enc, &p);
                     }
                 }
             }
         }
-        for m in [self.frozen.as_deref(), Some(&self.mem)].into_iter().flatten() {
+        for m in self.mems_oldest_first() {
             for (k, (enc, kind, _, p)) in m.opaques.iter().enumerate() {
                 f(m.opaque_base + k as u64, *kind, *enc, p);
             }
@@ -4071,13 +4781,16 @@ impl Db {
             for i in 0..(r.cat.np as usize).div_ceil(IDS) {
                 if let IxBlock::Pieces(v) = r.block(K_PIECES, i)? {
                     for (j, e) in v.iter().enumerate() {
+                        if e.file == GONE {
+                            continue;
+                        }
                         let id = r.cat.plo + (i * IDS + j) as u32;
                         f(id, e.kind, &self.piece(id)?, e.clen, e.base);
                     }
                 }
             }
         }
-        for m in [self.frozen.as_deref(), Some(&self.mem)].into_iter().flatten() {
+        for m in self.mems_oldest_first() {
             for (k, (kind, _, b)) in m.pieces.iter().enumerate() {
                 f(m.piece_base + k as u32, *kind, b, b.len() as u32, 0);
             }
@@ -4138,11 +4851,11 @@ impl Db {
 
     /// Drop everything read from files from the caches (sessions taking writes stay).
     pub fn clear_caches(&self) {
-        for c in [&self.cores as &dyn Clear, &self.nodemaps, &self.stepc, &self.lightc, &self.dirs, &self.blocks, &self.ix, &self.pieces, &self.skels, &self.statc, &self.longc, &self.fieldc, &self.textc, &self.msgtextc, &self.texthead, &self.textpost, &self.unitc, &self.piecec] {
+        for c in [&self.c.cores as &dyn Clear, &self.c.nodemaps, &self.c.stepc, &self.c.lightc, &self.c.dirs, &self.c.blocks, &self.c.ix, &self.c.pieces, &self.c.skels, &self.c.statc, &self.c.longc, &self.c.fieldc, &self.c.textc, &self.c.msgtextc, &self.c.texthead, &self.c.textpost, &self.c.unitc, &self.c.piecec] {
             c.clear_all();
         }
-        self.dir_res.lock().unwrap().clear();
-        self.head_res.lock().unwrap().clear();
+        self.c.dir_res.lock().unwrap().clear();
+        self.c.head_res.lock().unwrap().clear();
         crate::segment::forget_frames();
     }
 

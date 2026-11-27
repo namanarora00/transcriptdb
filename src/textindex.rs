@@ -106,8 +106,13 @@ pub fn part_units(core: &CorePart, stream: &[u8]) -> Vec<UnitBuild> {
             c = parent[(c - lo) as usize];
         }
     }
+    // responses are kept as they came, not read as messages
+    let responses: std::collections::HashSet<u32> = core.requests.iter().map(|r| r.response).filter(|&r| r != crate::record::NONE).collect();
     let mut out = Vec::new();
     for x in &core.nodes {
+        if responses.contains(&x.id) {
+            continue;
+        }
         let b = &stream[x.off as usize..(x.off + x.len) as usize];
         let Some((user, spans)) = text::scan_text(b) else { continue };
         for t in spans {

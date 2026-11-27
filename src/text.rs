@@ -19,33 +19,60 @@ pub struct TextSpan {
     pub span: Span,
 }
 
-/// The role of a message and its text blocks. `None` when the bytes are not a message
-/// object with a role.
+/// The role of a message and its text blocks: user or model, in any of the shapes model
+/// APIs use. `None` when the bytes are not a message from the user or the model (no role,
+/// or a system, developer or tool message).
+///
+/// Text blocks are `content` as a string, or its elements of type `text` (Anthropic, OpenAI
+/// Chat Completions), `input_text` or `output_text` (OpenAI Responses), each with a `text`
+/// string; and Gemini's `parts` that hold a `text` string (thoughts left out). The model's
+/// role is `assistant`, or `model` in Gemini.
 pub fn scan_text(b: &[u8]) -> Option<(bool, Vec<TextSpan>)> {
     let ms = json::members(b, &(0..b.len())).ok()?;
     let role = json::find_member(b, &ms, "role").filter(|r| b[r.value.start] == b'"')?;
-    let user = json::inner(b, &role.value) == b"user";
+    let user = match json::inner(b, &role.value) {
+        b"user" => true,
+        b"assistant" | b"model" => false,
+        _ => return None,
+    };
     let mut out = Vec::new();
-    let Some(c) = json::find_member(b, &ms, "content") else { return Some((user, out)) };
-    if b[c.value.start] == b'"' {
-        out.push(TextSpan { block: 0, span: c.value.start + 1..c.value.end - 1 });
-        return Some((user, out));
-    }
-    if b[c.value.start] != b'[' {
-        return Some((user, out));
-    }
-    let Ok((els, _)) = json::elements(b, &c.value) else { return Some((user, out)) };
-    for (k, el) in els.iter().enumerate() {
-        if b[el.start] != b'{' {
-            continue;
+    let text_of = |bm: &[json::Member]| json::find_member(b, bm, "text").filter(|x| b[x.value.start] == b'"').map(|x| x.value.start + 1..x.value.end - 1);
+    if let Some(c) = json::find_member(b, &ms, "content") {
+        if b[c.value.start] == b'"' {
+            out.push(TextSpan { block: 0, span: c.value.start + 1..c.value.end - 1 });
+        } else if b[c.value.start] == b'['
+            && let Ok((els, _)) = json::elements(b, &c.value)
+        {
+            for (k, el) in els.iter().enumerate() {
+                if b[el.start] != b'{' {
+                    continue;
+                }
+                let Ok(bm) = json::members(b, el) else { continue };
+                let Some(t) = json::find_member(b, &bm, "type") else { continue };
+                if b[t.value.start] != b'"' || !matches!(json::inner(b, &t.value), b"text" | b"input_text" | b"output_text") {
+                    continue;
+                }
+                if let Some(span) = text_of(&bm) {
+                    out.push(TextSpan { block: k as u16, span });
+                }
+            }
         }
-        let Ok(bm) = json::members(b, el) else { continue };
-        let Some(t) = json::find_member(b, &bm, "type") else { continue };
-        if b[t.value.start] != b'"' || json::inner(b, &t.value) != b"text" {
-            continue;
-        }
-        if let Some(x) = json::find_member(b, &bm, "text").filter(|x| b[x.value.start] == b'"') {
-            out.push(TextSpan { block: k as u16, span: x.value.start + 1..x.value.end - 1 });
+    }
+    if let Some(p) = json::find_member(b, &ms, "parts")
+        && b[p.value.start] == b'['
+        && let Ok((els, _)) = json::elements(b, &p.value)
+    {
+        for (k, el) in els.iter().enumerate() {
+            if b[el.start] != b'{' {
+                continue;
+            }
+            let Ok(pm) = json::members(b, el) else { continue };
+            if json::find_member(b, &pm, "thought").is_some_and(|t| &b[t.value.clone()] == b"true") {
+                continue;
+            }
+            if let Some(span) = text_of(&pm) {
+                out.push(TextSpan { block: k as u16, span });
+            }
         }
     }
     Some((user, out))
@@ -124,6 +151,23 @@ mod tests {
         assert_eq!(spans.len(), 1);
         assert_eq!(spans[0].block, 1);
         assert_eq!(&r[spans[0].span.clone()], b"and now?");
+    }
+
+    #[test]
+    fn other_apis() {
+        let texts = |m: &[u8]| -> Option<(bool, Vec<String>)> { scan_text(m).map(|(u, sp)| (u, sp.iter().map(|s| unescape(&m[s.span.clone()])).collect())) };
+        // OpenAI Chat Completions: system and tool messages are not text units
+        assert_eq!(texts(br#"{"role":"system","content":"be terse"}"#), None);
+        assert_eq!(texts(br#"{"role":"tool","tool_call_id":"c","content":"out"}"#), None);
+        assert_eq!(texts(br#"{"role":"user","content":[{"type":"text","text":"hi"},{"type":"image_url","image_url":{"url":"x"}}]}"#), Some((true, vec!["hi".into()])));
+        assert_eq!(texts(br#"{"role":"assistant","content":null,"tool_calls":[]}"#), Some((false, vec![])));
+        // OpenAI Responses
+        assert_eq!(texts(br#"{"type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]}"#), Some((false, vec!["done".into()])));
+        assert_eq!(texts(br#"{"role":"user","content":[{"type":"input_text","text":"go"}]}"#), Some((true, vec!["go".into()])));
+        assert_eq!(texts(br#"{"type":"function_call","call_id":"c","name":"f","arguments":"{}"}"#), None);
+        // Gemini: model is the assistant; thoughts are left out
+        assert_eq!(texts(br#"{"role":"model","parts":[{"text":"plan","thought":true},{"text":"answer"},{"functionCall":{"name":"f","args":{}}}]}"#), Some((false, vec!["answer".into()])));
+        assert_eq!(texts(br#"{"role":"user","parts":[{"text":"why?"}]}"#), Some((true, vec!["why?".into()])));
     }
 
     #[test]

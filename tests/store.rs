@@ -29,7 +29,7 @@ fn traffic(seed: u64, sessions: u64, per: usize) -> Vec<SynthRequest> {
 }
 
 fn put(db: &mut Db, q: &SynthRequest) -> PutOutcome {
-    db.put(&Put { session: &q.session, agent: &q.agent, id: &q.id, time: &q.time, meta: b"", body: &q.body }).unwrap()
+    db.put(&Put { session: &q.session, agent: &q.agent, id: &q.id, time: &q.time, meta: b"", body: &q.body, response: b"" }).unwrap()
 }
 
 /// What the store gives back for a request: its body with thinking and images blanked.
@@ -258,7 +258,7 @@ fn thinking_and_images_are_never_kept() {
         let dir = tmpdir(&format!("documents-{kept}"));
         let mut db = Db::open(&dir, Options { keep, ..opts(1 << 30) }).unwrap();
         for (i, b) in bodies.iter().enumerate() {
-            db.put(&Put { session: "s", agent: "", id: &format!("r{i}"), time: "2026-11-23T10:00:00.000Z", meta: b"", body: b.as_bytes() }).unwrap();
+            db.put(&Put { session: "s", agent: "", id: &format!("r{i}"), time: "2026-11-23T10:00:00.000Z", meta: b"", body: b.as_bytes(), response: b"" }).unwrap();
         }
         let check = |db: &Db| {
             for (i, b) in bodies.iter().enumerate() {

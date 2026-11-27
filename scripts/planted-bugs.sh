@@ -66,15 +66,22 @@ BUGS=(
   "rule-long-input-unread|src/db.rs|                Ok(Some(t)) => Value::from_json(&t),|                Ok(Some(_)) => Value::Null,|rules:rule_values"
   "rule-result-first-block-only|src/steps.rs|            for el in els.iter().filter(\|el\| b[el.start] == b'{') {|            for el in els.iter().take(1).filter(\|el\| b[el.start] == b'{') {|rules:rule_values"
   "flush-marks-later-writes-flushed|src/db.rs|            core.flushed_nodes = w.nodes;|            core.flushed_nodes = core.nodes.len() as u32;|store:flushes_run_while_writes_go_on"
-  "frozen-requests-not-found|src/db.rs|        self.mem.req_ix.get(id).or_else(\|\| self.frozen.as_ref().and_then(\|f\| f.req_ix.get(id))).copied()|        self.mem.req_ix.get(id).copied()|store:flushes_run_while_writes_go_on"
+  "frozen-requests-not-found|src/db.rs|        self.mems().find_map(\|m\| m.req_ix.get(id)).copied()|        self.mem.req_ix.get(id).copied()|store:flushes_run_while_writes_go_on"
   "merge-forgets-segments-still-read|src/db.rs|                self.retired.insert(*n, seg);|                drop(seg);|store:flushes_run_while_writes_go_on"
   "idle-session-dropped-unflushed|src/db.rs|a.last + self.opts.idle_flushes <= self.flushes && a.flushed()|a.last + self.opts.idle_flushes <= self.flushes|store:flushes_run_while_writes_go_on"
   "light-steps-codes-all-zero|src/db.rs|            code.push(*n);|            code.push(0);|store:light_steps_equal_full_steps_without_values"
   "pool-evicts-busiest-first|src/cache.rs|        order.sort_by_key(\|x\| x.0);|        order.sort_by_key(\|x\| std::cmp::Reverse(x.0));|lib:a_pool_gives_memory_to_the_cache_in_use"
   "session-names-swapped|src/db.rs|                return Ok((g.sid_names[*a as usize].clone(), g.agent_names[*b as usize].clone()));|                return Ok((g.agent_names[*b as usize].clone(), g.sid_names[*a as usize].clone()));|test:phrases_across_pieces_and_shared_session_ids"
   "step-values-read-from-block-start|src/db.rs|                Some(v) => v.get(d.vals.1 as usize..(d.vals.1 + d.vals.2) as usize)|                Some(v) => v.get(0..d.vals.2 as usize)|store:steps_match_the_reference_and_survive_reopen_and_compact"
-  "node-map-kept-after-wake|src/db.rs|        self.nodemaps.remove(&s);|        let _ = &self.nodemaps;|test:text_search_after_a_session_wakes"
+  "session-tables-keyed-without-generation|src/db.rs|        (s, self.manifest.generation)|        (s, 0)|t:concurrent:snapshot_outlives_merges_that_replace_its_files"
   "merge-files-replaced-while-merging|src/db.rs|                return self.merge_start(inputs, fold, reclaim);|                self.merge(inputs, fold, false)?; continue;|store:merges_run_while_writes_go_on"
+  # the store shared by threads, deletes, responses
+  "snapshot-misses-sealed|src/db.rs|        v.sealed = self.sealed.clone();|        v.sealed = Vec::new();|t:concurrent:a_snapshot_is_a_point_in_time"
+  "merged-files-deleted-under-snapshots|src/db.rs|                    seg.doom();|                    crate::block::remove_later(seg.path().to_path_buf());|t:concurrent:snapshot_outlives_merges_that_replace_its_files"
+  "group-answered-before-durable|src/store.rs|        && let Err(e) = db.commit()|        && let Err(e) = Ok::<(), Error>(())|t:concurrent:many_writers_and_readers"
+  "dropped-request-still-found|src/db.rs|        if self.manifest.is_dropped(req_parts(r).0) {|        if false && self.manifest.is_dropped(req_parts(r).0) {|t:drop:dropped_sessions_are_gone_everywhere"
+  "vacuum-keeps-unused-pieces|src/db.rs|                    if e.file == GONE \|\| !live_p[id as usize] {|                    if e.file == GONE {|t:drop:vacuum_leaves_no_trace_and_old_snapshots_still_read"
+  "response-read-as-text|src/textindex.rs|        if responses.contains(&x.id) {|        if false && responses.contains(&x.id) {|t:formats:responses_are_not_messages"
   "word-suffix-as-inside|src/textindex.rs|if if fit == Fit::Suffix { at + run.len() == end } else { at + run.len() <= end } {|if at + run.len() <= end {|lib:round_trip_and_lookups"
 )
 
@@ -96,6 +103,7 @@ run_check() {
     rules:*) (cd "$COPY" && cargo test --release --quiet --test rules "${1#rules:}" >"$WORK/out" 2>&1) || return 1 ;;
     store:*) (cd "$COPY" && cargo test --release --quiet --test store "${1#store:}" >"$WORK/out" 2>&1) || return 1 ;;
     lib:*) (cd "$COPY" && cargo test --release --quiet --lib "${1#lib:}" >"$WORK/out" 2>&1) || return 1 ;;
+    t:*) local x=${1#t:}; (cd "$COPY" && cargo test --release --quiet --test "${x%%:*}" "${x#*:}" >"$WORK/out" 2>&1) || return 1 ;;
   esac
   return 0
 }

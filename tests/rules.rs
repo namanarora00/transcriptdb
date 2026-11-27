@@ -89,7 +89,7 @@ const QUERIES: &[&str] = &[
 
 fn put_all(db: &mut Db, name: &str, steps: &[Step], k: &mut usize) {
     for b in bodies(steps, name) {
-        db.put(&Put { session: name, agent: "", id: &format!("r{k}"), time: &format!("{}", 1_700_000_000 + *k), meta: b"", body: b.as_bytes() }).unwrap();
+        db.put(&Put { session: name, agent: "", id: &format!("r{k}"), time: &format!("{}", 1_700_000_000 + *k), meta: b"", body: b.as_bytes(), response: b"" }).unwrap();
         *k += 1;
     }
     db.commit().unwrap();

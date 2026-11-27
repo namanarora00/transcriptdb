@@ -14,6 +14,7 @@
 //! the fast path for patterns over tool and outcome.
 
 use crate::json;
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 /// Value codes at or above this mark a value too long for the dictionary: the code points
@@ -96,8 +97,11 @@ pub struct RawCall<'a> {
     pub block: u16,
     pub id: &'a [u8],
     pub name: &'a [u8],
-    /// (key without quotes, value as JSON text)
-    pub fields: Vec<(&'a [u8], &'a [u8])>,
+    /// (key without quotes, value as JSON text). Borrowed from the message when the input is
+    /// a JSON object in it (Anthropic's `input`, Gemini's `args`); decoded when the input is
+    /// a JSON string holding an object (OpenAI's `arguments`), whose values longer than
+    /// [`MAX_VALUE`] are left out: they are not a range of the message to point at.
+    pub fields: Vec<(Cow<'a, [u8]>, Cow<'a, [u8]>)>,
 }
 
 /// A tool result found in a message.
@@ -106,53 +110,146 @@ pub struct RawResult<'a> {
     pub block: u16,
     pub tool_use_id: &'a [u8],
     pub is_error: bool,
-    /// Byte range of the `content` value in the message.
+    /// Byte range of the result's content in the message.
     pub content: json::Span,
 }
 
-/// Tool calls and tool results among a message's top-level content blocks.
+/// Strings in a message that mean it may hold a tool call or result, in one of the shapes
+/// [`scan_message`] reads.
+const MARKERS: &[&[u8]] = &[b"\"tool_use\"", b"\"tool_result\"", b"\"tool_calls\"", b"\"tool_call_id\"", b"function_call", b"custom_tool_call", b"\"functionCall\"", b"\"functionResponse\""];
+
+/// The members of an object input as fields, borrowed.
+fn object_fields<'a>(b: &'a [u8], v: &json::Span) -> Vec<(Cow<'a, [u8]>, Cow<'a, [u8]>)> {
+    if b.get(v.start) != Some(&b'{') {
+        return Vec::new();
+    }
+    let Ok(im) = json::members(b, v) else { return Vec::new() };
+    im.into_iter().map(|m| (Cow::Borrowed(json::inner(b, &m.key)), Cow::Borrowed(&b[m.value.clone()]))).collect()
+}
+
+/// The members of an input sent as a JSON string holding an object, decoded.
+fn string_fields<'a>(b: &'a [u8], v: &json::Span) -> Vec<(Cow<'a, [u8]>, Cow<'a, [u8]>)> {
+    if b.get(v.start) != Some(&b'"') {
+        return object_fields(b, v);
+    }
+    let text = crate::text::unescape(json::inner(b, v)).into_bytes();
+    let start = json::skip_ws(&text, 0);
+    if text.get(start) != Some(&b'{') {
+        return Vec::new();
+    }
+    let Ok(end) = json::scan_value(&text, start) else { return Vec::new() };
+    let Ok(im) = json::members(&text, &(start..end)) else { return Vec::new() };
+    im.into_iter().filter(|m| m.value.len() <= MAX_VALUE).map(|m| (Cow::Owned(json::inner(&text, &m.key).to_vec()), Cow::Owned(text[m.value.clone()].to_vec()))).collect()
+}
+
+/// Tool calls and tool results in a message, in any of the shapes model APIs use:
+///
+/// - Anthropic: `content` blocks of type `tool_use` (`id`, `name`, `input`) and
+///   `tool_result` (`tool_use_id`, `content`, `is_error`); the block is its index.
+/// - OpenAI Chat Completions: an assistant message's `tool_calls` (`id`,
+///   `function.name`, `function.arguments` as a JSON string; the block is its index), and
+///   a `tool` message (`tool_call_id`, `content`; block 0).
+/// - OpenAI Responses: items of type `function_call` / `custom_tool_call` (`call_id`,
+///   `name`, `arguments` or `input`) and `function_call_output` /
+///   `custom_tool_call_output` (`call_id`, `output`); block 0.
+/// - Gemini: `parts` holding `functionCall` (`name`, `args`, maybe `id`) and
+///   `functionResponse` (`name`, `response`, maybe `id`); the block is the part's index. A
+///   call without an id is known by its name, so a response pairs with the nearest call
+///   of that name before it; a response holding `error` failed.
 pub fn scan_message(b: &[u8]) -> (Vec<RawCall<'_>>, Vec<RawResult<'_>>) {
     let mut calls = Vec::new();
     let mut results = Vec::new();
-    let f = memchr::memmem::find;
-    if f(b, b"\"tool_use\"").is_none() && f(b, b"\"tool_result\"").is_none() {
+    if !MARKERS.iter().any(|m| memchr::memmem::find(b, m).is_some()) {
         return (calls, results);
     }
     let Ok(ms) = json::members(b, &(0..b.len())) else { return (calls, results) };
-    let Some(c) = json::find_member(b, &ms, "content") else { return (calls, results) };
-    let Ok((els, _)) = json::elements(b, &c.value) else { return (calls, results) };
-    for (k, el) in els.iter().enumerate() {
-        if b[el.start] != b'{' {
-            continue;
+    let s_in = |o: &[json::Member], name: &str| json::find_member(b, o, name).filter(|m| b[m.value.start] == b'"').map(|m| json::inner(b, &m.value));
+    let obj = |o: &[json::Member], name: &str| json::find_member(b, o, name).filter(|m| b[m.value.start] == b'{').and_then(|m| json::members(b, &m.value).ok());
+    let arr = |o: &[json::Member], name: &str| json::find_member(b, o, name).and_then(|m| json::elements(b, &m.value).ok()).map(|x| x.0);
+
+    // Anthropic content blocks
+    if let Some(els) = arr(&ms, "content") {
+        for (k, el) in els.iter().enumerate() {
+            if b[el.start] != b'{' {
+                continue;
+            }
+            let Ok(bm) = json::members(b, el) else { continue };
+            let Some(ty) = s_in(&bm, "type") else { continue };
+            if ty == b"tool_use" {
+                let (Some(id), Some(name)) = (s_in(&bm, "id"), s_in(&bm, "name")) else { continue };
+                let fields = json::find_member(b, &bm, "input").map(|m| object_fields(b, &m.value)).unwrap_or_default();
+                calls.push(RawCall { block: k as u16, id, name, fields });
+            } else if ty == b"tool_result" {
+                let Some(id) = s_in(&bm, "tool_use_id") else { continue };
+                let is_error = json::find_member(b, &bm, "is_error").is_some_and(|m| &b[m.value.clone()] == b"true");
+                let content = json::find_member(b, &bm, "content").map(|m| m.value.clone()).unwrap_or(el.end..el.end);
+                results.push(RawResult { block: k as u16, tool_use_id: id, is_error, content });
+            }
         }
-        let Ok(bm) = json::members(b, el) else { continue };
-        let Some(t) = json::find_member(b, &bm, "type") else { continue };
-        let ty = json::inner(b, &t.value);
-        let s = |name: &str| json::find_member(b, &bm, name).filter(|m| b[m.value.start] == b'"').map(|m| json::inner(b, &m.value));
-        if ty == b"tool_use" {
-            let (Some(id), Some(name)) = (s("id"), s("name")) else { continue };
-            let mut fields = Vec::new();
-            if let Some(inp) = json::find_member(b, &bm, "input")
-                && b[inp.value.start] == b'{'
-                    && let Ok(im) = json::members(b, &inp.value) {
-                        for m in im {
-                            fields.push((json::inner(b, &m.key), &b[m.value.clone()]));
-                        }
-                    }
+    }
+    // OpenAI Chat Completions
+    if let Some(els) = arr(&ms, "tool_calls") {
+        for (k, el) in els.iter().enumerate() {
+            if b[el.start] != b'{' {
+                continue;
+            }
+            let Ok(cm) = json::members(b, el) else { continue };
+            let (Some(id), Some(f)) = (s_in(&cm, "id"), obj(&cm, "function")) else { continue };
+            let Some(name) = s_in(&f, "name") else { continue };
+            let fields = json::find_member(b, &f, "arguments").map(|m| string_fields(b, &m.value)).unwrap_or_default();
             calls.push(RawCall { block: k as u16, id, name, fields });
-        } else if ty == b"tool_result" {
-            let Some(id) = s("tool_use_id") else { continue };
-            let is_error = json::find_member(b, &bm, "is_error").is_some_and(|m| &b[m.value.clone()] == b"true");
-            let content = json::find_member(b, &bm, "content").map(|m| m.value.clone()).unwrap_or(el.end..el.end);
-            results.push(RawResult { block: k as u16, tool_use_id: id, is_error, content });
+        }
+    }
+    if let Some(id) = s_in(&ms, "tool_call_id") {
+        let content = json::find_member(b, &ms, "content").map(|m| m.value.clone()).unwrap_or(b.len()..b.len());
+        results.push(RawResult { block: 0, tool_use_id: id, is_error: false, content });
+    }
+    // OpenAI Responses items
+    match s_in(&ms, "type") {
+        Some(t @ (b"function_call" | b"custom_tool_call")) => {
+            if let (Some(id), Some(name)) = (s_in(&ms, "call_id"), s_in(&ms, "name")) {
+                let input = if t == b"function_call" { "arguments" } else { "input" };
+                let fields = json::find_member(b, &ms, input).map(|m| string_fields(b, &m.value)).unwrap_or_default();
+                calls.push(RawCall { block: 0, id, name, fields });
+            }
+        }
+        Some(b"function_call_output" | b"custom_tool_call_output") => {
+            if let Some(id) = s_in(&ms, "call_id") {
+                let content = json::find_member(b, &ms, "output").map(|m| m.value.clone()).unwrap_or(b.len()..b.len());
+                results.push(RawResult { block: 0, tool_use_id: id, is_error: false, content });
+            }
+        }
+        _ => {}
+    }
+    // Gemini parts
+    if let Some(els) = arr(&ms, "parts") {
+        for (k, el) in els.iter().enumerate() {
+            if b[el.start] != b'{' {
+                continue;
+            }
+            let Ok(pm) = json::members(b, el) else { continue };
+            if let Some(fc) = obj(&pm, "functionCall") {
+                let Some(name) = s_in(&fc, "name") else { continue };
+                let id = s_in(&fc, "id").unwrap_or(name);
+                let fields = json::find_member(b, &fc, "args").map(|m| object_fields(b, &m.value)).unwrap_or_default();
+                calls.push(RawCall { block: k as u16, id, name, fields });
+            } else if let Some(fr) = json::find_member(b, &pm, "functionResponse").filter(|m| b[m.value.start] == b'{') {
+                let Ok(frm) = json::members(b, &fr.value) else { continue };
+                let Some(name) = s_in(&frm, "name") else { continue };
+                let id = s_in(&frm, "id").unwrap_or(name);
+                let resp = json::find_member(b, &frm, "response");
+                let is_error = resp.as_ref().filter(|m| b[m.value.start] == b'{').and_then(|m| json::members(b, &m.value).ok()).is_some_and(|rm| json::find_member(b, &rm, "error").is_some());
+                let content = resp.map(|m| m.value.clone()).unwrap_or(fr.value.clone());
+                results.push(RawResult { block: k as u16, tool_use_id: id, is_error, content });
+            }
         }
     }
     (calls, results)
 }
 
-/// The text of the tool result in content block `block` of a message: the string itself,
-/// or the text blocks of a list joined by newlines. `None` when the message has no such
-/// result or the result has no text.
+/// The text of the tool result in block `block` of a message: a string itself, the text
+/// blocks of a list joined by newlines, or any other JSON value as its text (Gemini's
+/// `response` object). `None` when the message has no such result or the result has no text.
 pub fn result_text(b: &[u8], block: u16) -> Option<String> {
     let (_, results) = scan_message(b);
     let c = &results.iter().find(|r| r.block == block)?.content;
@@ -163,7 +260,7 @@ pub fn result_text(b: &[u8], block: u16) -> Option<String> {
             let mut texts: Vec<String> = Vec::new();
             for el in els.iter().filter(|el| b[el.start] == b'{') {
                 let Ok(ms) = json::members(b, el) else { continue };
-                if !json::find_member(b, &ms, "type").is_some_and(|t| json::inner(b, &t.value) == b"text") {
+                if !json::find_member(b, &ms, "type").is_some_and(|t| matches!(json::inner(b, &t.value), b"text" | b"input_text" | b"output_text")) {
                     continue;
                 }
                 if let Some(t) = json::find_member(b, &ms, "text").filter(|m| b[m.value.start] == b'"') {
@@ -172,6 +269,7 @@ pub fn result_text(b: &[u8], block: u16) -> Option<String> {
             }
             (!texts.is_empty()).then(|| texts.join("\n"))
         }
+        b'{' => Some(String::from_utf8_lossy(&b[c.clone()]).into_owned()),
         _ => None,
     }
 }
@@ -543,7 +641,11 @@ pub fn extract(b: &[u8]) -> Extracted {
                     .map(|(k, v)| RawField {
                         key: k.to_vec(),
                         val: if v.len() > MAX_VALUE { Vec::new() } else { v.to_vec() },
-                        off: (v.as_ptr() as usize - base) as u32,
+                        // a decoded value is short and is not a range of the message
+                        off: match &v {
+                            Cow::Borrowed(x) => (x.as_ptr() as usize - base) as u32,
+                            Cow::Owned(_) => 0,
+                        },
                         len: v.len() as u32,
                     })
                     .collect();
@@ -566,54 +668,138 @@ pub struct RefStep {
 }
 
 /// The slow reference: every tool result in a full request body, paired with the call
-/// it answers in an earlier message of the same request. Walks the parsed JSON.
+/// it answers in an earlier message of the same request. Walks the parsed JSON, in each of
+/// the shapes [`scan_message`] reads.
 pub fn reference_steps(body: &[u8]) -> Vec<RefStep> {
     let Ok(root) = json::parse_all(body) else { return Vec::new() };
     let json::Node::Obj(top) = &root else { return Vec::new() };
-    let Some((_, json::Node::Arr(msgs))) = top.iter().find(|(k, _)| json::key_is(body, k, "messages")) else {
-        return Vec::new();
-    };
     fn get<'n>(body: &[u8], o: &'n [(json::Span, json::Node)], name: &str) -> Option<&'n json::Node> {
         o.iter().find(|(k, _)| json::key_is(body, k, name)).map(|(_, v)| v)
     }
+    let Some(msgs) = ["messages", "contents", "input"].iter().find_map(|k| match get(body, top, k) {
+        Some(json::Node::Arr(a)) => Some(a),
+        _ => None,
+    }) else {
+        return Vec::new();
+    };
     let tok = |n: Option<&json::Node>| match n {
         Some(json::Node::Tok(s)) if body[s.start] == b'"' => Some(json::inner(body, s).to_vec()),
         _ => None,
     };
+    let canon = |n: &json::Node| {
+        let mut t = Vec::new();
+        json::write_canonical(body, n, &mut t);
+        t
+    };
+    // an object input: canonical values, `None` past MAX_VALUE
+    let obj_fields = |n: Option<&json::Node>| {
+        let mut fields = Vec::new();
+        if let Some(json::Node::Obj(im)) = n {
+            for (k, v) in im {
+                let text = canon(v);
+                fields.push((json::inner(body, k).to_vec(), if text.len() <= MAX_VALUE { Some(text) } else { None }));
+            }
+        }
+        fields.sort();
+        fields
+    };
+    // an input sent as a JSON string: its decoded values as written, long ones left out
+    let str_fields = |n: Option<&json::Node>| {
+        let mut fields = Vec::new();
+        if let Some(json::Node::Tok(s)) = n
+            && body[s.start] == b'"'
+        {
+            let text = crate::text::unescape(json::inner(body, s)).into_bytes();
+            if let Ok(json::Node::Obj(im)) = json::parse_all(&text) {
+                for (k, v) in im {
+                    let raw = match &v {
+                        json::Node::Tok(x) => text[x.clone()].to_vec(),
+                        other => {
+                            let mut t = Vec::new();
+                            json::write_canonical(&text, other, &mut t);
+                            t
+                        }
+                    };
+                    if raw.len() <= MAX_VALUE {
+                        fields.push((json::inner(&text, &k).to_vec(), Some(raw)));
+                    }
+                }
+            }
+        }
+        fields.sort();
+        fields
+    };
+    let out_len = |n: Option<&json::Node>| n.map_or(0, |c| canon(c).len() as u32);
     let mut calls: HashMap<Vec<u8>, (Vec<u8>, Vec<(Vec<u8>, Option<Vec<u8>>)>)> = HashMap::new();
     let mut out = Vec::new();
+    let mut result = |calls: &HashMap<Vec<u8>, (Vec<u8>, Vec<(Vec<u8>, Option<Vec<u8>>)>)>, id: Vec<u8>, failed: bool, out_bytes: u32| {
+        if let Some((name, fields)) = calls.get(&id) {
+            out.push(RefStep { tool_use_id: id, tool: name.clone(), failed, out_bytes, fields: fields.clone() });
+        }
+    };
     for m in msgs {
         let json::Node::Obj(mo) = m else { continue };
-        let Some(json::Node::Arr(blocks)) = get(body, mo, "content") else { continue };
-        for blk in blocks {
-            let json::Node::Obj(bo) = blk else { continue };
-            match tok(get(body, bo, "type")).as_deref() {
-                Some(b"tool_use") => {
-                    let (Some(id), Some(name)) = (tok(get(body, bo, "id")), tok(get(body, bo, "name"))) else { continue };
-                    let mut fields = Vec::new();
-                    if let Some(json::Node::Obj(im)) = get(body, bo, "input") {
-                        for (k, v) in im {
-                            let mut text = Vec::new();
-                            json::write_canonical(body, v, &mut text);
-                            fields.push((json::inner(body, k).to_vec(), if text.len() <= MAX_VALUE { Some(text) } else { None }));
-                        }
+        // Anthropic content blocks
+        if let Some(json::Node::Arr(blocks)) = get(body, mo, "content") {
+            for blk in blocks {
+                let json::Node::Obj(bo) = blk else { continue };
+                match tok(get(body, bo, "type")).as_deref() {
+                    Some(b"tool_use") => {
+                        let (Some(id), Some(name)) = (tok(get(body, bo, "id")), tok(get(body, bo, "name"))) else { continue };
+                        calls.insert(id, (name, obj_fields(get(body, bo, "input"))));
                     }
-                    fields.sort();
-                    calls.insert(id, (name, fields));
+                    Some(b"tool_result") => {
+                        let Some(id) = tok(get(body, bo, "tool_use_id")) else { continue };
+                        let failed = matches!(get(body, bo, "is_error"), Some(json::Node::Tok(s)) if &body[s.clone()] == b"true");
+                        // compact length of the content; equal to the engine's raw length for compact bodies
+                        result(&calls, id, failed, out_len(get(body, bo, "content")));
+                    }
+                    _ => {}
                 }
-                Some(b"tool_result") => {
-                    let Some(id) = tok(get(body, bo, "tool_use_id")) else { continue };
-                    let Some((name, fields)) = calls.get(&id) else { continue };
-                    let failed = matches!(get(body, bo, "is_error"), Some(json::Node::Tok(s)) if &body[s.clone()] == b"true");
-                    // compact length of the content; equal to the engine's raw length for compact bodies
-                    let out_bytes = get(body, bo, "content").map(|c| {
-                        let mut t = Vec::new();
-                        json::write_canonical(body, c, &mut t);
-                        t.len() as u32
-                    });
-                    out.push(RefStep { tool_use_id: id, tool: name.clone(), failed, out_bytes: out_bytes.unwrap_or(0), fields: fields.clone() });
+            }
+        }
+        // OpenAI Chat Completions
+        if let Some(json::Node::Arr(tcs)) = get(body, mo, "tool_calls") {
+            for tc in tcs {
+                let json::Node::Obj(co) = tc else { continue };
+                let (Some(id), Some(json::Node::Obj(f))) = (tok(get(body, co, "id")), get(body, co, "function")) else { continue };
+                let Some(name) = tok(get(body, f, "name")) else { continue };
+                calls.insert(id, (name, str_fields(get(body, f, "arguments"))));
+            }
+        }
+        if let Some(id) = tok(get(body, mo, "tool_call_id")) {
+            result(&calls, id, false, out_len(get(body, mo, "content")));
+        }
+        // OpenAI Responses items
+        match tok(get(body, mo, "type")).as_deref() {
+            Some(t @ (b"function_call" | b"custom_tool_call")) => {
+                if let (Some(id), Some(name)) = (tok(get(body, mo, "call_id")), tok(get(body, mo, "name"))) {
+                    let input = if t == b"function_call" { "arguments" } else { "input" };
+                    calls.insert(id, (name, str_fields(get(body, mo, input))));
                 }
-                _ => {}
+            }
+            Some(b"function_call_output" | b"custom_tool_call_output") => {
+                if let Some(id) = tok(get(body, mo, "call_id")) {
+                    result(&calls, id, false, out_len(get(body, mo, "output")));
+                }
+            }
+            _ => {}
+        }
+        // Gemini parts
+        if let Some(json::Node::Arr(parts)) = get(body, mo, "parts") {
+            for p in parts {
+                let json::Node::Obj(po) = p else { continue };
+                if let Some(json::Node::Obj(fc)) = get(body, po, "functionCall") {
+                    let Some(name) = tok(get(body, fc, "name")) else { continue };
+                    let id = tok(get(body, fc, "id")).unwrap_or_else(|| name.clone());
+                    calls.insert(id, (name, obj_fields(get(body, fc, "args"))));
+                } else if let Some(json::Node::Obj(fr)) = get(body, po, "functionResponse") {
+                    let Some(name) = tok(get(body, fr, "name")) else { continue };
+                    let id = tok(get(body, fr, "id")).unwrap_or_else(|| name.clone());
+                    let resp = get(body, fr, "response");
+                    let failed = matches!(resp, Some(json::Node::Obj(r)) if get(body, r, "error").is_some());
+                    result(&calls, id, failed, out_len(resp));
+                }
             }
         }
     }
@@ -640,7 +826,7 @@ mod tests {
         assert!(r.is_empty());
         assert_eq!(c[0].block, 1);
         assert_eq!(c[0].name, b"Bash");
-        assert_eq!(c[0].fields, vec![(&b"command"[..], &b"\"ls\""[..]), (&b"n"[..], &b"3"[..])]);
+        assert_eq!(fields(&c[0]), vec![("command", "\"ls\""), ("n", "3")]);
         let u = br#"{"content":[{"content":"ok","is_error":true,"tool_use_id":"t1","type":"tool_result"}],"role":"user"}"#;
         let (c, r) = scan_message(u);
         assert!(c.is_empty());
@@ -651,5 +837,52 @@ mod tests {
         assert_eq!(result_text(u, 1), None);
         let l = br#"{"content":[{"content":[{"text":"3 failed\n","type":"text"},{"source":{"data":""},"type":"image"},{"text":"done","type":"text"}],"tool_use_id":"t1","type":"tool_result"}],"role":"user"}"#;
         assert_eq!(result_text(l, 0).as_deref(), Some("3 failed\n\ndone"));
+    }
+
+    fn fields<'a>(c: &'a RawCall) -> Vec<(&'a str, &'a str)> {
+        c.fields.iter().map(|(k, v)| (std::str::from_utf8(k).unwrap(), std::str::from_utf8(v).unwrap())).collect()
+    }
+
+    #[test]
+    fn openai_chat_calls_and_results() {
+        let a = br#"{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"run_shell","arguments":"{\"command\":\"ls -la\",\"n\":3}"}},{"id":"call_2","type":"function","function":{"name":"read","arguments":"{}"}}]}"#;
+        let (c, r) = scan_message(a);
+        assert!(r.is_empty());
+        assert_eq!(c.len(), 2);
+        assert_eq!((c[0].block, c[0].id, c[0].name), (0, &b"call_1"[..], &b"run_shell"[..]));
+        assert_eq!(fields(&c[0]), vec![("command", "\"ls -la\""), ("n", "3")]);
+        assert_eq!((c[1].block, c[1].name), (1, &b"read"[..]));
+        // decoded values are not ranges of the message
+        let ex = extract(a);
+        assert_eq!(ex.calls[0].3[0].val, b"\"ls -la\"");
+        let t = br#"{"role":"tool","tool_call_id":"call_1","content":"total 0"}"#;
+        let (c, r) = scan_message(t);
+        assert!(c.is_empty());
+        assert_eq!((r[0].block, r[0].tool_use_id, r[0].is_error), (0, &b"call_1"[..], false));
+        assert_eq!(result_text(t, 0).as_deref(), Some("total 0"));
+    }
+
+    #[test]
+    fn responses_items() {
+        let a = br#"{"type":"function_call","call_id":"fc_1","name":"get_weather","arguments":"{\"city\":\"Paris\"}","id":"x"}"#;
+        let (c, _) = scan_message(a);
+        assert_eq!((c[0].id, c[0].name), (&b"fc_1"[..], &b"get_weather"[..]));
+        assert_eq!(fields(&c[0]), vec![("city", "\"Paris\"")]);
+        let o = br#"{"type":"function_call_output","call_id":"fc_1","output":"sunny"}"#;
+        let (_, r) = scan_message(o);
+        assert_eq!(r[0].tool_use_id, b"fc_1");
+        assert_eq!(result_text(o, 0).as_deref(), Some("sunny"));
+    }
+
+    #[test]
+    fn gemini_parts() {
+        let a = br#"{"role":"model","parts":[{"text":"checking"},{"functionCall":{"name":"lookup","args":{"q":"rust","k":2}}}]}"#;
+        let (c, _) = scan_message(a);
+        assert_eq!((c[0].block, c[0].id, c[0].name), (1, &b"lookup"[..], &b"lookup"[..]));
+        assert_eq!(fields(&c[0]), vec![("q", "\"rust\""), ("k", "2")]);
+        let u = br#"{"role":"user","parts":[{"functionResponse":{"name":"lookup","response":{"error":"timeout"}}}]}"#;
+        let (_, r) = scan_message(u);
+        assert_eq!((r[0].tool_use_id, r[0].is_error), (&b"lookup"[..], true));
+        assert_eq!(result_text(u, 0).as_deref(), Some(r#"{"error":"timeout"}"#));
     }
 }

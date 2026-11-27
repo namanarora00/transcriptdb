@@ -26,14 +26,17 @@ pub mod rule_check;
 pub mod rules;
 pub mod search_check;
 pub mod segment;
+pub mod server;
 pub mod split;
 pub mod stats;
 pub mod steps;
+pub mod store;
 pub mod synth;
 pub mod text;
 pub mod textindex;
 pub mod trace;
 pub mod wal;
 
-pub use db::{req_id, req_parts, Db, Options, Put, PutOutcome, ReadStats, ReqId, Stats};
+pub use db::{req_id, req_parts, Db, DropReport, Options, Prepared, Put, PutOutcome, ReadStats, ReqId, Stats, VacuumReport};
+pub use store::{Request, Store, StoreOptions};
 pub use wal::SyncMode;

@@ -14,7 +14,7 @@
 //! * long base64 strings under `signature` or `data` keys (thinking signatures,
 //!   images) are cut out of a message by [`cut_opaque`] into the opaque store.
 
-use crate::codec::{corrupt, Dec, Enc, Error, Result};
+use crate::codec::{corrupt, Dec, Enc, Result};
 use crate::json::{self, Member, Span};
 use base64::Engine;
 
@@ -165,17 +165,34 @@ fn cut_blocks(v: &[u8]) -> Result<Piece> {
     Ok(apply_cuts(v, &cuts))
 }
 
-/// Split a request body. The body must be a JSON object.
+/// Members holding the conversation, by API: Anthropic and OpenAI Chat Completions
+/// (`messages`), Gemini (`contents`), OpenAI Responses (`input`, when it is a list of
+/// items). The first one present that is an array is split into messages.
+const MESSAGE_KEYS: &[&str] = &["messages", "contents", "input"];
+/// Members holding the system prompt: Anthropic (`system`), Gemini (`systemInstruction`,
+/// `system_instruction`), OpenAI Responses (`instructions`). OpenAI Chat Completions keeps
+/// it as the first message.
+const SYSTEM_KEYS: &[&str] = &["system", "systemInstruction", "system_instruction", "instructions"];
+
+/// A body kept whole, as its own skeleton: one that is not a JSON object (an embedding's
+/// input list, a form, plain text), or not JSON at all.
+fn whole(body: &[u8]) -> Split {
+    Split { skeleton: Skeleton { bytes: body.to_vec(), holes: Vec::new() }, messages: Vec::new(), layout: None, system: None, tools: None }
+}
+
+/// Split a request body. A JSON object is cut into its messages, system prompt and tool
+/// list, wherever the API keeps them ([`MESSAGE_KEYS`], [`SYSTEM_KEYS`], `tools`), and the
+/// rest (its skeleton); anything else is kept whole.
 pub fn split(body: &[u8]) -> Result<Split> {
     let start = json::skip_ws(body, 0);
     if body.get(start) != Some(&b'{') {
-        return Err(Error::BadRequest("body is not a JSON object".into()));
+        return Ok(whole(body));
     }
-    let end = json::scan_value(body, start)?;
+    let Ok(end) = json::scan_value(body, start) else { return Ok(whole(body)) };
     if json::skip_ws(body, end) != body.len() {
-        return Err(Error::BadRequest("trailing bytes after the body".into()));
+        return Ok(whole(body));
     }
-    let top = json::members(body, &(start..end))?;
+    let Ok(top) = json::members(body, &(start..end)) else { return Ok(whole(body)) };
 
     // (range removed from the body, hole kind)
     let mut cuts: Vec<(Span, HoleKind)> = Vec::new();
@@ -184,8 +201,12 @@ pub fn split(body: &[u8]) -> Result<Split> {
     let mut system = None;
     let mut tools = None;
 
-    if let Some(m) = json::find_member(body, &top, "messages")
-        && body[m.value.start] == b'[' {
+    // an `input` list is a conversation (Responses items are objects); an embedding's list of
+    // texts or token ids stays in the skeleton rather than becoming one node per element
+    let conversation = |k: &str, m: &json::Member| {
+        body[m.value.start] == b'[' && (k != "input" || body.get(json::skip_ws(body, m.value.start + 1)) == Some(&b'{'))
+    };
+    if let Some(m) = MESSAGE_KEYS.iter().filter_map(|k| json::find_member(body, &top, k).filter(|m| conversation(k, m))).next() {
             let (els, close) = json::elements(body, &m.value)?;
             let interior = m.value.start + 1..close;
             // compact means exactly e0,e1,...,en with nothing else
@@ -217,7 +238,7 @@ pub fn split(body: &[u8]) -> Result<Split> {
             }
             cuts.push((interior, HoleKind::Messages));
         }
-    if let Some(m) = json::find_member(body, &top, "system") {
+    if let Some(m) = SYSTEM_KEYS.iter().find_map(|k| json::find_member(body, &top, k)) {
         system = Some(cut_blocks(&body[m.value.clone()])?);
         cuts.push((m.value.clone(), HoleKind::System));
     }
@@ -635,5 +656,22 @@ mod tests {
         assert!(Keep::dropping("pictures").is_err());
         assert!(Keep::dropping("thinking").is_err());
         assert_eq!(Keep::dropping("other, documents").unwrap(), Keep { documents: false, other: false });
+    }
+
+    #[test]
+    fn where_each_api_keeps_its_conversation() {
+        let n = |b: &[u8]| {
+            let sp = split(b).unwrap();
+            assert_eq!(join(&sp).unwrap(), b);
+            (sp.messages.len(), sp.system.is_some())
+        };
+        assert_eq!(n(br#"{"model":"gpt-4o","messages":[{"role":"system","content":"s"},{"role":"user","content":"u"}]}"#), (2, false));
+        assert_eq!(n(br#"{"instructions":"s","input":[{"role":"user","content":"u"},{"type":"function_call","call_id":"c","name":"f","arguments":"{}"}]}"#), (2, true));
+        assert_eq!(n(br#"{"systemInstruction":{"parts":[{"text":"s"}]},"contents":[{"role":"user","parts":[{"text":"u"}]}]}"#), (1, true));
+        // an embedding's texts or token ids are not a conversation
+        assert_eq!(n(br#"{"model":"text-embedding-3-small","input":["a","b","c"]}"#), (0, false));
+        assert_eq!(n(br#"{"model":"text-embedding-3-small","input":[[1,2,3],[4,5]]}"#), (0, false));
+        assert_eq!(n(br#"{"input":"one string"}"#), (0, false));
+        assert_eq!(n(b"not json"), (0, false));
     }
 }

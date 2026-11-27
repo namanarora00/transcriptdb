@@ -214,7 +214,7 @@ fn ingest_claude(a: &Args) {
                 }
                 let t = Instant::now();
                 let out = db
-                    .put(&Put { session: &r.session, agent: &r.agent, id: &r.id, time: &r.time, meta: &r.meta, body })
+                    .put(&Put { session: &r.session, agent: &r.agent, id: &r.id, time: &r.time, meta: &r.meta, body, response: b"" })
                     .unwrap_or_else(|e| panic!("put {}: {e}", r.id));
                 match out {
                     PutOutcome::Stored(_) => {
@@ -985,7 +985,7 @@ fn synth_store(a: &Args) {
     let mut n = 0;
     for s in 0..a.num("sessions", 20) {
         for q in synth::session_with(seed, s, a.num("per", 40) as usize, a.get("rich").is_some()) {
-            db.put(&Put { session: &q.session, agent: &q.agent, id: &q.id, time: &q.time, meta: b"", body: &q.body }).expect("put");
+            db.put(&Put { session: &q.session, agent: &q.agent, id: &q.id, time: &q.time, meta: b"", body: &q.body, response: b"" }).expect("put");
             n += 1;
         }
         db.commit().expect("commit");
@@ -1029,6 +1029,243 @@ fn serve(a: &Args) {
     }
 }
 
+/// `tdb server --root DIR [--bind 127.0.0.1:8378] [--token T | env TDB_TOKEN]
+/// [--max-connections 256] [--cache-mb 1024] [--query-threads N] [--sync full]`: the network
+/// server (see `server.rs`), one store per project under `--root`.
+fn server(a: &Args) {
+    let d = transcriptdb::server::ServerConfig::default();
+    let cfg = transcriptdb::server::ServerConfig {
+        root: PathBuf::from(a.get("root").expect("--root DIR is required")),
+        bind: a.get("bind").unwrap_or("127.0.0.1:8378").parse().expect("--bind HOST:PORT"),
+        token: a.get("token").map(String::from).or_else(|| std::env::var("TDB_TOKEN").ok()).filter(|t| !t.is_empty()),
+        max_connections: a.num("max-connections", d.max_connections as u64) as usize,
+        cache_bytes: (a.num("cache-mb", (d.cache_bytes >> 20) as u64) as usize) << 20,
+        query_threads: a.num("query-threads", d.query_threads as u64) as usize,
+        max_body: (a.num("max-body-mb", (d.max_body >> 20) as u64) as usize) << 20,
+        store: a.opts(),
+        ..d
+    };
+    if let Err(e) = transcriptdb::server::serve(cfg) {
+        eprintln!("server: {e}");
+        std::process::exit(1);
+    }
+}
+
+/// `tdb load --store DIR [--via store|http] [--clients 1,2,4,8,16] [--readers 2]
+/// [--max-mb 600] [--batch 1] [--sync full]`: real logs replayed by many clients at once.
+/// Each client owns a share of the sessions and puts their requests in order (`--batch`
+/// at a time); readers fetch requests already acknowledged meanwhile. A fresh store per
+/// client count. Reports requests and body MB a second, put and read latency, and how many
+/// requests shared each sync.
+fn load(a: &Args) {
+    use transcriptdb::store::{Request, Store, StoreOptions};
+    let max = (a.num("max-mb", 600) as usize) << 20;
+    let via = a.get("via").unwrap_or("store").to_string();
+    let batch = a.num("batch", 1).max(1) as usize;
+    let readers = a.num("readers", 2) as usize;
+    let clients: Vec<usize> = a.get("clients").unwrap_or("1,2,4,8,16").split(',').map(|x| x.parse().expect("--clients 1,2,4")).collect();
+    // real requests, by session, until max bytes
+    let rx = read_logs(select_files(a), 4);
+    let mut by_session: Vec<Vec<Request>> = Vec::new();
+    let mut ix: HashMap<(String, String), usize> = HashMap::new();
+    let mut bytes = 0usize;
+    for item in rx {
+        let Item::Req(r) = item else { continue };
+        let Ok(body) = r.body else { continue };
+        if bytes >= max {
+            continue;
+        }
+        bytes += body.len();
+        let k = *ix.entry((r.session.clone(), r.agent.clone())).or_insert_with(|| {
+            by_session.push(Vec::new());
+            by_session.len() - 1
+        });
+        by_session[k].push(Request { session: r.session, agent: r.agent, id: r.id, time: r.time, meta: r.meta, body, response: Vec::new() });
+    }
+    let n: usize = by_session.iter().map(|v| v.len()).sum();
+    println!("{n} requests in {} sessions, {:.0} MB of bodies; via {via}, {batch} per put, {readers} readers, sync {:?}", by_session.len(), bytes as f64 / 1e6, a.sync());
+    println!("{:>7} {:>9} {:>9} {:>9} {:>9} {:>9} {:>11} {:>9} {:>9}", "clients", "req/s", "MB/s", "put p50", "put p99", "put max", "reqs/sync", "read p50", "read p99");
+    let by_session = Arc::new(by_session);
+    for &c in &clients {
+        let dir = a.store().join(format!("load-{c}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        let opts = Options { sync: a.sync(), ..a.opts() };
+        let g0 = transcriptdb::store::group_stats();
+        // the store, in this process or behind a server
+        let store = Arc::new(Store::open(&dir, opts.clone(), StoreOptions::default()).expect("open store"));
+        let srv = (via == "http").then(|| {
+            drop(store.clone());
+            transcriptdb::server::start(transcriptdb::server::ServerConfig {
+                root: a.store().join(format!("load-http-{c}")),
+                bind: "127.0.0.1:0".parse().unwrap(),
+                store: opts.clone(),
+                max_connections: 1024,
+                ..Default::default()
+            })
+            .expect("start server")
+        });
+        let addr = srv.as_ref().map(|s| s.addr);
+        let acked: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let left = Arc::new(AtomicUsize::new(c));
+        let t0 = Instant::now();
+        let mut hs = Vec::new();
+        for k in 0..c {
+            let (bs, store, acked, left) = (by_session.clone(), store.clone(), acked.clone(), left.clone());
+            hs.push(std::thread::spawn(move || {
+                let mut lat = Vec::new();
+                let mut http = addr.map(LoadClient::new);
+                for (si, reqs) in bs.iter().enumerate() {
+                    if si % c != k {
+                        continue;
+                    }
+                    for chunk in reqs.chunks(batch) {
+                        let t = Instant::now();
+                        match &mut http {
+                            None => {
+                                for r in store.put(chunk.to_vec()) {
+                                    r.expect("put");
+                                }
+                            }
+                            Some(h) => h.put(chunk),
+                        }
+                        lat.push(t.elapsed().as_secs_f64() * 1e3);
+                        acked.lock().unwrap().extend(chunk.iter().map(|r| r.id.clone()));
+                    }
+                }
+                left.fetch_sub(1, Ordering::SeqCst);
+                lat
+            }));
+        }
+        let mut rh = Vec::new();
+        for _ in 0..readers {
+            let (store, acked, left) = (store.clone(), acked.clone(), left.clone());
+            rh.push(std::thread::spawn(move || {
+                let mut lat = Vec::new();
+                let mut http = addr.map(LoadClient::new);
+                let mut r = Rng::new(lat.len() as u64 + 7);
+                while left.load(Ordering::SeqCst) > 0 {
+                    let id = {
+                        let g = acked.lock().unwrap();
+                        if g.is_empty() {
+                            None
+                        } else {
+                            Some(g[r.below(g.len() as u64) as usize].clone())
+                        }
+                    };
+                    let Some(id) = id else {
+                        std::thread::sleep(Duration::from_millis(1));
+                        continue;
+                    };
+                    let t = Instant::now();
+                    match &mut http {
+                        None => {
+                            let snap = store.snapshot().unwrap();
+                            let ri = snap.request_index(&id).expect("acknowledged request missing");
+                            snap.rebuild(ri).unwrap();
+                        }
+                        Some(h) => h.get(&id),
+                    }
+                    lat.push(t.elapsed().as_secs_f64() * 1e3);
+                }
+                lat
+            }));
+        }
+        let mut put_lat: Vec<f64> = hs.into_iter().flat_map(|h| h.join().unwrap()).collect();
+        let secs = t0.elapsed().as_secs_f64();
+        let mut read_lat: Vec<f64> = rh.into_iter().flat_map(|h| h.join().unwrap()).collect();
+        let g1 = transcriptdb::store::group_stats();
+        let pct = |v: &mut Vec<f64>, p: f64| {
+            if v.is_empty() {
+                return f64::NAN;
+            }
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            v[((v.len() - 1) as f64 * p).round() as usize]
+        };
+        let groups = (g1.groups - g0.groups).max(1);
+        println!(
+            "{c:>7} {:>9.0} {:>9.0} {:>8.2}ms {:>8.2}ms {:>8.1}ms {:>11.1} {:>8.2}ms {:>8.2}ms",
+            n as f64 / secs,
+            bytes as f64 / 1e6 / secs,
+            pct(&mut put_lat, 0.5),
+            pct(&mut put_lat, 0.99),
+            pct(&mut put_lat, 1.0),
+            (g1.requests - g0.requests) as f64 / groups as f64,
+            pct(&mut read_lat, 0.5),
+            pct(&mut read_lat, 0.99)
+        );
+        if let Some(s) = srv {
+            s.stop(Duration::from_secs(30));
+        }
+        store.close();
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(a.store().join(format!("load-http-{c}")));
+    }
+}
+
+/// A keep-alive HTTP connection for `tdb load`.
+struct LoadClient {
+    w: std::net::TcpStream,
+    r: BufReader<std::net::TcpStream>,
+}
+
+impl LoadClient {
+    fn new(addr: std::net::SocketAddr) -> LoadClient {
+        let s = std::net::TcpStream::connect(addr).expect("connect");
+        s.set_nodelay(true).unwrap();
+        LoadClient { r: BufReader::new(s.try_clone().unwrap()), w: s }
+    }
+
+    fn call(&mut self, method: &str, path: &str, body: &[u8]) -> (u16, Vec<u8>) {
+        let head = format!("{method} {path} HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\n\r\n", body.len());
+        self.w.write_all(head.as_bytes()).unwrap();
+        self.w.write_all(body).unwrap();
+        let mut line = String::new();
+        self.r.read_line(&mut line).unwrap();
+        let status: u16 = line.split(' ').nth(1).unwrap().parse().unwrap();
+        let mut len = 0usize;
+        loop {
+            let mut h = String::new();
+            self.r.read_line(&mut h).unwrap();
+            let h = h.trim_end();
+            if h.is_empty() {
+                break;
+            }
+            if let Some(v) = h.strip_prefix("Content-Length: ") {
+                len = v.parse().unwrap();
+            }
+        }
+        let mut b = vec![0; len];
+        std::io::Read::read_exact(&mut self.r, &mut b).unwrap();
+        (status, b)
+    }
+
+    fn put(&mut self, reqs: &[transcriptdb::store::Request]) {
+        let mut body = Vec::with_capacity(reqs.iter().map(|r| r.body.len() + 256).sum());
+        body.push(b'[');
+        for (i, r) in reqs.iter().enumerate() {
+            if i > 0 {
+                body.push(b',');
+            }
+            body.extend_from_slice(format!(r#"{{"id":{},"session":{},"agent":{},"time":{},"body":"#, transcriptdb::server::q(&r.id), transcriptdb::server::q(&r.session), transcriptdb::server::q(&r.agent), transcriptdb::server::q(&r.time)).as_bytes());
+            body.extend_from_slice(&r.body);
+            body.push(b'}');
+        }
+        body.push(b']');
+        let (s, b) = self.call("POST", "/v1/p/load/put", &body);
+        assert!(s == 200 && !b.windows(8).any(|w| w == b"\"error\":"), "put: {s} {}", String::from_utf8_lossy(&b[..b.len().min(300)]));
+    }
+
+    fn get(&mut self, id: &str) {
+        let (s, _) = self.call("GET", &format!("/v1/p/load/requests/{}?response=0", pct_encode(id)), b"");
+        assert_eq!(s, 200, "get {id}");
+    }
+}
+
+fn pct_encode(s: &str) -> String {
+    s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") }).collect()
+}
+
 // ---------------------------------------------------------------------- crash test
 
 const CRASH_SESSIONS: u64 = 6;
@@ -1070,7 +1307,7 @@ fn crash_child(a: &Args) {
             }
             let i = *r.pick(&live);
             let q = queues[i].remove(0);
-            let o = db.put(&Put { session: &q.session, agent: &q.agent, id: &q.id, time: &q.time, meta: b"", body: &q.body }).expect("put");
+            let o = db.put(&Put { session: &q.session, agent: &q.agent, id: &q.id, time: &q.time, meta: b"", body: &q.body, response: b"" }).expect("put");
             if matches!(o, PutOutcome::Stored(_)) {
                 batch.push(q.id);
             }
@@ -1203,7 +1440,7 @@ fn scale(a: &Args) {
         for (k, it) in rx.into_iter().enumerate() {
             let kind = if dst.flushing() { 2 } else if dst.merging() { 1 } else { 0 };
             let t = Instant::now();
-            dst.put(&Put { session: &it.session, agent: &it.agent, id: &it.id, time: &it.time, meta: &it.meta, body: &it.body }).expect("put");
+            dst.put(&Put { session: &it.session, agent: &it.agent, id: &it.id, time: &it.time, meta: &it.meta, body: &it.body, response: b"" }).expect("put");
             dst.commit().expect("commit");
             times[kind].push(t.elapsed().as_micros().min(u32::MAX as u128) as u32);
             bytes_in += it.body.len() as u64;
@@ -1435,6 +1672,8 @@ fn main() {
         "compact" => compact(&a),
         "check-steps" => check_steps(&a),
         "serve" => serve(&a),
+        "server" => server(&a),
+        "load" => load(&a),
         "query" => query(&a),
         "check-queries" => check_queries(&a),
         "check-search" => check_search(&a),
@@ -1693,7 +1932,7 @@ fn growth(a: &Args) {
                 let mut any = false;
                 for s in queues.iter_mut() {
                     if let Some(q) = s.pop() {
-                        db.put(&Put { session: &q.session, agent: &q.agent, id: &q.id, time: &q.time, meta: b"", body: &q.body }).expect("put");
+                        db.put(&Put { session: &q.session, agent: &q.agent, id: &q.id, time: &q.time, meta: b"", body: &q.body, response: b"" }).expect("put");
                         round_raw += q.body.len() as u64;
                         any = true;
                     }

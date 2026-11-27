@@ -38,6 +38,10 @@ pub struct ReqRec {
     pub tools: u32,
     pub notes: Box<[ReqNote]>,
     pub layout: Option<Box<[Box<[u8]>]>>,
+    /// The node holding the response the model gave this request, kept as it came (`NONE`
+    /// if none was stored). A child of `tip` outside the conversation: no later request
+    /// walks through it, and its text and tool calls are not read as messages.
+    pub response: u32,
 }
 
 fn opt(v: u32) -> u64 {
@@ -79,6 +83,7 @@ impl ReqRec {
                 }
             }
         }
+        e.var(opt(self.response));
     }
 
     pub fn decode(d: &mut Dec) -> Result<ReqRec> {
@@ -108,7 +113,8 @@ impl ReqRec {
             }
             _ => return corrupt("bad layout flag"),
         };
-        Ok(ReqRec { id, time, meta, session, tip, n_msgs, skeleton, system, tools, notes: notes.into_boxed_slice(), layout })
+        let response = unopt(d.var()?)?;
+        Ok(ReqRec { id, time, meta, session, tip, n_msgs, skeleton, system, tools, notes: notes.into_boxed_slice(), layout, response })
     }
 }
 
@@ -265,6 +271,7 @@ mod tests {
                 tools: NONE,
                 notes: vec![ReqNote { target: 2, offset: 1, text: 4 }].into_boxed_slice(),
                 layout: Some(vec![b" ".to_vec().into_boxed_slice()].into_boxed_slice()),
+                response: 1,
             },
         };
         assert_eq!(Mutation::decode(&m.encode()).unwrap(), m);

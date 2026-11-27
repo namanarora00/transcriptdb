@@ -35,7 +35,7 @@ use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-const SEG_MAGIC: &[u8; 8] = b"TDBSEG12";
+const SEG_MAGIC: &[u8; 8] = b"TDBSEG13";
 /// Raw bytes per group block of encoded parts, and per directory block.
 const GROUP: usize = 64 * 1024;
 /// Bloom filter bits per key: about 0.2% false positives.
@@ -366,7 +366,7 @@ fn encode_core(p: &CorePart, e: &mut Enc) {
             last_opaque = id as i64;
         }
     }
-    let (mut tip, mut nm, mut ps, mut sess) = (0i64, 0i64, [0i64; 3], 0i64);
+    let (mut tip, mut nm, mut ps, mut sess, mut resp) = (0i64, 0i64, [0i64; 3], 0i64, 0i64);
     for r in &p.requests {
         c[12].var(zz(r.session as i64 - sess));
         sess = r.session as i64;
@@ -382,6 +382,9 @@ fn encode_core(p: &CorePart, e: &mut Enc) {
             c[12].var(zz(v as i64 - ps[k]));
             ps[k] = v as i64;
         }
+        let rv = opt_id(r.response) as i64;
+        c[12].var(zz(rv - resp));
+        resp = rv;
         c[13].var(r.notes.len() as u64);
         for n in r.notes.iter() {
             c[13].var(n.target as u64);
@@ -450,7 +453,7 @@ pub fn decode_core(b: &[u8]) -> Result<CorePart> {
         nodes.push(SegNode { id, parent, off, len, holes });
     }
     let mut requests = Vec::with_capacity(nr.min(1 << 20));
-    let (mut tip, mut nm, mut ps, mut sess) = (0i64, 0i64, [0i64; 3], 0i64);
+    let (mut tip, mut nm, mut ps, mut sess, mut resp) = (0i64, 0i64, [0i64; 3], 0i64, 0i64);
     let utf8 = |b: &[u8]| -> Result<Box<str>> { Ok(std::str::from_utf8(b).map_err(|_| crate::codec::Error::Corrupt("string not utf-8".into()))?.into()) };
     for _ in 0..nr {
         sess = i64_from(sess, c[12].var()?)?;
@@ -464,6 +467,8 @@ pub fn decode_core(b: &[u8]) -> Result<CorePart> {
             ps[k] = i64_from(ps[k], c[12].var()?)?;
             v[k] = u64::try_from(ps[k]).map_err(|_| crate::codec::Error::Corrupt("bad piece id".into()))?;
         }
+        resp = i64_from(resp, c[12].var()?)?;
+        let response = unopt_id(u64::try_from(resp).map_err(|_| crate::codec::Error::Corrupt("bad response node".into()))?)?;
         let nn = c[13].var()? as usize;
         let mut notes = Vec::with_capacity(nn.min(1 << 16));
         for _ in 0..nn {
@@ -494,6 +499,7 @@ pub fn decode_core(b: &[u8]) -> Result<CorePart> {
             tools: unopt_id(v[2])?,
             notes: notes.into_boxed_slice(),
             layout,
+            response,
         });
     }
     if c.iter().any(|x| !x.done()) {
@@ -1146,6 +1152,14 @@ pub struct Segment {
     path: PathBuf,
     pub cat: SegCat,
     pub file_bytes: u64,
+    /// Set once the store replaced it: the file goes when the last handle does.
+    doom: crate::block::Doom,
+}
+
+impl Drop for Segment {
+    fn drop(&mut self) {
+        self.doom.drop_file(&self.path);
+    }
 }
 
 thread_local! {
@@ -1282,11 +1296,16 @@ impl Segment {
         let f = file(&path)?;
         let (c, file_bytes) = read_catalog(&f, SEG_MAGIC, &format!("segment {num}"))?;
         let cat = SegCat::decode(&c)?;
-        Ok(Segment { num, uid: crate::block::uid(), path, cat, file_bytes })
+        Ok(Segment { num, uid: crate::block::uid(), path, cat, file_bytes, doom: Default::default() })
     }
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Delete the file once no handle on this segment is left (snapshots may still read it).
+    pub fn doom(&self) {
+        self.doom.set();
     }
 
     /// The dictionary this segment's frames were compressed with, if any.

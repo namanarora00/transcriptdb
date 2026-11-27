@@ -23,13 +23,6 @@ struct RawStep {
     failed: bool,
 }
 
-fn block(m: &[u8], k: u16) -> Option<&[u8]> {
-    let ms = crate::json::members(m, &(0..m.len())).ok()?;
-    let c = crate::json::find_member(m, &ms, "content")?;
-    let (els, _) = crate::json::elements(m, &c.value).ok()?;
-    els.get(k as usize).map(|e| &m[e.clone()])
-}
-
 fn raw_steps(db: &Db, s: u32) -> Result<Vec<RawStep>, QError> {
     let ss_arc = db.steps(s);
     let ss = &*ss_arc;
@@ -41,16 +34,10 @@ fn raw_steps(db: &Db, s: u32) -> Result<Vec<RawStep>, QError> {
                 e.insert(db.message(s, n).map_err(|e| QError::new(e.to_string()))?);
             }
         }
-        let call = block(&cache[&r.call_node], r.call_block).ok_or_else(|| QError::new("reference: call block missing"))?;
-        let res = block(&cache[&r.result_node], r.result_block).ok_or_else(|| QError::new("reference: result block missing"))?;
-        // the call block is a one-block message for scan purposes
-        let mut wrapped = Vec::from(&br#"{"content":["#[..]);
-        wrapped.extend_from_slice(call);
-        wrapped.extend_from_slice(b"]}");
-        let (calls, _) = steps::scan_message(&wrapped);
-        let c = calls.first().ok_or_else(|| QError::new("reference: not a tool call"))?;
-        let rm = crate::json::members(res, &(0..res.len())).map_err(|e| QError::new(e.to_string()))?;
-        let failed = crate::json::find_member(res, &rm, "is_error").is_some_and(|m| &res[m.value.clone()] == b"true");
+        let (calls, _) = steps::scan_message(&cache[&r.call_node]);
+        let c = calls.iter().find(|c| c.block == r.call_block).ok_or_else(|| QError::new("reference: call block missing"))?;
+        let (_, results) = steps::scan_message(&cache[&r.result_node]);
+        let failed = results.iter().find(|x| x.block == r.result_block).ok_or_else(|| QError::new("reference: result block missing"))?.is_error;
         out.push(RawStep {
             tool: String::from_utf8_lossy(c.name).into_owned(),
             fields: c.fields.iter().map(|(k, v)| (String::from_utf8_lossy(k).into_owned(), v.to_vec())).collect(),

@@ -420,6 +420,14 @@ pub struct Run {
     path: PathBuf,
     pub cat: RunCat,
     pub file_bytes: u64,
+    /// Set once a merge of runs replaced it: the file goes when the last handle does.
+    doom: crate::block::Doom,
+}
+
+impl Drop for Run {
+    fn drop(&mut self) {
+        self.doom.drop_file(&self.path);
+    }
 }
 
 impl Run {
@@ -428,7 +436,7 @@ impl Run {
         let f = file(&path)?;
         let (c, file_bytes) = read_catalog(&f, MAGIC, &format!("index run {num}"))?;
         let cat = RunCat::decode(&c)?;
-        let run = Run { num, uid: crate::block::uid(), path, cat, file_bytes };
+        let run = Run { num, uid: crate::block::uid(), path, cat, file_bytes, doom: Default::default() };
         let c = &run.cat;
         let ends = [
             (c.keys_off, run.pages_end()),
@@ -509,6 +517,11 @@ impl Run {
             }
             _ => return bad(),
         })
+    }
+
+    /// Delete the file once no handle on this run is left (snapshots may still read it).
+    pub fn doom(&self) {
+        self.doom.set();
     }
 
     pub fn path(&self) -> &Path {

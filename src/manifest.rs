@@ -12,7 +12,7 @@ use std::fs::{self, File};
 use std::io::Write;
 use std::path::Path;
 
-const MAGIC: &[u8; 8] = b"TDBMAN04";
+const MAGIC: &[u8; 8] = b"TDBMAN05";
 
 /// Session parts in a segment that a fold replaced: they stay in the file, unread, until
 /// the segment is rewritten. Counted so the store's totals leave them out.
@@ -58,9 +58,44 @@ pub struct Manifest {
     pub sessions: u32,
     pub pieces: u32,
     pub opaques: u64,
+    /// Sessions deleted, as sorted ranges `[a, b)` that do not touch: nothing of them is
+    /// read again, merges leave them out, and [`crate::Db::vacuum`] removes their last traces
+    /// (and empties this).
+    pub dropped: Vec<(u32, u32)>,
 }
 
 impl Manifest {
+    pub fn is_dropped(&self, s: u32) -> bool {
+        let i = self.dropped.partition_point(|r| r.1 <= s);
+        self.dropped.get(i).is_some_and(|r| r.0 <= s)
+    }
+
+    /// Mark session `s` deleted.
+    pub fn drop_session(&mut self, s: u32) {
+        if self.is_dropped(s) {
+            return;
+        }
+        let i = self.dropped.partition_point(|r| r.1 < s);
+        // join the range ending at s and the one starting at s + 1, if there are such
+        let joins_prev = i < self.dropped.len() && self.dropped[i].1 == s;
+        let next = if joins_prev { i + 1 } else { i };
+        let joins_next = next < self.dropped.len() && self.dropped[next].0 == s + 1;
+        match (joins_prev, joins_next) {
+            (true, true) => {
+                self.dropped[i].1 = self.dropped[next].1;
+                self.dropped.remove(next);
+            }
+            (true, false) => self.dropped[i].1 = s + 1,
+            (false, true) => self.dropped[next].0 = s,
+            (false, false) => self.dropped.insert(i, (s, s + 1)),
+        }
+    }
+
+    /// How many sessions are deleted.
+    pub fn dropped_count(&self) -> u64 {
+        self.dropped.iter().map(|r| (r.1 - r.0) as u64).sum()
+    }
+
     pub fn load(dir: &Path) -> Result<Option<Manifest>> {
         let p = dir.join("MANIFEST");
         let data = match fs::read(&p) {
@@ -98,10 +133,18 @@ impl Manifest {
             blobs.push((d.var32()?, d.var()?));
         }
         let (sessions, pieces, opaques) = (d.var32()?, d.var32()?, d.var()?);
+        let mut dropped = Vec::new();
+        let mut at = 0u32;
+        for _ in 0..d.var()? {
+            let a = at.checked_add(d.var32()?).ok_or_else(|| crate::codec::Error::Corrupt("MANIFEST: bad deleted sessions".into()))?;
+            let b = a.checked_add(d.var32()?).ok_or_else(|| crate::codec::Error::Corrupt("MANIFEST: bad deleted sessions".into()))?;
+            dropped.push((a, b));
+            at = b;
+        }
         if !d.done() {
             return corrupt("MANIFEST has trailing bytes");
         }
-        Ok(Some(Manifest { generation, checkpoint, wal_start, next_file, segs, dead, runs, blobs, sessions, pieces, opaques }))
+        Ok(Some(Manifest { generation, checkpoint, wal_start, next_file, segs, dead, runs, blobs, sessions, pieces, opaques, dropped }))
     }
 
     pub fn store(&self, dir: &Path, mode: SyncMode) -> Result<()> {
@@ -134,6 +177,13 @@ impl Manifest {
         e.var(self.sessions as u64);
         e.var(self.pieces as u64);
         e.var(self.opaques);
+        e.var(self.dropped.len() as u64);
+        let mut at = 0u32;
+        for &(a, b) in &self.dropped {
+            e.var((a - at) as u64);
+            e.var((b - a) as u64);
+            at = b;
+        }
         let crc = crc32c::crc32c(&e.buf);
         e.raw(&crc.to_le_bytes());
         let tmp = dir.join("MANIFEST.tmp");
@@ -144,5 +194,25 @@ impl Manifest {
         }
         fs::rename(&tmp, dir.join("MANIFEST"))?;
         sync_dir(dir, mode)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dropped_ranges_join() {
+        let mut m = Manifest::default();
+        for s in [5, 3, 4, 9, 1, 2, 7] {
+            m.drop_session(s);
+        }
+        assert_eq!(m.dropped, vec![(1, 6), (7, 8), (9, 10)]);
+        m.drop_session(8);
+        assert_eq!(m.dropped, vec![(1, 6), (7, 10)]);
+        m.drop_session(6);
+        assert_eq!(m.dropped, vec![(1, 10)]);
+        assert!(m.is_dropped(1) && m.is_dropped(9) && !m.is_dropped(0) && !m.is_dropped(10));
+        assert_eq!(m.dropped_count(), 9);
     }
 }
