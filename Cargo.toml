@@ -21,6 +21,10 @@ duckdb = { version = "1.20001.0", features = ["bundled"], optional = true }
 # the head-to-head against DuckDB (`tdb duck`); builds DuckDB from source
 duckdb = ["dep:duckdb"]
 
+[[example]]
+name = "duck_sql"
+required-features = ["duckdb"]
+
 [profile.release]
 debug = 1
 lto = "thin"

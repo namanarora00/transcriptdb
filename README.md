@@ -93,33 +93,46 @@ What you can do with them:
 
 The gaps hold at 3 times the data.
 
-**Against DuckDB 2.0**, in the same process, on all 12 cores, with the same tables and indexes
-PostgreSQL got. TranscriptDB on one thread. Queries and reads run on this Mac's 24 real sessions
-copied 30 times (720 sessions, 101,310 requests, 537 MB of distinct text). Sizes are for the
-24 real sessions alone.
+**Against DuckDB 2.0**, in the same process, on all 12 cores. TranscriptDB on one thread.
+DuckDB got the tables PostgreSQL got, plus what helped it most when tried: an inverted word
+table built by the application, message ids on each step, `IN` lookups for reads, and the
+fastest SQL form of each query. Queries and reads ran on this Mac's 24 real sessions copied 30
+times (720 sessions, 101,310 requests, 537 MB of distinct text). Every answer and read was
+identical.
 
 | | TranscriptDB | DuckDB | |
 |:--|--:|--:|:--|
-| Size on disk | 6.6 MB | 29 – 32 MB | **4.4 – 4.8× smaller** |
-| Size, each request body kept whole | 6.6 MB | 112 MB | **17× smaller** |
-| Sequence queries | 0.15 – 2.1 ms | 5.1 – 37 ms | **15 – 35× faster** |
-| Aggregations | 0.03 – 0.07 ms | 1.7 – 6.6 ms | **24 – 165× faster** |
-| Text search | 0.01 – 0.50 ms | 5.9 – 59 ms | **82 – 533× faster** |
-| Rule columns | 0.01 – 1.4 ms | 2.1 – 30 ms | **22 – 769× faster** |
-| Scans its index can't narrow | 4.1 – 17 ms | 33 – 78 ms | **4.5 – 8× faster** |
-| Reads, median | 0.15 – 0.31 ms | 1.8 – 6.7 ms | **7 – 40× faster** |
+| Sequence queries | 0.13 – 2.0 ms | 5.4 – 32 ms | **14 – 42× faster** |
+| Aggregations | 0.03 – 0.07 ms | 1.7 – 6.3 ms | **24 – 167× faster** |
+| Text search | 0.01 – 0.51 ms | 2.1 – 59 ms | **41 – 513× faster** |
+| Rule columns | 0.01 – 1.5 ms | 2.1 – 27 ms | **18 – 671× faster** |
+| Scans neither can avoid | 4.2 – 17 ms | 33 – 76 ms | **4.4 – 8× faster** |
+| Reads, median | 0.14 – 0.30 ms | 1.8 – 6.9 ms | **6 – 24× faster** |
 
-Every answer and read was identical. What favours whom:
+Storing calls as they arrive, each request body whole (the 24 real sessions: 3,078 MB of
+bodies), DuckDB has to choose between size and reads. TranscriptDB doesn't:
 
-- DuckDB was handed TranscriptDB's deduplication (each distinct message once). Storing each
-  request whole, as calls arrive, it is the 17× row.
+| | Size | Read a request by id, median |
+|:--|--:|--:|
+| TranscriptDB | **6.6 MB** | **0.17 ms** |
+| DuckDB, its own compression | 113 MB | 49 ms |
+| DuckDB, the app zstd-compressing each body | 231 – 841 MB | 0.7 – 6.5 ms |
+| DuckDB, uncompressed | 3,080 MB | 0.36 ms |
+
+Even handed TranscriptDB's deduplication (each distinct message stored once), DuckDB takes
+13 – 32 MB: 2 – 4.9× more. The 13 MB is with zstd forced, which makes its reads 5 – 11 ms
+(80 ms at p99).
+
+What favours whom:
+
 - Every DuckDB query pays about 1.7 ms before it starts. DuckDB is built for big scans and full
   SQL (joins, anything ad hoc), which TranscriptDB's language doesn't offer.
-- The closest race is text with no word for the index to use (a digits regex, `rm -rf`): both
+- The closest race is text with no word for an index to use (a digits regex, `rm -rf`): both
   sides scan.
-- DuckDB had no full-text extension (it would be downloaded at run time); warm reads only.
-- The 30 copies are near-duplicates. That helps TranscriptDB's compression (17× smaller at 30x),
-  so sizes are given for the real data.
+- DuckDB's full-text extension wasn't available here (it is downloaded at run time); the word
+  table stood in for it. Warm reads only.
+- The 30 copies are near-duplicates, which flatters TranscriptDB's compression, so sizes are for
+  the real data alone.
 
 **Many clients at once**: real requests of about 0.7 MB each, every write fsynced, Apple M6.
 

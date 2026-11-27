@@ -702,7 +702,8 @@ fn head_to_head(a: &Args) {
 }
 
 /// `tdb duck --store DIR --duck FILE [--reps 7] [--reads 300] [--duck-threads 12,1]
-/// [--raw FILE] [--no-keys x]` (built with `--features duckdb`): the head-to-head of `h2h` against DuckDB
+/// [--raw FILE [--raw-only x] [--app-zstd LEVEL]] [--no-keys x] [--compression zstd]` (built with `--features
+/// duckdb`): the head-to-head of `h2h` against DuckDB
 /// in this process (see `duck.rs`). `--raw` also loads every request body whole into a
 /// DuckDB file of its own and reports its size.
 #[cfg(feature = "duckdb")]
@@ -713,21 +714,34 @@ fn duck(a: &Args) {
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(path.with_extension("duckdb.wal"));
     let conn = duckdb::Connection::open(&path).expect("open duckdb");
+    if let Some(c) = a.get("compression") {
+        conn.execute_batch(&format!("SET force_compression = '{c}'")).expect("compression");
+    }
     let ver = duck::rows(&conn, "SELECT version()").ok().and_then(|r| r.first()?.first()?.clone()).unwrap_or_default();
     let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
     println!("DuckDB {ver} in this process; {cores} cores");
-    let keys = a.get("no-keys").is_none();
-    println!("{} ({})", duck::load(&db, &conn, keys).expect("load"), if keys { "with primary keys" } else { "no primary keys or indexes" });
     let st = db.stats();
-    let (dsize, dsize_nt) = duck::sizes(&conn, &path).expect("sizes");
-    println!("\n== size on disk");
+    let raw_only = a.get("raw-only").is_some();
+    println!("\n== size on disk{}", a.get("compression").map(|c| format!(" (DuckDB compression forced: {c})")).unwrap_or_default());
     println!("  TranscriptDB store: {}", mb(st.store_bytes()));
-    println!("  DuckDB: {} ({} without its copy of the text for search); DuckDB / TranscriptDB {:.2}x", mb(dsize), mb(dsize_nt), dsize as f64 / st.store_bytes() as f64);
+    if !raw_only {
+        let keys = a.get("no-keys").is_none();
+        println!("  {} ({})", duck::load(&db, &conn, keys).expect("load"), if keys { "with primary keys" } else { "no primary keys or indexes" });
+        let (dsize, dsize_nt) = duck::sizes(&conn, &path).expect("sizes");
+        println!("  DuckDB, deduplicated tables: {} ({} without its copy of the text for search); DuckDB / TranscriptDB {:.2}x", mb(dsize), mb(dsize_nt), dsize as f64 / st.store_bytes() as f64);
+    }
     if let Some(raw) = a.get("raw") {
-        let (size, secs) = duck::raw_bodies(&db, Path::new(raw)).expect("raw bodies");
-        let bytes: u64 = db.all_requests().unwrap().iter().map(|&ri| db.rebuild(ri).unwrap().len() as u64).sum();
-        println!("  DuckDB holding every request body whole ({} of bodies): {} in {secs:.1}s; / TranscriptDB {:.1}x", mb(bytes), mb(size), size as f64 / st.store_bytes() as f64);
-        let _ = std::fs::remove_file(raw);
+        let ro = duck::raw_bodies(&db, Path::new(raw), a.get("compression"), a.get("app-zstd").map(|l| l.parse().expect("--app-zstd LEVEL")), a.num("reads", 300) as usize, a.num("seed", 5)).expect("raw bodies");
+        let e = ro.reads.engine;
+        let d = ro.reads.pg.unwrap();
+        let how = a.get("app-zstd").map(|l| format!(", each compressed by the app with zstd {l}")).unwrap_or_default();
+        println!("  DuckDB holding every request body whole{how} ({} of bodies): {} in {:.1}s; / TranscriptDB {:.1}x", mb(ro.bytes_in), mb(ro.size), ro.load_s, ro.size as f64 / st.store_bytes() as f64);
+        println!("    a whole request by id: same {}/{}   TDB {:.3} / {:.3} / {:.3}   DuckDB {:.3} / {:.3} / {:.3} ms (median / p95 / p99)", ro.reads.same, ro.reads.total, e.0, e.1, e.2, d.0, d.1, d.2);
+        if raw_only {
+            drop(conn);
+            let _ = std::fs::remove_file(&path);
+            return;
+        }
     }
     let threads: Vec<usize> = a.get("duck-threads").map(|t| t.split(',').map(|x| x.parse().expect("--duck-threads 12,1")).collect()).unwrap_or(vec![cores, 1]);
     let reps = a.num("reps", 7) as usize;
