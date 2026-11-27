@@ -2,7 +2,7 @@
 name = "transcriptdb"
 version = "0.1.0"
 edition = "2024"
-description = "A storage and query engine for agent transcripts"
+description = "A database for LLM agent transcripts"
 publish = false
 
 [dependencies]
