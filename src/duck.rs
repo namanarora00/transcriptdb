@@ -104,7 +104,7 @@ CREATE TABLE pieces (id INTEGER PRIMARY KEY, kind SMALLINT, body VARCHAR, holes 
 CREATE TABLE blocks (id INTEGER PRIMARY KEY, body VARCHAR);
 CREATE TABLE steps (session INTEGER, step INTEGER, turn INTEGER, depth INTEGER, prev INTEGER, call_node INTEGER, result_node INTEGER,
                     tool VARCHAR, failed BOOLEAN, out_bytes INTEGER, time_ms BIGINT, file_path VARCHAR, command VARCHAR,
-                    program VARCHAR, tests_failed INTEGER, PRIMARY KEY (session, step));
+                    program VARCHAR, tests_failed INTEGER, call_msg INTEGER, result_msg INTEGER, PRIMARY KEY (session, step));
 CREATE TABLE path_steps (session INTEGER, path INTEGER, depth INTEGER, step INTEGER, tool VARCHAR, failed BOOLEAN, file_path VARCHAR, tests_failed INTEGER);
 CREATE TABLE texts_s (session INTEGER, unit INTEGER, node INTEGER, role VARCHAR, time_ms BIGINT, lbody VARCHAR, terms VARCHAR);
 CREATE TABLE texts (session INTEGER, unit INTEGER, node INTEGER, role VARCHAR, time_ms BIGINT, lbody VARCHAR, terms VARCHAR[], PRIMARY KEY (session, unit));
@@ -118,6 +118,9 @@ INSERT INTO pieces SELECT id, kind, body, CASE WHEN holes IS NULL THEN NULL WHEN
   CASE WHEN elements IS NULL THEN NULL ELSE string_split(elements, ',')::INTEGER[] END FROM pieces_s;
 INSERT INTO texts SELECT session, unit, node, role, time_ms, lbody, CASE WHEN terms = '' THEN []::VARCHAR[] ELSE string_split(terms, ' ') END FROM texts_s;
 DROP TABLE requests_s; DROP TABLE pieces_s; DROP TABLE texts_s;
+-- an inverted index the application builds: each text's words, sorted by word so DuckDB's
+-- zone maps skip all but the word asked for
+CREATE TABLE words AS SELECT unnest(terms) AS word, session, unit, role FROM texts ORDER BY word, session, unit;
 CHECKPOINT;
 ";
 
@@ -129,6 +132,7 @@ fn utf8(b: &[u8]) -> R<&str> {
 /// the point reads); without, smaller, and every read scans.
 pub fn load(db: &Db, conn: &Connection, keys: bool) -> R<String> {
     let t0 = Instant::now();
+    // (a forced compression, set by the caller, applies to what this writes)
     let schema = if keys { SCHEMA.to_string() } else { regex::Regex::new(r",? ?PRIMARY KEY( \([a-z, ]+\))?").unwrap().replace_all(SCHEMA, "").into_owned() };
     conn.execute_batch(&schema).map_err(de)?;
     let ns = db.session_count() as u32;
@@ -279,7 +283,9 @@ pub fn load(db: &Db, conn: &Connection, keys: bool) -> R<String> {
                     f[0].as_deref(),
                     f[1].as_deref(),
                     f[2].as_deref(),
-                    f[3].as_deref().and_then(|x| x.parse::<i32>().ok())
+                    f[3].as_deref().and_then(|x| x.parse::<i32>().ok()),
+                    node_msg[s as usize][r.call_node as usize] as i32,
+                    node_msg[s as usize][r.result_node as usize] as i32
                 ])
                 .map_err(de)?;
             }
@@ -324,13 +330,48 @@ pub fn load(db: &Db, conn: &Connection, keys: bool) -> R<String> {
     ))
 }
 
-/// Bytes DuckDB's tables take, whole and without the text table (the search copy).
+/// Bytes DuckDB's tables take, whole and without the text and word tables (the search copy
+/// and its index).
 pub fn sizes(conn: &Connection, path: &Path) -> R<(u64, u64)> {
     conn.execute_batch("CHECKPOINT").map_err(de)?;
     let total = std::fs::metadata(path).map_err(|e| e.to_string())?.len();
     let bs: u64 = rows(conn, "SELECT block_size FROM pragma_database_size()")?.first().and_then(|r| r[0].as_ref()?.parse().ok()).unwrap_or(262_144);
-    let texts: u64 = rows(conn, "SELECT count(DISTINCT block_id) FROM pragma_storage_info('texts') WHERE persistent AND block_id >= 0")?.first().and_then(|r| r[0].as_ref()?.parse().ok()).unwrap_or(0);
-    Ok((total, total.saturating_sub(texts * bs)))
+    let mut search = 0u64;
+    for t in ["texts", "words"] {
+        search += rows(conn, &format!("SELECT count(DISTINCT block_id) FROM pragma_storage_info('{t}') WHERE persistent AND block_id >= 0"))?.first().and_then(|r| r[0].as_ref()?.parse().ok()).unwrap_or(0);
+    }
+    Ok((total, total.saturating_sub(search * bs)))
+}
+
+/// "a then b then c, nothing passing x strictly between a and c", in the form DuckDB runs
+/// fastest of those tried: one row per turn, then the nearest a before and c after each b turn
+/// with `last_value` / `first_value` ignoring nulls (about a quarter faster than
+/// [`h2h`]'s filtered RANGE frames over steps, same answers).
+fn three_step_duck(a: &str, b: &str, c: &str, x: &str) -> String {
+    format!(
+        "WITH t AS (SELECT session, path, depth, bool_or({a}) AS a, bool_or({b}) AS b, bool_or({c}) AS c, bool_or({x}) AS x FROM path_steps GROUP BY ALL),
+         w AS (SELECT session, b, x,
+           last_value(CASE WHEN a THEN depth END IGNORE NULLS) OVER pre AS pa, last_value(CASE WHEN x THEN depth END IGNORE NULLS) OVER pre AS px,
+           first_value(CASE WHEN c THEN depth END IGNORE NULLS) OVER post AS nc, first_value(CASE WHEN x THEN depth END IGNORE NULLS) OVER post AS nx
+           FROM t WINDOW pre AS (PARTITION BY session, path ORDER BY depth ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING),
+                         post AS (PARTITION BY session, path ORDER BY depth ROWS BETWEEN 1 FOLLOWING AND UNBOUNDED FOLLOWING))
+         SELECT DISTINCT session FROM w WHERE b AND pa IS NOT NULL AND nc IS NOT NULL AND (px IS NULL OR px <= pa) AND NOT x AND (nx IS NULL OR nx >= nc)"
+    )
+}
+
+/// DuckDB's SQL for a query: its own form where one was faster, else [`to_duck`] of the
+/// PostgreSQL text.
+pub fn duck_sql(q: &QuerySpec) -> String {
+    let edits = "tool IN ('Edit','Write','MultiEdit','NotebookEdit')";
+    let test = "coalesce(file_path, '') ILIKE '%test%'";
+    match q.name {
+        "Bash, then Edit, then Bash; no Read between" => three_step_duck("tool = 'Bash'", "tool = 'Edit'", "tool = 'Bash'", "tool = 'Read'"),
+        "Bash fails, only test files edited, Bash passes" => three_step_duck("tool = 'Bash' AND failed", &format!("{edits} AND {test}"), "tool = 'Bash' AND NOT failed", &format!("{edits} AND NOT {test}")),
+        "Tests fail, then an edit, then a test run" => three_step_duck("tests_failed > 0", edits, "tests_failed IS NOT NULL", "false"),
+        // whole words from the word table instead of scanning every text's word list
+        "User text with the word error, top sessions" => "SELECT se.sid, count(*) AS n FROM words w JOIN sessions se ON se.id = w.session WHERE w.role = 'u' AND w.word = 'error' GROUP BY se.sid ORDER BY n DESC, se.sid ASC LIMIT 10".into(),
+        _ => to_duck(&q.sql),
+    }
 }
 
 /// Queries the store's indexes cannot narrow, so it reads every value as DuckDB does: a
@@ -360,8 +401,8 @@ pub fn run_queries(db: &Db, conn: &Connection, reps: usize, threads: &[usize]) -
     let mut out = Vec::new();
     let rule_qs = if h2h::has_rule_columns(db) { h2h::rule_queries() } else { Vec::new() };
     for q in h2h::queries().into_iter().chain(rule_qs).chain(scan_queries()) {
-        let QuerySpec { name, engine, sql, sessions } = q;
-        let sql = to_duck(&sql);
+        let sql = duck_sql(&q);
+        let QuerySpec { name, engine, sessions, .. } = q;
         let run = |t: usize| query::run(db, &engine, t).map_err(|e| format!("{name}: {}", e.show(&engine)));
         let (er, e1) = h2h::best(reps, || run(1))?;
         let (_, e8) = h2h::best(reps, || run(8))?;
@@ -396,10 +437,7 @@ fn duck_rebuild(conn: &Connection, id: &str) -> R<Vec<u8>> {
     let head = rows_p(conn, "SELECT skeleton, coalesce(system, -1), coalesce(tools, -1), notes, layout FROM requests WHERE id = ?", &[&id])?;
     let h = head.first().ok_or("no such request")?;
     let ids: Vec<i64> = h[..3].iter().map(|c| c.as_deref().and_then(|x| x.parse().ok()).unwrap_or(-1)).collect();
-    let mut msgs = Vec::new();
-    for r in rows_p(conn, "SELECT u.o, m.body FROM (SELECT unnest(msgs) AS mid, generate_subscripts(msgs, 1) AS o FROM requests WHERE id = ?) u JOIN messages m ON m.id = u.mid", &[&id])? {
-        msgs.push((r[0].as_deref().and_then(|x| x.parse().ok()).unwrap_or(0), r[1].clone().unwrap_or_default()));
-    }
+    let msgs: Vec<(u64, String)> = request_messages(conn, id)?.into_iter().enumerate().map(|(k, m)| (k as u64, m)).collect();
     let notes: Vec<i64> = h[3].as_deref().map(|n| n.trim_matches(|c| c == '{' || c == '}').split(',').filter_map(|x| x.trim().parse().ok()).collect()).unwrap_or_default();
     let mut want: Vec<i64> = ids.iter().copied().filter(|&x| x >= 0).collect();
     want.extend(notes.chunks(3).filter_map(|c| c.get(2).copied()));
@@ -426,6 +464,26 @@ fn duck_rebuild(conn: &Connection, id: &str) -> R<Vec<u8>> {
     h2h::assemble(msgs, &pcs, (format!("{},{},{}", ids[0], ids[1], ids[2]), notes_text, h[4].clone()))
 }
 
+/// Messages by id, fetched with one `IN` lookup (DuckDB's fastest of the forms tried), put in
+/// the order `ids` gives.
+fn messages_in_order(conn: &Connection, sub: &str, p: &[&dyn duckdb::ToSql], ids: &[i64]) -> R<Vec<String>> {
+    let mut by: HashMap<i64, String> = HashMap::new();
+    for r in rows_p(conn, &format!("SELECT id, body FROM messages WHERE id IN ({sub})"), p)? {
+        by.insert(r[0].as_deref().and_then(|x| x.parse().ok()).unwrap_or(-1), r[1].clone().unwrap_or_default());
+    }
+    ids.iter().map(|i| by.get(i).cloned().ok_or_else(|| format!("missing message {i}"))).collect()
+}
+
+fn list_ints(s: Option<&str>) -> Vec<i64> {
+    s.map(|n| n.trim_matches(|c| c == '{' || c == '}').split(',').filter_map(|x| x.trim().parse().ok()).collect()).unwrap_or_default()
+}
+
+/// A request's messages in order.
+fn request_messages(conn: &Connection, id: &str) -> R<Vec<String>> {
+    let ids = list_ints(rows_p(conn, "SELECT msgs FROM requests WHERE id = ?", &[&id])?.first().and_then(|r| r[0].as_deref()));
+    messages_in_order(conn, "SELECT unnest(msgs) FROM requests WHERE id = ?", &[&id], &ids)
+}
+
 /// The reads of [`h2h::run_reads`], warm: `n` random items each, compared byte for byte.
 pub fn run_reads(db: &Db, conn: &Connection, n: usize, seed: u64) -> R<Vec<ReadOutcome>> {
     let mut r = Rng::new(seed);
@@ -433,7 +491,6 @@ pub fn run_reads(db: &Db, conn: &Connection, n: usize, seed: u64) -> R<Vec<ReadO
     let all = db.all_requests().map_err(e)?;
     let mut res = Vec::new();
     let sha = crate::db::sha256;
-    let first = |rs: Vec<Vec<Option<String>>>| rs.into_iter().next().and_then(|x| x.into_iter().next().flatten()).unwrap_or_default();
     {
         let (mut te, mut td, mut same) = (Vec::new(), Vec::new(), 0);
         for _ in 0..n {
@@ -445,7 +502,7 @@ pub fn run_reads(db: &Db, conn: &Connection, n: usize, seed: u64) -> R<Vec<ReadO
             te.push(a.elapsed().as_secs_f64() * 1e3);
             let id: &str = &rec.id;
             let a = Instant::now();
-            let db_ = first(rows_p(conn, "SELECT string_agg(m.body, ',' ORDER BY u.o) FROM (SELECT unnest(msgs) AS mid, generate_subscripts(msgs, 1) AS o FROM requests WHERE id = ?) u JOIN messages m ON m.id = u.mid", &[&id])?);
+            let db_ = request_messages(conn, id)?.join(",");
             td.push(a.elapsed().as_secs_f64() * 1e3);
             same += (sha(&eb) == sha(db_.as_bytes())) as usize;
         }
@@ -464,15 +521,12 @@ pub fn run_reads(db: &Db, conn: &Connection, n: usize, seed: u64) -> R<Vec<ReadO
             te.push(a.elapsed().as_secs_f64() * 1e3);
             let (s32, k0, k1) = (s as i32, k as i32, k as i32 + 20);
             let a = Instant::now();
-            let got: Vec<String> = rows_p(
-                conn,
-                "SELECT cm.body, rm.body FROM steps s
-                   JOIN nodes cn ON cn.session = s.session AND cn.node = s.call_node JOIN messages cm ON cm.id = cn.msg
-                   JOIN nodes rn ON rn.session = s.session AND rn.node = s.result_node JOIN messages rm ON rm.id = rn.msg
-                 WHERE s.session = ? AND s.step >= ? AND s.step < ? ORDER BY s.step",
-                &[&s32, &k0, &k1],
-            )?
-            .into_iter().flat_map(|x| x.into_iter().map(|c| c.unwrap_or_default())).collect();
+            // the steps' message ids, then the messages by id
+            let ids: Vec<i64> = rows_p(conn, "SELECT call_msg, result_msg FROM steps WHERE session = ? AND step >= ? AND step < ? ORDER BY step", &[&s32, &k0, &k1])?
+                .into_iter()
+                .flat_map(|r| r.into_iter().map(|c| c.and_then(|x| x.parse().ok()).unwrap_or(-1)))
+                .collect();
+            let got = messages_in_order(conn, "SELECT unnest([call_msg, result_msg]) FROM steps WHERE session = ? AND step >= ? AND step < ?", &[&s32, &k0, &k1], &ids)?;
             td.push(a.elapsed().as_secs_f64() * 1e3);
             same += (sha(&eb) == sha(got.join("|").as_bytes())) as usize;
         }
@@ -489,7 +543,12 @@ pub fn run_reads(db: &Db, conn: &Connection, n: usize, seed: u64) -> R<Vec<ReadO
             te.push(a.elapsed().as_secs_f64() * 1e3);
             let s32 = s as i32;
             let a = Instant::now();
-            let got = first(rows_p(conn, "SELECT string_agg(m.body, ',' ORDER BY n.node) FROM nodes n JOIN messages m ON m.id = n.msg WHERE n.session = ?", &[&s32])?);
+            // (one join here was faster than ids then IN: a session's messages are many)
+            let got = rows_p(conn, "SELECT string_agg(m.body, ',' ORDER BY n.node) FROM nodes n JOIN messages m ON m.id = n.msg WHERE n.session = ?", &[&s32])?
+                .into_iter()
+                .next()
+                .and_then(|x| x.into_iter().next().flatten())
+                .unwrap_or_default();
             td.push(a.elapsed().as_secs_f64() * 1e3);
             same += (sha(&eb) == sha(got.as_bytes())) as usize;
         }
@@ -513,26 +572,76 @@ pub fn run_reads(db: &Db, conn: &Connection, n: usize, seed: u64) -> R<Vec<ReadO
     Ok(res)
 }
 
-/// DuckDB holding every request body whole, one row each, as a system storing raw calls
-/// would (CostKey's `request_body` column): its file size, and how long it took to load.
-pub fn raw_bodies(db: &Db, path: &Path) -> R<(u64, f64)> {
+/// What [`raw_bodies`] measured.
+pub struct RawOutcome {
+    pub bytes_in: u64,
+    pub size: u64,
+    pub load_s: f64,
+    /// A whole request by id: (median, p95, p99) ms for the store's rebuild and DuckDB's
+    /// lookup, and how many were the same bytes.
+    pub reads: ReadOutcome,
+}
+
+/// DuckDB holding every request body whole, one row each, keyed by request id: what a system
+/// storing calls as they arrive keeps (CostKey's `request_body`). `compression` forces one
+/// of DuckDB's (`zstd`, `fsst`, ...) instead of letting it choose. Then `n` random requests
+/// read back by id from both sides, compared byte for byte.
+///
+/// With `app_zstd`, the application compresses each body with zstd at that level and DuckDB
+/// stores the bytes (a BLOB); a read decompresses the one body it fetched.
+pub fn raw_bodies(db: &Db, path: &Path, compression: Option<&str>, app_zstd: Option<i32>, n: usize, seed: u64) -> R<RawOutcome> {
     let _ = std::fs::remove_file(path);
     let conn = Connection::open(path).map_err(de)?;
-    conn.execute_batch("CREATE TABLE calls (id VARCHAR, session VARCHAR, body VARCHAR)").map_err(de)?;
+    if let Some(c) = compression {
+        conn.execute_batch(&format!("SET force_compression = '{c}'")).map_err(de)?;
+    }
+    let ty = if app_zstd.is_some() { "BLOB" } else { "VARCHAR" };
+    conn.execute_batch(&format!("CREATE TABLE calls (id VARCHAR PRIMARY KEY, session VARCHAR, time VARCHAR, body {ty})")).map_err(de)?;
     let t = Instant::now();
+    let mut bytes_in = 0u64;
+    let all = db.all_requests().map_err(|e| e.to_string())?;
     {
         let mut a = conn.appender("calls").map_err(de)?;
-        for ri in db.all_requests().map_err(|e| e.to_string())? {
+        for &ri in &all {
             let r = db.request(ri).map_err(|e| e.to_string())?;
             let b = db.rebuild(ri).map_err(|e| e.to_string())?;
-            a.append_row(params![&*r.id, db.session_key(r.session).0, utf8(&b)?]).map_err(de)?;
+            bytes_in += b.len() as u64;
+            match app_zstd {
+                Some(level) => {
+                    let c = zstd::bulk::compress(&b, level).map_err(|e| e.to_string())?;
+                    a.append_row(params![&*r.id, db.session_key(r.session).0, &*r.time, c]).map_err(de)?
+                }
+                None => a.append_row(params![&*r.id, db.session_key(r.session).0, &*r.time, utf8(&b)?]).map_err(de)?,
+            }
         }
     }
     conn.execute_batch("CHECKPOINT").map_err(de)?;
-    let secs = t.elapsed().as_secs_f64();
-    drop(conn);
+    let load_s = t.elapsed().as_secs_f64();
     let size = std::fs::metadata(path).map_err(|e| e.to_string())?.len();
-    Ok((size, secs))
+    let mut r = Rng::new(seed);
+    let (mut te, mut td, mut same) = (Vec::new(), Vec::new(), 0);
+    for _ in 0..n {
+        let ri = all[r.below(all.len() as u64) as usize];
+        let id = db.request(ri).map_err(|e| e.to_string())?.id;
+        let a = Instant::now();
+        let eb = db.rebuild(ri).map_err(|e| e.to_string())?;
+        te.push(a.elapsed().as_secs_f64() * 1e3);
+        let idr: &str = &id;
+        let a = Instant::now();
+        let got: Vec<u8> = match app_zstd {
+            Some(_) => {
+                let mut st = conn.prepare_cached("SELECT body FROM calls WHERE id = ?").map_err(de)?;
+                let c: Vec<u8> = st.query_row([idr], |r| r.get(0)).map_err(de)?;
+                zstd::stream::decode_all(&c[..]).map_err(|e| e.to_string())?
+            }
+            None => rows_p(&conn, "SELECT body FROM calls WHERE id = ?", &[&idr])?.into_iter().next().and_then(|x| x.into_iter().next().flatten()).unwrap_or_default().into_bytes(),
+        };
+        td.push(a.elapsed().as_secs_f64() * 1e3);
+        same += (eb == got) as usize;
+    }
+    drop(conn);
+    let _ = std::fs::remove_file(path);
+    Ok(RawOutcome { bytes_in, size, load_s, reads: ReadOutcome { name: "a whole request by id".into(), same, total: n, engine: h2h::quantiles(&te), pg: Some(h2h::quantiles(&td)) } })
 }
 
 #[cfg(test)]
