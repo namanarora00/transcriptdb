@@ -713,7 +713,7 @@ fn duck(a: &Args) {
     let path = PathBuf::from(a.get("duck").expect("--duck FILE"));
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(path.with_extension("duckdb.wal"));
-    let conn = duckdb::Connection::open(&path).expect("open duckdb");
+    let mut conn = duckdb::Connection::open(&path).expect("open duckdb");
     if let Some(c) = a.get("compression") {
         conn.execute_batch(&format!("SET force_compression = '{c}'")).expect("compression");
     }
@@ -737,6 +737,8 @@ fn duck(a: &Args) {
         let how = a.get("app-zstd").map(|l| format!(", each compressed by the app with zstd {l}")).unwrap_or_default();
         println!("  DuckDB holding every request body whole{how} ({} of bodies): {} in {:.1}s; / TranscriptDB {:.1}x", mb(ro.bytes_in), mb(ro.size), ro.load_s, ro.size as f64 / st.store_bytes() as f64);
         println!("    a whole request by id: same {}/{}   TDB {:.3} / {:.3} / {:.3}   DuckDB {:.3} / {:.3} / {:.3} ms (median / p95 / p99)", ro.reads.same, ro.reads.total, e.0, e.1, e.2, d.0, d.1, d.2);
+        let (e, d) = (ro.cold.engine, ro.cold.pg.unwrap());
+        println!("    the same, cold:        same {}/{}   TDB {:.3} / {:.3} / {:.3}   DuckDB {:.3} / {:.3} / {:.3} ms", ro.cold.same, ro.cold.total, e.0, e.1, e.2, d.0, d.1, d.2);
         if raw_only {
             drop(conn);
             let _ = std::fs::remove_file(&path);
@@ -756,12 +758,21 @@ fn duck(a: &Args) {
         println!("  {:<48} {:>5} {:>7} ms {:>7} ms {}  {}", o.name, if o.same { "yes" } else { "NO" }, ms(o.engine_ms), ms(o.engine_ms_par), d.iter().map(|x| format!("{:>9} ms", ms(*x))).collect::<String>(), o.detail);
     }
     conn.execute_batch(&format!("SET threads = {cores}")).expect("threads");
-    let reads = duck::run_reads(&db, &conn, a.num("reads", 300) as usize, a.num("seed", 5)).expect("reads");
-    println!("\n== reads, warm (median / p95 / p99 ms per item)");
-    for r in &reads {
-        all_same &= r.same == r.total;
-        let (e, p) = (r.engine, r.pg.unwrap());
-        println!("  {:<36} same {}/{}   TDB {:.3} / {:.3} / {:.3}   DuckDB {:.3} / {:.3} / {:.3}", r.name, r.same, r.total, e.0, e.1, e.2, p.0, p.1, p.2);
+    for (cold, title) in [(false, "reads, warm"), (true, "reads, cold (each side's own memory emptied before every read: the store's caches; DuckDB closed and opened again; the OS file cache warm for both)")] {
+        let reads = duck::run_reads(&db, &mut conn, &path, a.num("reads", 300) as usize, a.num("seed", 5), cold).expect("reads");
+        println!("\n== {title} (median / p95 / p99 ms per item)");
+        for r in &reads {
+            all_same &= r.same == r.total;
+            let (e, p) = (r.engine, r.pg.unwrap());
+            println!("  {:<36} same {}/{}   TDB {:.3} / {:.3} / {:.3}   DuckDB {:.3} / {:.3} / {:.3}", r.name, r.same, r.total, e.0, e.1, e.2, p.0, p.1, p.2);
+        }
+    }
+    if let Ok(all) = db.all_requests()
+        && let Some(&ri) = all.get(all.len() / 2)
+    {
+        let id = db.request(ri).expect("request").id;
+        let (before, after) = duck::reopen_check(&mut conn, &path, &id).expect("reopen check");
+        println!("  (DuckDB buffer memory right after a reopen: {}; after reading one request: {})", mb(before), mb(after));
     }
     if !all_same {
         println!("\nFAILED: some answers differ");

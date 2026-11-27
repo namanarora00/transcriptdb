@@ -108,21 +108,25 @@ message ids, batched lookups, and rewritten window queries.
 
 | | TranscriptDB | DuckDB | |
 |:--|--:|--:|:--|
+| Size on disk | 6.6 MB | 32 MB | 4.9× smaller |
+| Size on disk, DuckDB with zstd forced | 6.6 MB | 13 MB | 2× smaller, but DuckDB point reads slow to 5 – 11 ms |
 | Sequence queries | 0.13 – 2.0 ms | 5.4 – 32 ms | 14 – 42× faster |
 | Aggregations | 0.03 – 0.07 ms | 1.7 – 6.3 ms | 24 – 167× faster |
 | Text search | 0.01 – 0.51 ms | 2.1 – 59 ms | 41 – 513× faster |
 | Rule columns | 0.01 – 1.5 ms | 2.1 – 27 ms | 18 – 671× faster |
 | Full scans | 4.2 – 17 ms | 33 – 76 ms | 4.4 – 8× faster |
-| Point reads, median | 0.14 – 0.30 ms | 1.8 – 6.9 ms | 6 – 24× faster |
+| Point reads, median, warm | 0.19 – 0.36 ms | 2.1 – 8.2 ms | 6 – 23× faster |
+| Point reads, median, cold | 0.38 – 0.70 ms | 2.5 – 8.3 ms | 4.7 – 12× faster |
 
 Storing raw request bodies in DuckDB (one row per call, 3,078 MB of input):
 
-| | Size | Fetch by id, median |
-|:--|--:|--:|
-| TranscriptDB | 6.6 MB | 0.17 ms |
-| DuckDB, default compression | 113 MB | 49 ms |
-| DuckDB, per-row zstd in the application | 231 – 841 MB | 0.7 – 6.5 ms |
-| DuckDB, uncompressed | 3,080 MB | 0.36 ms |
+| | Size | Fetch by id, median, warm | Cold |
+|:--|--:|--:|--:|
+| TranscriptDB | 6.6 MB | 0.17 ms | 0.73 ms |
+| DuckDB, default compression | 113 MB | 50 ms | 52 ms |
+| DuckDB, per-row zstd in the application | 231 – 286 MB | 5.5 – 6.7 ms | 8.6 – 10 ms |
+| DuckDB, per-row zstd, DuckDB compression off | 841 MB | 0.69 ms | 0.87 ms |
+| DuckDB, uncompressed | 3,080 MB | 0.37 ms | 0.73 ms |
 
 **Write throughput**, requests averaging 0.7 MB, fsync on every commit:
 
@@ -139,11 +143,11 @@ Storing raw request bodies in DuckDB (one row per call, 3,078 MB of input):
   text markers: 720 sessions, 101,310 requests, 537 MB of distinct text. Sizes are reported on
   the unreplicated sessions, since replicas compress unusually well.
 - Hardware: Apple M6, 12 cores, 32 GB RAM. Query times are the best of 7 runs; read times are
-  over 300 random items with warm caches.
+  medians over 300 random items. Cold reads empty each engine's own caches before every read
+  (DuckDB is closed and reopened; its buffer pool is verified empty); the OS page cache stays
+  warm for both.
 - Caveats: DuckDB pays roughly 1.7 ms of fixed overhead per query and supports full SQL, which
-  TranscriptDB's language does not. DuckDB's full-text extension was not used. Forcing zstd on
-  DuckDB's deduplicated tables shrinks them to 2× TranscriptDB's size at the cost of 5 – 11 ms
-  median reads.
+  TranscriptDB's language does not. DuckDB's full-text extension was not used.
 
 Scripts: `scripts/h2h.sh` (PostgreSQL), `scripts/duck.sh` (DuckDB), `tdb load` (throughput).
 
