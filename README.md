@@ -50,16 +50,23 @@ await tdb.dropBefore(new Date(Date.now() - 7 * 86_400_000)); await tdb.vacuum()
 
 ## Queries
 
-```
-match a: tool == "Bash" and failed
-  then b: tool in ("Edit", "Write") and file_path contains "test"
-  then c: tool == "Bash" and not failed
-| summarize n = count(), sessions = dcount(session) by a.tool
+A Kusto-style pipe language over two sources:
 
-messages | where role == "user" and text has "revert" | summarize n = count() by session
+- **Steps** (the default): one row per tool call paired with its result. Columns are `tool`,
+  `failed`, `time`, `out_bytes`, `session`, `agent` and every input field of the call.
+- **`messages`**: one row per text block the user wrote or the model said, with `role`, `text`,
+  `time` and `session`.
 
-.create column program on tool == "Bash" = extract(command, @"^\s*(\S+)")
-```
+What you can do with them:
+
+| | |
+|---|---|
+| Filter | `where` with `==`, `<`, `in`, `and`/`or`/`not`; text tests `has`, `contains`, `startswith`, `endswith`, `matches regex` (case-insensitive, `_cs` for exact case). |
+| Sequences | `match` binds steps in order: `then` (any later turn), `next` (the very next turn), `within N` turns, repeats `{n}` / `{n,}`, and `where no (...) between a and b` to exclude steps in the gap. |
+| Shape | `extend`, `project`, `summarize ... by` with `count`, `dcount`, `countif`, `sum`, `avg`, `min`, `max`, then `top`, `order by`, `take`. |
+| Time | `ago(7d)`, `now()`, `bin(time, 1d)`; differences between bound steps (`c.time - a.time`). |
+| Functions | `extract(regex)`, `toint`, `tostring`, `tolower`, `strlen`, `iff`, `isnull`. |
+| Rule columns | `.create column name on <filter> = <expr>` adds a stored column computed from each step (its inputs or its output), queried like any other and filled in for old steps too. |
 
 ## How it handles many clients
 
@@ -72,24 +79,27 @@ messages | where role == "user" and text has "revert" | summarize n = count() by
 
 ## Numbers
 
-Against PostgreSQL 18 with a tuned schema, on 1,059 real Claude Code sessions (129,730 requests):
+**Against PostgreSQL 18** (tuned schema, 4 parallel workers) on 1,059 real Claude Code sessions,
+129,730 requests. TranscriptDB on one thread.
 
-| | TranscriptDB vs PostgreSQL |
-|---|---|
-| Size on disk | 128 MB vs 1,051 MB (8.2x smaller) |
-| Sequence queries | 0.3–4.8 ms; 51–709x faster |
-| Aggregations | under 0.12 ms; 40–409x faster |
-| Text search | 0.05–1.9 ms; 6–764x faster |
-| Reading a request | 0.6 ms median; 2–3.5x faster |
+| | TranscriptDB | PostgreSQL | |
+|:--|--:|--:|:--|
+| Size on disk | 128 MB | 1,051 MB | **8.2× smaller** |
+| Sequence queries | 0.27 – 4.8 ms | 15 – 3,389 ms | **51 – 709× faster** |
+| Aggregations | 0.04 – 0.11 ms | 4.4 – 21 ms | **40 – 409× faster** |
+| Text search | 0.05 – 1.9 ms | 0.64 – 262 ms | **6 – 764× faster** |
+| Rule columns | 0.01 – 3.1 ms | 0.20 – 1,467 ms | **16 – 470× faster** |
+| Reads, median | 0.24 – 0.66 ms | 0.61 – 1.9 ms | **2 – 3.5× faster** |
 
-At 3 times the data the gaps hold. Many clients, real requests of about 0.7 MB each, every write
-fsynced (Apple M6):
+The gaps hold at 3 times the data.
 
-| | Requests/s | Body MB/s | Read p99 meanwhile |
-|---|---|---|---|
-| 1 client | 230 | 154 | 0.1 ms |
-| 12 clients, HTTP | 739 | 498 | 0.8 ms |
-| 12 clients, HTTP, 8 per put | 2,342 | 1,562 | 1.1 ms |
+**Many clients at once**: real requests of about 0.7 MB each, every write fsynced, Apple M6.
+
+| Clients | Requests per write | Requests/s | Body MB/s | Read p99 meanwhile |
+|--:|--:|--:|--:|--:|
+| 1 | 1 | 230 | 154 | 0.1 ms |
+| 12 (HTTP) | 1 | 739 | 498 | 0.8 ms |
+| 12 (HTTP) | 8 | 2,342 | 1,562 | 1.1 ms |
 
 Reproduce with `scripts/h2h.sh` (needs `postgresql@18`) and `tdb load --store DIR --via http`.
 
