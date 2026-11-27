@@ -4857,6 +4857,7 @@ impl Db {
         self.c.dir_res.lock().unwrap().clear();
         self.c.head_res.lock().unwrap().clear();
         crate::segment::forget_frames();
+        crate::segment::forget_dicts();
     }
 
     pub fn dir(&self) -> &Path {

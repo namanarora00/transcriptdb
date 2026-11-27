@@ -1175,6 +1175,11 @@ pub fn forget_frames() {
     FRAMES.with(|c| *c.borrow_mut() = FrameCache::default());
 }
 
+/// Forget every decoded zstd dictionary (they are read again from their segments).
+pub fn forget_dicts() {
+    *DICTS.lock().unwrap() = None;
+}
+
 /// Bytes of decompressed frames each thread keeps (128 frames of 64 KB, or two of a cold
 /// session's 4 MB runs).
 const FRAME_CACHE: usize = 8 << 20;

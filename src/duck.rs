@@ -433,8 +433,41 @@ pub fn run_queries(db: &Db, conn: &Connection, reps: usize, threads: &[usize]) -
 
 /// A request rebuilt from DuckDB alone: its row, its messages in order, its pieces (array
 /// pieces from their blocks), then the same assembly as the store's.
+const Q_HEAD: &str = "SELECT skeleton, coalesce(system, -1), coalesce(tools, -1), notes, layout FROM requests WHERE id = ?";
+const Q_PIECE: &str = "SELECT body, holes, elements IS NOT NULL FROM pieces WHERE id = ?";
+const Q_BLOCKS: &str = "SELECT b.body FROM (SELECT unnest(elements) AS bid, generate_subscripts(elements, 1) AS k FROM pieces WHERE id = ?) u JOIN blocks b ON b.id = u.bid ORDER BY u.k";
+const Q_REQ_IDS: &str = "SELECT msgs FROM requests WHERE id = ?";
+const Q_REQ_MSGS: &str = "SELECT id, body FROM messages WHERE id IN (SELECT unnest(msgs) FROM requests WHERE id = ?)";
+const Q_STEP_IDS: &str = "SELECT call_msg, result_msg FROM steps WHERE session = ? AND step >= ? AND step < ? ORDER BY step";
+const Q_STEP_MSGS: &str = "SELECT id, body FROM messages WHERE id IN (SELECT unnest([call_msg, result_msg]) FROM steps WHERE session = ? AND step >= ? AND step < ?)";
+// (one join was faster here than ids then IN: a session's messages are many)
+const Q_SESSION: &str = "SELECT string_agg(m.body, ',' ORDER BY n.node) FROM nodes n JOIN messages m ON m.id = n.msg WHERE n.session = ?";
+const READS: &[&str] = &[Q_HEAD, Q_PIECE, Q_BLOCKS, Q_REQ_IDS, Q_REQ_MSGS, Q_STEP_IDS, Q_STEP_MSGS, Q_SESSION];
+
+/// Close the database and open it again with nothing in its buffer pool, with `stmts`
+/// prepared (so a cold read pays for reading the data, not for planning).
+fn reopen(conn: &mut Connection, path: &Path, stmts: &[&str]) -> R<()> {
+    // the file allows one open instance: let go of this one first
+    drop(std::mem::replace(conn, Connection::open_in_memory().map_err(de)?));
+    *conn = Connection::open(path).map_err(de)?;
+    for q in stmts {
+        conn.prepare_cached(q).map_err(de)?;
+    }
+    Ok(())
+}
+
+/// DuckDB's buffer memory (bytes) right after [`reopen`], and after reading a request: shows
+/// that a reopened database starts with nothing of the data in memory.
+pub fn reopen_check(conn: &mut Connection, path: &Path, id: &str) -> R<(u64, u64)> {
+    reopen(conn, path, READS)?;
+    let mem = |c: &Connection| -> R<u64> { Ok(rows(c, "SELECT sum(memory_usage_bytes) FROM duckdb_memory()")?.first().and_then(|r| r[0].as_ref()?.parse().ok()).unwrap_or(0)) };
+    let before = mem(conn)?;
+    duck_rebuild(conn, id)?;
+    Ok((before, mem(conn)?))
+}
+
 fn duck_rebuild(conn: &Connection, id: &str) -> R<Vec<u8>> {
-    let head = rows_p(conn, "SELECT skeleton, coalesce(system, -1), coalesce(tools, -1), notes, layout FROM requests WHERE id = ?", &[&id])?;
+    let head = rows_p(conn, Q_HEAD, &[&id])?;
     let h = head.first().ok_or("no such request")?;
     let ids: Vec<i64> = h[..3].iter().map(|c| c.as_deref().and_then(|x| x.parse().ok()).unwrap_or(-1)).collect();
     let msgs: Vec<(u64, String)> = request_messages(conn, id)?.into_iter().enumerate().map(|(k, m)| (k as u64, m)).collect();
@@ -446,7 +479,7 @@ fn duck_rebuild(conn: &Connection, id: &str) -> R<Vec<u8>> {
     let mut pcs: HashMap<u32, (String, Option<String>)> = HashMap::new();
     for pid in want {
         let pid32 = pid as i32;
-        let r = rows_p(conn, "SELECT body, holes, elements IS NOT NULL FROM pieces WHERE id = ?", &[&pid32])?;
+        let r = rows_p(conn, Q_PIECE, &[&pid32])?;
         let r = r.first().ok_or_else(|| format!("missing piece {pid}"))?;
         match &r[0] {
             Some(body) => {
@@ -454,7 +487,7 @@ fn duck_rebuild(conn: &Connection, id: &str) -> R<Vec<u8>> {
             }
             None => {
                 // an array piece: its blocks in order
-                let parts = rows_p(conn, "SELECT b.body FROM (SELECT unnest(elements) AS bid, generate_subscripts(elements, 1) AS k FROM pieces WHERE id = ?) u JOIN blocks b ON b.id = u.bid ORDER BY u.k", &[&pid32])?;
+                let parts = rows_p(conn, Q_BLOCKS, &[&pid32])?;
                 let parts: Vec<String> = parts.into_iter().map(|x| x[0].clone().unwrap_or_default()).collect();
                 pcs.insert(pid as u32, (format!("[{}]", parts.join(",")), None));
             }
@@ -466,9 +499,9 @@ fn duck_rebuild(conn: &Connection, id: &str) -> R<Vec<u8>> {
 
 /// Messages by id, fetched with one `IN` lookup (DuckDB's fastest of the forms tried), put in
 /// the order `ids` gives.
-fn messages_in_order(conn: &Connection, sub: &str, p: &[&dyn duckdb::ToSql], ids: &[i64]) -> R<Vec<String>> {
+fn messages_in_order(conn: &Connection, sql: &str, p: &[&dyn duckdb::ToSql], ids: &[i64]) -> R<Vec<String>> {
     let mut by: HashMap<i64, String> = HashMap::new();
-    for r in rows_p(conn, &format!("SELECT id, body FROM messages WHERE id IN ({sub})"), p)? {
+    for r in rows_p(conn, sql, p)? {
         by.insert(r[0].as_deref().and_then(|x| x.parse().ok()).unwrap_or(-1), r[1].clone().unwrap_or_default());
     }
     ids.iter().map(|i| by.get(i).cloned().ok_or_else(|| format!("missing message {i}"))).collect()
@@ -480,13 +513,24 @@ fn list_ints(s: Option<&str>) -> Vec<i64> {
 
 /// A request's messages in order.
 fn request_messages(conn: &Connection, id: &str) -> R<Vec<String>> {
-    let ids = list_ints(rows_p(conn, "SELECT msgs FROM requests WHERE id = ?", &[&id])?.first().and_then(|r| r[0].as_deref()));
-    messages_in_order(conn, "SELECT unnest(msgs) FROM requests WHERE id = ?", &[&id], &ids)
+    let ids = list_ints(rows_p(conn, Q_REQ_IDS, &[&id])?.first().and_then(|r| r[0].as_deref()));
+    messages_in_order(conn, Q_REQ_MSGS, &[&id], &ids)
 }
 
-/// The reads of [`h2h::run_reads`], warm: `n` random items each, compared byte for byte.
-pub fn run_reads(db: &Db, conn: &Connection, n: usize, seed: u64) -> R<Vec<ReadOutcome>> {
+/// The reads of [`h2h::run_reads`]: `n` random items each, compared byte for byte. With
+/// `cold`, both sides start every item with nothing of the data in their own memory: the
+/// store's caches are emptied (and its decoded dictionaries), and DuckDB is closed and opened
+/// again, its statements prepared, before the timing. The operating system's file cache stays
+/// warm for both.
+pub fn run_reads(db: &Db, conn: &mut Connection, path: &Path, n: usize, seed: u64, cold: bool) -> R<Vec<ReadOutcome>> {
     let mut r = Rng::new(seed);
+    let prep = |conn: &mut Connection| -> R<()> {
+        if cold {
+            db.clear_caches();
+            reopen(conn, path, READS)?;
+        }
+        Ok(())
+    };
     let e = |x: crate::codec::Error| x.to_string();
     let all = db.all_requests().map_err(e)?;
     let mut res = Vec::new();
@@ -496,9 +540,10 @@ pub fn run_reads(db: &Db, conn: &Connection, n: usize, seed: u64) -> R<Vec<ReadO
         for _ in 0..n {
             let ri = all[r.below(all.len() as u64) as usize];
             let rec = db.request(ri).map_err(e)?;
+            prep(conn)?;
             let a = Instant::now();
-            let path = db.request_path(ri).map_err(e)?;
-            let eb = db.read_messages(rec.session, &path, &mut ReadStats::default()).map_err(e)?.join(&b","[..]);
+            let rp = db.request_path(ri).map_err(e)?;
+            let eb = db.read_messages(rec.session, &rp, &mut ReadStats::default()).map_err(e)?.join(&b","[..]);
             te.push(a.elapsed().as_secs_f64() * 1e3);
             let id: &str = &rec.id;
             let a = Instant::now();
@@ -515,6 +560,7 @@ pub fn run_reads(db: &Db, conn: &Connection, n: usize, seed: u64) -> R<Vec<ReadO
             let s = *r.pick(&long);
             let ss = db.steps(s);
             let k = r.below(ss.rows.len() as u64 - 19) as usize;
+            prep(conn)?;
             let a = Instant::now();
             let ids: Vec<u32> = ss.rows[k..k + 20].iter().flat_map(|row| [row.call_node, row.result_node]).collect();
             let eb = db.read_messages(s, &ids, &mut ReadStats::default()).map_err(e)?.join(&b"|"[..]);
@@ -522,11 +568,11 @@ pub fn run_reads(db: &Db, conn: &Connection, n: usize, seed: u64) -> R<Vec<ReadO
             let (s32, k0, k1) = (s as i32, k as i32, k as i32 + 20);
             let a = Instant::now();
             // the steps' message ids, then the messages by id
-            let ids: Vec<i64> = rows_p(conn, "SELECT call_msg, result_msg FROM steps WHERE session = ? AND step >= ? AND step < ? ORDER BY step", &[&s32, &k0, &k1])?
+            let ids: Vec<i64> = rows_p(conn, Q_STEP_IDS, &[&s32, &k0, &k1])?
                 .into_iter()
                 .flat_map(|r| r.into_iter().map(|c| c.and_then(|x| x.parse().ok()).unwrap_or(-1)))
                 .collect();
-            let got = messages_in_order(conn, "SELECT unnest([call_msg, result_msg]) FROM steps WHERE session = ? AND step >= ? AND step < ?", &[&s32, &k0, &k1], &ids)?;
+            let got = messages_in_order(conn, Q_STEP_MSGS, &[&s32, &k0, &k1], &ids)?;
             td.push(a.elapsed().as_secs_f64() * 1e3);
             same += (sha(&eb) == sha(got.join("|").as_bytes())) as usize;
         }
@@ -537,14 +583,14 @@ pub fn run_reads(db: &Db, conn: &Connection, n: usize, seed: u64) -> R<Vec<ReadO
         let m = n.min(db.session_count());
         for _ in 0..m {
             let s = r.below(db.session_count() as u64) as u32;
+            prep(conn)?;
             let a = Instant::now();
             let ids: Vec<u32> = (0..db.session_len(s)).collect();
             let eb = db.read_messages(s, &ids, &mut ReadStats::default()).map_err(e)?.join(&b","[..]);
             te.push(a.elapsed().as_secs_f64() * 1e3);
             let s32 = s as i32;
             let a = Instant::now();
-            // (one join here was faster than ids then IN: a session's messages are many)
-            let got = rows_p(conn, "SELECT string_agg(m.body, ',' ORDER BY n.node) FROM nodes n JOIN messages m ON m.id = n.msg WHERE n.session = ?", &[&s32])?
+            let got = rows_p(conn, Q_SESSION, &[&s32])?
                 .into_iter()
                 .next()
                 .and_then(|x| x.into_iter().next().flatten())
@@ -559,6 +605,7 @@ pub fn run_reads(db: &Db, conn: &Connection, n: usize, seed: u64) -> R<Vec<ReadO
         for _ in 0..n {
             let ri = all[r.below(all.len() as u64) as usize];
             let id = db.request(ri).map_err(e)?.id;
+            prep(conn)?;
             let a = Instant::now();
             let eb = db.rebuild(ri).map_err(e)?;
             te.push(a.elapsed().as_secs_f64() * 1e3);
@@ -577,9 +624,10 @@ pub struct RawOutcome {
     pub bytes_in: u64,
     pub size: u64,
     pub load_s: f64,
-    /// A whole request by id: (median, p95, p99) ms for the store's rebuild and DuckDB's
-    /// lookup, and how many were the same bytes.
+    /// A whole request by id, warm then cold (see [`run_reads`]): (median, p95, p99) ms for
+    /// the store's rebuild and DuckDB's lookup, and how many were the same bytes.
     pub reads: ReadOutcome,
+    pub cold: ReadOutcome,
 }
 
 /// DuckDB holding every request body whole, one row each, keyed by request id: what a system
@@ -618,11 +666,19 @@ pub fn raw_bodies(db: &Db, path: &Path, compression: Option<&str>, app_zstd: Opt
     conn.execute_batch("CHECKPOINT").map_err(de)?;
     let load_s = t.elapsed().as_secs_f64();
     let size = std::fs::metadata(path).map_err(|e| e.to_string())?.len();
+    let mut conn = conn;
+    let q = "SELECT body FROM calls WHERE id = ?";
+    let mut out = Vec::new();
+    for cold in [false, true] {
     let mut r = Rng::new(seed);
     let (mut te, mut td, mut same) = (Vec::new(), Vec::new(), 0);
     for _ in 0..n {
         let ri = all[r.below(all.len() as u64) as usize];
         let id = db.request(ri).map_err(|e| e.to_string())?.id;
+        if cold {
+            db.clear_caches();
+            reopen(&mut conn, path, &[q])?;
+        }
         let a = Instant::now();
         let eb = db.rebuild(ri).map_err(|e| e.to_string())?;
         te.push(a.elapsed().as_secs_f64() * 1e3);
@@ -630,18 +686,22 @@ pub fn raw_bodies(db: &Db, path: &Path, compression: Option<&str>, app_zstd: Opt
         let a = Instant::now();
         let got: Vec<u8> = match app_zstd {
             Some(_) => {
-                let mut st = conn.prepare_cached("SELECT body FROM calls WHERE id = ?").map_err(de)?;
+                let mut st = conn.prepare_cached(q).map_err(de)?;
                 let c: Vec<u8> = st.query_row([idr], |r| r.get(0)).map_err(de)?;
                 zstd::stream::decode_all(&c[..]).map_err(|e| e.to_string())?
             }
-            None => rows_p(&conn, "SELECT body FROM calls WHERE id = ?", &[&idr])?.into_iter().next().and_then(|x| x.into_iter().next().flatten()).unwrap_or_default().into_bytes(),
+            None => rows_p(&conn, q, &[&idr])?.into_iter().next().and_then(|x| x.into_iter().next().flatten()).unwrap_or_default().into_bytes(),
         };
         td.push(a.elapsed().as_secs_f64() * 1e3);
         same += (eb == got) as usize;
     }
+    out.push(ReadOutcome { name: if cold { "a whole request by id, cold" } else { "a whole request by id" }.into(), same, total: n, engine: h2h::quantiles(&te), pg: Some(h2h::quantiles(&td)) });
+    }
     drop(conn);
     let _ = std::fs::remove_file(path);
-    Ok(RawOutcome { bytes_in, size, load_s, reads: ReadOutcome { name: "a whole request by id".into(), same, total: n, engine: h2h::quantiles(&te), pg: Some(h2h::quantiles(&td)) } })
+    let cold = out.pop().unwrap();
+    let reads = out.pop().unwrap();
+    Ok(RawOutcome { bytes_in, size, load_s, reads, cold })
 }
 
 #[cfg(test)]
