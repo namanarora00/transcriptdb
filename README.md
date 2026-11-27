@@ -88,68 +88,113 @@ writes.
 
 ## Benchmarks
 
-All engines held the same data and returned identical results for every query and read.
-TranscriptDB ran single-threaded.
+Every comparison checks that both engines return identical results for every query and every
+read. TranscriptDB runs on one thread; the other engine uses the parallelism listed for it.
+Ranges span the queries or read types in each row. Datasets, machines and measurement details
+are under [Methodology](#methodology).
 
-**PostgreSQL 18** (tuned schema, parallel workers enabled), dataset A:
+### PostgreSQL 18, dataset A
 
 | | TranscriptDB | PostgreSQL | |
 |:--|--:|--:|:--|
 | Size on disk | 128 MB | 1,051 MB | 8.2× smaller |
-| Sequence queries | 0.27 – 4.8 ms | 15 – 3,389 ms | 51 – 709× faster |
-| Aggregations | 0.04 – 0.11 ms | 4.4 – 21 ms | 40 – 409× faster |
-| Text search | 0.05 – 1.9 ms | 0.64 – 262 ms | 6 – 764× faster |
-| Rule columns | 0.01 – 3.1 ms | 0.20 – 1,467 ms | 16 – 470× faster |
-| Point reads, median | 0.24 – 0.66 ms | 0.61 – 1.9 ms | 2 – 3.5× faster |
+| Sequence queries (8) | 0.27 – 4.8 ms | 15 – 3,389 ms | 51 – 709× faster |
+| Aggregations (7) | 0.04 – 0.11 ms | 4.4 – 21 ms | 40 – 409× faster |
+| Text search (6) | 0.05 – 1.9 ms | 0.64 – 262 ms | 6 – 764× faster |
+| Rule columns (4) | 0.01 – 3.1 ms | 0.20 – 1,467 ms | 16 – 470× faster |
+| Point reads (4 types), median, warm | 0.24 – 0.66 ms | 0.61 – 1.9 ms | 2 – 3.5× faster |
+| Point reads (4 types), median, cold | 0.42 – 1.1 ms | 0.47 – 2.1 ms | 1.1 – 2× faster |
 
-**DuckDB 2.0** (embedded, 12 threads), dataset B. DuckDB was given the same schema as
-PostgreSQL plus the optimizations that measured fastest: an inverted word index, denormalized
-message ids, batched lookups, and rewritten window queries.
+At 3× dataset A (each session replicated three times): 359 MB vs 3,084 MB on disk, and every
+query 6 – 917× faster.
+
+### DuckDB 2.0, dataset B
 
 | | TranscriptDB | DuckDB | |
 |:--|--:|--:|:--|
-| Size on disk | 6.6 MB | 32 MB | 4.9× smaller |
-| Size on disk, DuckDB with zstd forced | 6.6 MB | 13 MB | 2× smaller, but DuckDB point reads slow to 5 – 11 ms |
-| Sequence queries | 0.13 – 2.0 ms | 5.4 – 32 ms | 14 – 42× faster |
-| Aggregations | 0.03 – 0.07 ms | 1.7 – 6.3 ms | 24 – 167× faster |
-| Text search | 0.01 – 0.51 ms | 2.1 – 59 ms | 41 – 513× faster |
-| Rule columns | 0.01 – 1.5 ms | 2.1 – 27 ms | 18 – 671× faster |
-| Full scans | 4.2 – 17 ms | 33 – 76 ms | 4.4 – 8× faster |
-| Point reads, median, warm | 0.19 – 0.36 ms | 2.1 – 8.2 ms | 6 – 23× faster |
-| Point reads, median, cold | 0.38 – 0.70 ms | 2.5 – 8.3 ms | 4.7 – 12× faster |
+| Size on disk, unreplicated sessions | 6.6 MB | 32 MB | 4.9× smaller |
+| Size on disk, unreplicated sessions, DuckDB with zstd forced | 6.6 MB | 13 MB | 2× smaller, but DuckDB point reads slow to 5 – 11 ms |
+| Sequence queries (8) | 0.13 – 2.0 ms | 5.4 – 32 ms | 14 – 42× faster |
+| Aggregations (7) | 0.03 – 0.07 ms | 1.7 – 6.3 ms | 24 – 167× faster |
+| Text search (6) | 0.01 – 0.51 ms | 2.1 – 59 ms | 41 – 513× faster |
+| Rule columns (4) | 0.01 – 1.5 ms | 2.1 – 27 ms | 18 – 671× faster |
+| Queries no index can narrow (2) | 4.2 – 17 ms | 33 – 76 ms | 4.4 – 8× faster |
+| Point reads (4 types), median, warm | 0.19 – 0.36 ms | 2.1 – 8.2 ms | 6 – 23× faster |
+| Point reads (4 types), median, cold | 0.38 – 0.70 ms | 2.5 – 8.3 ms | 4.7 – 12× faster |
 
-Storing raw request bodies in DuckDB (one row per call, 3,078 MB of input):
+### DuckDB storing raw request bodies, dataset B unreplicated
 
-| | Size | Fetch by id, median, warm | Cold |
+One row per request, keyed by request id, holding the body as sent (3,377 requests, 3,078 MB).
+Reads fetch one whole request by id.
+
+| | Size | Fetch by id, median, warm | Fetch by id, median, cold |
 |:--|--:|--:|--:|
 | TranscriptDB | 6.6 MB | 0.17 ms | 0.73 ms |
 | DuckDB, default compression | 113 MB | 50 ms | 52 ms |
-| DuckDB, per-row zstd in the application | 231 – 286 MB | 5.5 – 6.7 ms | 8.6 – 10 ms |
-| DuckDB, per-row zstd, DuckDB compression off | 841 MB | 0.69 ms | 0.87 ms |
+| DuckDB, each body zstd-compressed by the application (levels 19 and 3) | 231 – 286 MB | 5.5 – 6.7 ms | 8.6 – 10 ms |
+| DuckDB, each body zstd-compressed by the application, DuckDB compression off | 841 MB | 0.69 ms | 0.87 ms |
 | DuckDB, uncompressed | 3,080 MB | 0.37 ms | 0.73 ms |
 
-**Write throughput**, requests averaging 0.7 MB, fsync on every commit:
+### Write throughput, dataset C
 
-| Clients | Requests per call | Requests/s | MB/s | Read p99 under load |
+Each client writes its own sessions in order; every commit is fsynced. Two reader threads fetch
+already-acknowledged requests meanwhile.
+
+| Clients | Requests per call | Requests/s | Body MB/s | Read p99 under load |
 |--:|--:|--:|--:|--:|
-| 1 | 1 | 230 | 154 | 0.1 ms |
-| 12 | 1 | 739 | 498 | 0.8 ms |
-| 12 | 8 | 2,342 | 1,562 | 1.1 ms |
+| 1, in process | 1 | 230 | 154 | 0.1 ms |
+| 12, over HTTP | 1 | 739 | 498 | 0.8 ms |
+| 12, over HTTP | 8 | 2,342 | 1,562 | 1.1 ms |
 
 ### Methodology
 
-- Dataset A: 1,059 Claude Code sessions, 129,730 requests, 617 MB of distinct message text.
-- Dataset B: 24 Claude Code sessions (3,377 requests) replicated 30 times with unique ids and
-  text markers: 720 sessions, 101,310 requests, 537 MB of distinct text. Sizes are reported on
-  the unreplicated sessions, since replicas compress unusually well.
-- Hardware: Apple M6, 12 cores, 32 GB RAM. Query times are the best of 7 runs; read times are
-  medians over 300 random items. Cold reads empty each engine's own caches before every read
-  (DuckDB is closed and reopened; its buffer pool is verified empty); the OS page cache stays
-  warm for both.
-- Caveats: DuckDB pays roughly 1.7 ms of fixed overhead per query and supports full SQL, which
-  TranscriptDB's language does not. DuckDB's full-text extension was not used.
+Datasets (all real Claude Code sessions):
 
-Scripts: `scripts/h2h.sh` (PostgreSQL), `scripts/duck.sh` (DuckDB), `tdb load` (throughput).
+- A: 1,059 sessions, 129,730 requests, 617 MB of distinct message text.
+- B: 24 sessions, 3,377 requests, 3,078 MB of request bodies, 17 MB of distinct message text.
+  Queries and reads ran on B replicated 30 times with unique ids and text markers (720
+  sessions, 101,310 requests, 537 MB of distinct text). Sizes are for the unreplicated 24
+  sessions, because replicas compress unusually well.
+- C: 943 requests from 12 sessions, 631 MB of request bodies (0.67 MB on average).
+
+Machines:
+
+- PostgreSQL comparison: Apple M4, 10 cores, 16 GB RAM, measured 2026-11-25.
+- DuckDB comparison and write throughput: Apple M6, 12 cores, 32 GB RAM, measured 2026-11-27.
+- On both machines a virtual machine was running and using several cores during the runs.
+
+Engines:
+
+- PostgreSQL 18 over loopback TCP, up to 4 parallel workers, 256 MB of shared buffers. Schema:
+  each distinct message stored once, a step table with indexes, a materialized table of turn
+  paths for sequence queries, everything needed to rebuild requests, and for search a copy of
+  the text with a full-text index plus trigram indexes on text and commands.
+- DuckDB 2.0.1 embedded in the same process, 12 threads. The PostgreSQL schema plus what
+  measured fastest for it: an inverted word table built by the application, message ids
+  denormalized onto steps, batched `IN` lookups for reads, rewritten window queries, primary-key
+  indexes and prepared statements. Its full-text extension was not used (it is downloaded at
+  run time).
+
+Measurement:
+
+- Query times are the best of 7 runs. Read times are medians over 300 random items.
+- Warm reads run with each engine's caches populated. Cold reads empty each engine's own
+  caches before every read: TranscriptDB's caches; PostgreSQL's shared buffers
+  (`pg_buffercache_evict_all()`); DuckDB closed and reopened, with its buffer pool checked
+  empty. The operating system's page cache stays warm for both.
+- DuckDB query times and read times come from separate runs; the machine was busier during the
+  read run, which slowed both engines by about 15 – 20% relative to the query run.
+- Size on disk: TranscriptDB's store files; PostgreSQL's tables, indexes and TOAST, including
+  its search copy; DuckDB's database file after a checkpoint, including its text copy and word
+  table.
+
+Caveats:
+
+- DuckDB spends about 1.7 ms per query before execution, and supports full SQL (joins, ad hoc
+  queries), which TranscriptDB's language does not.
+- Cold, at p99, PostgreSQL was faster on one read type (a request's messages, 0.8×).
+
+Reproduce: `scripts/h2h.sh` (PostgreSQL), `scripts/duck.sh` (DuckDB), `tdb load` (throughput).
 
 ## Testing
 
