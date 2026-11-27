@@ -14,6 +14,8 @@ pub mod check;
 pub mod claude;
 pub mod codec;
 pub mod db;
+#[cfg(feature = "duckdb")]
+pub mod duck;
 pub mod h2h;
 pub mod index;
 pub mod json;
